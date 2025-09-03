@@ -16,6 +16,14 @@ from .frozen_lake.env import FrozenLakeEnv
 # from .metamathqa.env import MetaMathQAEnv
 # from .metamathqa.config import MetaMathQAEnvConfig
 
+# Jidi environments
+from .jidi.config import CliffWalkingConfig, GridWorldConfig, MiniGridConfig, SokobanConfig
+from .jidi.env import CliffWalkingEnv, GridWorldEnv, MiniGridEnv, SokobanEnv
+
+# Search environment
+from .search.config import SearchEnvConfig
+from .search.env import SearchEnv
+
 logger = get_logger()
 
 REGISTERED_ENVS = {
@@ -25,6 +33,13 @@ REGISTERED_ENVS = {
     "frozen_lake": FrozenLakeEnv,
     # 'alfworld': AlfredTXTEnv,
     # "metamathqa": MetaMathQAEnv,
+    # Jidi environments
+    "jidi_cliffwalking": CliffWalkingEnv,
+    "jidi_gridworld": GridWorldEnv,
+    "jidi_minigrid": MiniGridEnv,
+    "jidi_sokoban": SokobanEnv,
+    # Search environment
+    "search": SearchEnv,
 }
 
 REGISTERED_ENV_CONFIGS = {
@@ -34,6 +49,13 @@ REGISTERED_ENV_CONFIGS = {
     "frozen_lake": FrozenLakeEnvConfig,
     # 'alfworld': AlfredEnvConfig,
     # "metamathqa": MetaMathQAEnvConfig,
+    # Jidi environments
+    "jidi_cliffwalking": CliffWalkingConfig,
+    "jidi_gridworld": GridWorldConfig,
+    "jidi_minigrid": MiniGridConfig,
+    "jidi_sokoban": SokobanConfig,
+    # Search environment
+    "search": SearchEnvConfig,
 }
 
 try:

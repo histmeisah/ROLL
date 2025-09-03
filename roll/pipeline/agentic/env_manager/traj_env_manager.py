@@ -1,5 +1,8 @@
 import copy
+import json
+import os
 from contextlib import nullcontext
+from datetime import datetime
 from threading import Lock
 from typing import Dict, List, Optional
 
@@ -84,6 +87,22 @@ class TrajEnvManager(BaseEnvManager):
             tokenizer=self.tokenizer,
             available_actions=self.env.get_all_actions()
         )
+
+        # 初始化轨迹日志配置
+        self.trajectory_logging_config = getattr(self.pipeline_config, 'trajectory_logging', {})
+        self.trajectory_logging_enabled = self.trajectory_logging_config.get('enabled', False)
+        if self.trajectory_logging_enabled:
+            self.trajectory_log_dir = self.trajectory_logging_config.get('log_dir', None)
+            self.trajectory_log_level = self.trajectory_logging_config.get('log_level', 'all')
+            self.trajectory_max_files = self.trajectory_logging_config.get('max_files_per_env', 1000)
+            
+            # 创建日志目录
+            if self.trajectory_log_dir and self.env_config["env_id"] == 0:
+                os.makedirs(self.trajectory_log_dir, exist_ok=True)
+                self.logger.info(f"Trajectory logging enabled. Log dir: {self.trajectory_log_dir}")
+        
+        # 用于记录已保存的轨迹文件数量
+        self.trajectory_file_count = 0
 
     def run_rollout_loop(self, data: DataProto):
         """
@@ -182,6 +201,10 @@ class TrajEnvManager(BaseEnvManager):
         if not info['metrics'].get("action_is_valid", True):
             self.rollout_cache.history[-1]['penalty'] = self.worker_config.format_penalty
         self.rollout_cache.history[-1]['llm_response'] = responses[0]
+        
+        # 记录解析后的动作信息（用于轨迹日志）
+        self.rollout_cache.history[-1]['parsed_action'] = info.get('action', '')
+        
         if info is not None:
             self.rollout_cache.history[-1].update(info)
 
@@ -361,5 +384,115 @@ class TrajEnvManager(BaseEnvManager):
         env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}
         env_metric["env/response_length"] = response_length
         lm_input.meta_info = {"metrics": env_metric}
+        
+        # 保存轨迹日志
+        if self.trajectory_logging_enabled:
+            self._dump_trajectory_log(rollout_cache, messages, episode_score, episode_penalty)
+        
         return lm_input
+
+    def _dump_trajectory_log(self, rollout_cache: RolloutCache, messages: List[Dict], episode_score: float, episode_penalty: float):
+        """
+        保存完整的轨迹日志到jsonl文件
+        
+        Args:
+            rollout_cache: 轨迹缓存
+            messages: 格式化后的对话消息
+            episode_score: 总得分
+            episode_penalty: 总惩罚
+        """
+        try:
+            # 检查是否应该保存此轨迹
+            if not self._should_log_trajectory(episode_score):
+                return
+            
+            # 检查文件数量限制
+            if self.trajectory_file_count >= self.trajectory_max_files:
+                return
+            
+            # 构建轨迹数据
+            trajectory_data = {
+                "metadata": {
+                    "env_id": rollout_cache.env_id,
+                    "group_id": rollout_cache.group_id,
+                    "tag": rollout_cache.tag,
+                    "episode_score": episode_score,
+                    "episode_penalty": episode_penalty,
+                    "num_steps": rollout_cache.step,
+                    "terminated": rollout_cache.terminated,
+                    "truncated": rollout_cache.truncated,
+                    "timestamp": datetime.now().isoformat(),
+                    "mode": self.mode,
+                },
+                "trajectory": []
+            }
+            
+            # 从messages重构完整的交互序列
+            step_idx = 0
+            user_messages = []
+            assistant_messages = []
+            
+            # 分离用户和助手消息（跳过系统消息）
+            for i in range(1, len(messages)):
+                if messages[i]["role"] == "user":
+                    user_messages.append(messages[i]["content"])
+                elif messages[i]["role"] == "assistant":
+                    assistant_messages.append(messages[i]["content"])
+            
+            # 构建每步的数据
+            for step_idx in range(min(len(user_messages), len(assistant_messages))):
+                # 获取对应的历史记录
+                if step_idx < len(rollout_cache.history):
+                    history_step = rollout_cache.history[step_idx]
+                    
+                    step_data = {
+                        f"obs{step_idx}": user_messages[step_idx],  # 完整的LLM输入
+                        f"output{step_idx}": assistant_messages[step_idx],  # 模型完整输出
+                        f"action{step_idx}": history_step.get("parsed_action", ""),  # 环境得到的动作
+                        f"reward{step_idx}": history_step.get("reward", 0),
+                        f"penalty{step_idx}": history_step.get("penalty", 0),
+                        f"info{step_idx}": {
+                            "action_is_valid": history_step.get("metrics", {}).get("action_is_valid", True),
+                            "action_is_effective": history_step.get("metrics", {}).get("action_is_effective", True),
+                            "success": history_step.get("metrics", {}).get("success", False),
+                        }
+                    }
+                    trajectory_data["trajectory"].append(step_data)
+            
+            # 生成文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # 精确到毫秒
+            filename = f"traj_{rollout_cache.tag}_env{rollout_cache.env_id}_grp{rollout_cache.group_id}_{timestamp}.jsonl"
+            filepath = os.path.join(self.trajectory_log_dir, filename)
+            
+            # 保存为jsonl格式（每行一个JSON对象）
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(trajectory_data, ensure_ascii=False) + '\n')
+            
+            self.trajectory_file_count += 1
+            
+            # 仅在第一个环境worker中记录日志，避免重复日志
+            if self.env_config["env_id"] == 0 and self.trajectory_file_count % 10 == 1:
+                self.logger.info(f"Saved trajectory log: {filename} (count: {self.trajectory_file_count})")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to save trajectory log: {e}")
+    
+    def _should_log_trajectory(self, episode_score: float) -> bool:
+        """
+        根据配置决定是否应该记录此轨迹
+        
+        Args:
+            episode_score: 轨迹得分
+            
+        Returns:
+            是否应该记录
+        """
+        if self.trajectory_log_level == "all":
+            return True
+        elif self.trajectory_log_level == "successful_only":
+            return episode_score > 0
+        elif self.trajectory_log_level == "failed_only":
+            return episode_score <= 0
+        else:
+            return True
 
