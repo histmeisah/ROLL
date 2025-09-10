@@ -1,0 +1,250 @@
+# ===============================================================================
+# STEP-BASED REPLAY BUFFER CONFIGURATION FOR FROZENLAKE
+# ===============================================================================
+#
+# This configuration implements a step-based TextualReplayBuffer with three storage modes:
+#
+# 🔶 HYBRID (Default):     Text + Tokens | Fast sampling | Text analysis support
+# 💾 TEXT_ONLY:           Text only     | Memory efficient | Text analysis support  
+# ⚡ TOKENS_ONLY:         Tokens only   | Fastest         | No text analysis
+#
+# Quick Start:
+# 1. Default hybrid mode works out of the box
+# 2. For memory constraints: uncomment text_only mode in replay section
+# 3. For pure training speed: uncomment tokens_only mode in replay section
+# 4. Monitor metrics: replay_buffer/storage_mode, replay_buffer/step_transitions
+#
+# ===============================================================================
+defaults:
+  - ../../ROLL/examples/config/traj_envs@_here_
+  - ../../ROLL/examples/config/deepspeed_zero@_here_
+  - ../../ROLL/examples/config/deepspeed_zero2@_here_
+  - ../../ROLL/examples/config/deepspeed_zero3@_here_
+  - ../../ROLL/examples/config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "agentic_pipeline"
+seed: 42
+timestamp: ${oc.env:TRAINING_TIMESTAMP,${now:%Y%m%d_%H%M%S}}
+base_output_dir: /data1/Weiyu_project/roll_dev/experiments/reproduce_frozen_lake_replay/output
+logging_dir: ${base_output_dir}/${timestamp}/logs
+output_dir: ${base_output_dir}/${timestamp}
+render_save_dir: ${base_output_dir}/${timestamp}/render
+system_envs:
+  USE_MODELSCOPE: '1'
+
+track_with: wandb
+tracker_kwargs:
+  project: roll-agentic-replay
+  name: ${timestamp}_${exp_name}_step_buffer_hybrid
+  notes: "Step-based Replay: hybrid storage, 100K transitions, ROLL-native tokenization"
+  tags: [agentic, roll, frozen_lake, step_based, hybrid, optimized, v3]
+  mode: offline
+  dir: ${base_output_dir}/${timestamp}/wandb
+
+checkpoint_config:
+  type: file_system
+  output_dir: ${base_output_dir}/${timestamp}/models/${exp_name}
+
+# =============================================================================
+# TRAINING CONFIGURATION
+# =============================================================================
+
+num_gpus_per_node: 8
+
+# Training schedule (optimized for step-based replay buffer testing)
+max_steps: 100                    # Quick test (recommended: 1000+ for full training)
+save_steps: 10000                # Checkpoint frequency
+logging_steps: 1                 # Log every step (change to 10 for production)
+eval_steps: 5                    # Evaluate every 5 steps (good for replay buffer monitoring)
+resume_from_checkpoint: false
+
+# 🔧 修复batch size问题：使用auto模式（ROLL官方推荐）
+batch_adjust_mode: auto          # auto模式会根据batch大小智能选择copy或delete
+
+# Generation settings
+async_generation_ratio: 1        # Full async generation
+
+# Batch and sequence settings (reduced for memory efficiency)
+rollout_batch_size: 1024         # Restored to 1024 to fix batch adjustment
+val_batch_size: 1024              # Reduced from 1024 to save memory
+sequence_length: 4096            # Reduced from 8192 to save memory
+
+# RL algorithm settings
+advantage_clip: 0.2              # PPO advantage clipping
+ppo_epochs: 1                    # Single epoch for stability
+adv_estimator: "reinforce"       # REINFORCE advantage estimation
+init_kl_coef: 0.0               # No KL penalty
+whiten_advantages: true          # Normalize advantages
+entropy_loss_coef: 0            # No entropy bonus
+max_grad_norm: 1.0              # Gradient clipping
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+
+pretrain: /data1/Weiyu_project/Models/downloaded_models/Qwen2.5-0.5B-Instruct
+reward_pretrain: /data1/Weiyu_project/Models/downloaded_models/Qwen2.5-0.5B-Instruct
+
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 128
+    warmup_steps: 10
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: megatron_train
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+      use_distributed_optimizer: true
+      recompute_granularity: full
+  device_mapping: list(range(0,4))
+  infer_batch_size: 2
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: 128
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.8
+      block_size: 16
+      load_format: auto
+  device_mapping: list(range(4,8))
+
+reference:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: ~
+  device_mapping: list(range(0,4))
+  infer_batch_size: 2
+
+# =============================================================================
+# ENVIRONMENT CONFIGURATION  
+# =============================================================================
+
+# Action format patterns
+action_pattern: <answer>(.*?)</answer>
+think_action_pattern: <think>(.*?)</think>\s*<answer>(.*?)</answer>
+user_prompt_no_think_format: <answer> [your answer] </answer>
+user_prompt_think_format: <think> [Your thoughts] </think> <answer> [your answer] </answer>
+added_text_no_think: <answer>
+added_text_think: <think>
+
+# Environment limits
+max_tokens_per_step: 128         # Max tokens per response
+max_actions_per_traj: 10         # Max steps per episode
+
+reward_normalization:
+  grouping: traj_group_id
+  method: mean_std
+
+train_env_manager:
+  format_penalty: -0.15
+  max_env_num_per_worker: 16
+  num_env_groups: 128
+  group_size: 8
+  tags: [FrozenLake]
+  num_groups_partition: [128]
+
+val_env_manager:
+  max_env_num_per_worker: 32
+  num_env_groups: 1024
+  group_size: 1
+  tags: [FrozenLake]
+  num_groups_partition: [1024]
+
+custom_envs:
+  FrozenLake:
+    env_type: frozen_lake
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_no_think_format}
+    added_text: ${added_text_no_think}
+    agent_system_template: "You are an agent solving the FrozenLake puzzle. Output must be wrapped as <answer>Action</answer>."
+    agent_template: |
+      Current turn: {turn_idx}
+      Grid state:
+      {state}
+      Actions left: {actions_left}
+      Respond with one action token only, within {max_response_length} tokens.
+    reward_template: "Feedback: Your previous action received reward {reward}. Revise your plan if needed."
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      env_instruction: "You are solving the FrozenLake puzzle. Forbid the whole and go to the target. You may move to the unintended direction due to the slippery ice. The answer must be one of action in a turn, format is <answer>Right</answer>"
+      action_pattern: ${action_pattern}
+      max_steps: ${max_actions_per_traj}
+      is_slippery: false
+
+# =============================================================================
+# STEP-BASED REPLAY BUFFER CONFIGURATION
+# =============================================================================
+
+replay:
+  # Basic settings
+  enabled: true                 # Enable off-policy training with step-based textual buffer
+  
+  # Capacity settings (step-level, not episode-level)
+  capacity: 100000              # 100K step transitions (much larger than episode storage)
+  min_size: 512                 # Minimum steps before training starts (2x batch_size) 
+  train_steps_per_env_step: 1   # Training frequency
+  minibatch_size: 1024          # Replay buffer sampling batch size (match rollout_batch_size)
+  
+  # Batch alignment with ROLL framework
+  use_rollout_batch_size: true  # Use rollout_batch_size (1024) for consistency
+  
+  # Data mixing configuration  
+  replay_ratio: 0.1             # 30% replay data, 70% fresh data (conservative start)
+  
+  # Sampling mode (trajectory-level by default for fair comparison with original ROLL)
+  sampling_mode: trajectory      # trajectory | step
+  steps_per_episode: ${max_actions_per_traj}   # sample a full episode each time
+  
+  # =========================================================================== 
+  # STORAGE MODE CONFIGURATION - Choose one configuration below
+  # ===========================================================================
+  
+  # 🔶 HYBRID MODE (Default - Recommended for development)
+  storage_mode: hybrid          # Stores both text and tokens
+  lazy_tokenization: false     # Pre-tokenize for fastest sampling
+  
+  # 💾 TEXT-ONLY MODE (Uncomment for memory efficiency)
+  # storage_mode: text_only     # Stores only text, tokens computed on-demand
+  # lazy_tokenization: false   # false=pre-tokenize | true=tokenize-on-demand
+  
+  # ⚡ TOKENS-ONLY MODE (Uncomment for pure training performance)
+  # storage_mode: tokens_only   # Stores only tokens, no text analysis capability
+  # lazy_tokenization: false   # Not used in tokens_only mode
+
