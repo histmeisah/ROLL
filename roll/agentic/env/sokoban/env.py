@@ -1,6 +1,6 @@
 import re
 
-import gym
+import gymnasium as gym
 from gym_sokoban.envs.sokoban_env import SokobanEnv as GymSokobanEnv
 import numpy as np
 

@@ -28,6 +28,50 @@ class LLMProxyConfig:
 
 
 @dataclass
+class ReplayConfig:
+    enabled: bool = field(default=False, metadata={"help": "Enable replay buffer for agentic training."})
+    capacity: int = field(default=1000000, metadata={"help": "Max number of step transitions stored in replay buffer (1M steps, not episodes)."})
+    min_size: int = field(default=2000, metadata={"help": "Minimum step transitions before sampling is allowed (recommended: 2x batch_size)."})
+    train_steps_per_env_step: int = field(default=1, metadata={"help": "Number of training steps per rollout step when replay is enabled."})
+    
+    # Batch size configuration
+    minibatch_size: int = field(default=128, metadata={"help": "Legacy compatibility. Use use_rollout_batch_size=True instead."})
+    
+    # Step-based textual buffer configuration
+    use_rollout_batch_size: bool = field(
+        default=True, 
+        metadata={"help": "Use rollout_batch_size for sampling instead of minibatch_size (recommended for step-based buffer)."}
+    )
+    
+    # Storage mode configuration
+    storage_mode: Literal["hybrid", "text_only", "tokens_only"] = field(
+        default="hybrid",
+        metadata={"help": "Storage mode: 'hybrid' (text+tokens), 'text_only' (pure text), 'tokens_only' (pure tokens)"}
+    )
+    
+    lazy_tokenization: bool = field(
+        default=False,
+        metadata={"help": "If True, tokenize only during sampling (memory efficient, but slower sampling)"}
+    )
+    
+    # Replay buffer integration settings
+    replay_ratio: float = field(
+        default=0.5,
+        metadata={"help": "Ratio of replay data in each training batch (0.0-1.0). 0.5 means 50% replay, 50% fresh data"}
+    )
+
+    # Sampling mode settings
+    sampling_mode: Literal["trajectory", "step"] = field(
+        default="trajectory",
+        metadata={"help": "Sampling mode for replay: 'trajectory' samples full episodes; 'step' samples per-step items"}
+    )
+    steps_per_episode: int = field(
+        default=1,
+        metadata={"help": "When sampling_mode='step', number of steps to sample per episode in one minibatch."}
+    )
+
+
+@dataclass
 class EnvManagerConfig(WorkerConfig):
     llm_proxy: LLMProxyConfig = field(default_factory=LLMProxyConfig, metadata={"help": "llm proxy config."})
     num_env_groups: int = field(default=128, metadata={"help": "Number of environment groups during training."})
@@ -83,6 +127,7 @@ class AgenticConfig(BaseConfig):
     reward_normalization: RewardNormalizationConfig = field(
         default_factory=RewardNormalizationConfig, metadata={"help": "Reward normalization configuration."}
     )
+    replay: ReplayConfig = field(default_factory=ReplayConfig, metadata={"help": "Replay buffer configuration."})
 
     # role related
     pretrain: str = field(

@@ -227,12 +227,7 @@ class StepEnvManager(TrajEnvManager):
             attention_mask = inputs.attention_mask[:, :last_response_idx+1]
             position_ids = attention_mask.cumsum(dim=-1)
 
-            input_ids = pad_to_length(input_ids, length=self.pipeline_config.sequence_length, pad_value=self.tokenizer.pad_token_id)
-            attention_mask = pad_to_length(attention_mask, length=self.pipeline_config.sequence_length, pad_value=0)
-            position_ids = pad_to_length(position_ids, length=self.pipeline_config.sequence_length, pad_value=0)
-            response_mask = pad_to_length(response_mask, length=self.pipeline_config.sequence_length, pad_value=0)
-            prompt_mask = pad_to_length(prompt_mask, length=self.pipeline_config.sequence_length, pad_value=0)
-            score_tensor = pad_to_length(score_tensor, length=self.pipeline_config.sequence_length, pad_value=0)
+            # Do not pad here; let RolloutScheduler apply unified padding
 
             samples.append(DataProto(
                 batch=TensorDict(

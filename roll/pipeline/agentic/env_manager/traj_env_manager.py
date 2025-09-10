@@ -327,34 +327,25 @@ class TrajEnvManager(BaseEnvManager):
         attention_mask = inputs.attention_mask[:, :last_response_idx+1]
         position_ids = attention_mask.cumsum(dim=-1)
 
+        # Create DataProto with original dynamic-length tensors
+        # Ensure masks and scores are truncated consistently with attention
+        response_mask = response_mask[:, :last_response_idx+1]
+        prompt_mask = prompt_mask[:, :last_response_idx+1]
+        score_tensor = score_tensor[:, :last_response_idx+1]
         lm_input = DataProto()
         lm_input.batch = TensorDict(
             {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
+                "penalty": torch.Tensor([episode_penalty]),
+                "response_mask": response_mask,
+                "prompt_mask": prompt_mask,
+                "scores": score_tensor,
             },
             batch_size=input_ids.shape[0])
 
         response_length = response_mask.sum(dim=-1).float().mean().item()
-
-        # TODO: move pad to pipeline
-        input_ids = pad_to_length(input_ids, length=self.pipeline_config.sequence_length, pad_value=self.tokenizer.pad_token_id)
-        attention_mask = pad_to_length(attention_mask, length=self.pipeline_config.sequence_length, pad_value=0)
-        position_ids = pad_to_length(position_ids, length=self.pipeline_config.sequence_length, pad_value=0)
-        response_mask = pad_to_length(response_mask, length=self.pipeline_config.sequence_length, pad_value=0)
-        prompt_mask = pad_to_length(prompt_mask, length=self.pipeline_config.sequence_length, pad_value=0)
-        score_tensor = pad_to_length(score_tensor, length=self.pipeline_config.sequence_length, pad_value=0)
-
-        lm_input.batch.update({
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "penalty": torch.Tensor([episode_penalty]),
-            "response_mask": response_mask,
-            "prompt_mask": prompt_mask,
-            "scores": score_tensor,
-        })
         lm_input.non_tensor_batch.update({
             "env_ids": np.array([self.rollout_cache.env_id], dtype=object),
             "group_ids": np.array([self.rollout_cache.group_id], dtype=object),

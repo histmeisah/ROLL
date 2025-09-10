@@ -14,6 +14,7 @@ from roll.agentic.rollout.rollout_scheduler import RolloutScheduler
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.protocol import DataProto
 from roll.models.model_providers import default_tokenizer_provider
+from roll.configs.model_args import ModelArguments
 from roll.pipeline.agentic.agentic_config import AgenticConfig
 from roll.pipeline.agentic.utils import (dump_rollout_render, compute_discounted_returns,
                                          compute_response_level_rewards)
@@ -29,6 +30,7 @@ from roll.utils.functionals import (
 )
 from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
+from roll.agentic.replay_buffer import TextualReplayBuffer
 
 logger = get_logger()
 
@@ -93,6 +95,13 @@ class AgenticPipeline(BasePipeline):
             infer_cluster=self.actor_infer,
             mode="val",
         )
+        
+        # 🎯 SETUP PADDING: Provide pipeline's padding strategy to rollout schedulers
+        # Padding policy is unified in pipeline, but execution happens in rollout_scheduler
+        ray.get([
+            self.train_rollout_scheduler.setup_padding.remote(self.tokenizer, self.pipeline_config.sequence_length),
+            self.val_rollout_scheduler.setup_padding.remote(self.tokenizer, self.pipeline_config.sequence_length)
+        ])
         refs: List[ray.ObjectRef] = []
         refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
         if self.pipeline_config.adv_estimator == "gae":
@@ -114,6 +123,40 @@ class AgenticPipeline(BasePipeline):
             self.set_checkpoint_clusters(self.actor_train)
 
         self.running = RunningMoments()
+
+        # Initialize replay buffer
+        self.replay_buffer = None
+        rb_cfg = self.pipeline_config.replay
+        
+        if rb_cfg.enabled:
+            # Initialize step-based textual replay buffer
+            batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
+            self.replay_buffer = TextualReplayBuffer(
+                capacity=rb_cfg.capacity,
+                batch_size=batch_size,
+                seed=42,
+                storage_mode=getattr(rb_cfg, 'storage_mode', 'hybrid'),
+                lazy_tokenization=getattr(rb_cfg, 'lazy_tokenization', False)
+            )
+            
+            # Initialize tokenizer for textual buffer
+            try:
+                model_path = (
+                    self.pipeline_config.pretrain or 
+                    getattr(self.pipeline_config.actor_train.model_args, 'model_name_or_path', None)
+                )
+                if not model_path:
+                    raise ValueError("No model path found for tokenizer initialization")
+                
+                model_args = ModelArguments(model_name_or_path=model_path)
+                self.tokenizer = default_tokenizer_provider(model_args)
+                logger.info(f"Initialized tokenizer for Step-Based TextualReplayBuffer from model: {model_path}")
+            except Exception as e:
+                logger.error(f"Failed to initialize tokenizer for Step-Based TextualReplayBuffer: {e}")
+                raise
+        else:
+            self.replay_buffer = None
+            self.tokenizer = None
 
     @torch.no_grad()
     def run(self):
@@ -152,9 +195,16 @@ class AgenticPipeline(BasePipeline):
 
                 batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
 
+                # ✨ REPLAY BUFFER INTEGRATION: Mix replay data with fresh rollout data
+                batch = self.integrate_replay_buffer_data(batch, global_step)
+
+                # ✅ PADDING HANDLED: Training data padding already applied in rollout_scheduler using pipeline's strategy
+
                 batch = self.adjust_batch(batch, mode=self.pipeline_config.batch_adjust_mode)
                 metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
 
+                # 当启用 replay 时，下方 off-policy 训练路径会对采样批次重新计算 log_probs/adv。
+                # 为避免重复计算，这里仅在 off-policy 关闭时计算。
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
                     ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(batch, blocking=False)
                     ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
@@ -228,19 +278,114 @@ class AgenticPipeline(BasePipeline):
                 metrics.update(kl_metrics)
                 metrics["time/adv"] = timer.last
 
-                if self.pipeline_config.adv_estimator == "gae":
-                    critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
+                # training stage: on-policy (disabled) or via replay buffer
+                if not self.pipeline_config.replay.enabled:
+                    if self.pipeline_config.adv_estimator == "gae":
+                        critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
-                # implement critic warmup
-                if self.pipeline_config.critic_warmup <= global_step:
-                    # update actor
-                    actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
-                    actor_train_metrics: DataProto = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
-                    metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
+                    if self.pipeline_config.critic_warmup <= global_step:
+                        actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
+                        actor_train_metrics: DataProto = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
+                        metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
 
-                if self.pipeline_config.adv_estimator == "gae":
-                    critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
-                    metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
+                    if self.pipeline_config.adv_estimator == "gae":
+                        critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
+                        metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
+                else:
+                    # Use replay buffer for off-policy training
+                    rb_cfg = self.pipeline_config.replay
+                    
+                    # Add batch to step-based replay buffer
+                    num_added = self.replay_buffer.push_from_dataproto(batch, self.tokenizer)
+                    if num_added == 0:
+                        logger.warning("No step transitions added to textual replay buffer")
+                        continue
+                    else:
+                        logger.debug(f"Added {num_added} step transitions to replay buffer "
+                                   f"(total: {len(self.replay_buffer)} steps)")
+                    
+                    # Check if buffer has enough samples for training
+                    if not self.replay_buffer.can_sample(min_size=rb_cfg.min_size):
+                        logger.debug(f"Textual replay buffer not ready: {len(self.replay_buffer)} < {rb_cfg.min_size}")
+                        continue
+                    
+                    # Sample and train with replay buffer
+                    training_batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
+                    
+                    all_actor_refs = []
+                    all_critic_refs = []
+                    
+                    for step_idx in range(rb_cfg.train_steps_per_env_step):
+                        # Sample batch for training based on storage mode
+                        mb = self.replay_buffer.sample_for_training(
+                            batch_size=training_batch_size,
+                            device='cpu',  # Will be moved to correct device in GPU workers
+                            tokenizer=self.tokenizer  # Required for text_only mode
+                        )
+                        if mb is None:
+                            logger.warning(f"TextualReplayBuffer failed to sample batch at step {step_idx}")
+                            break
+                        
+                        # 计算 ref_log_probs / old_log_probs / advantages 仅在 off-policy 路径进行，避免重复
+                        # This computation was missing in the replay buffer training path
+                        ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(mb, blocking=False)
+                        ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
+                        ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
+                        mb = mb.union(ref_log_probs)
+                        
+                        # 🔥 ADD MISSING COMPUTATION: Calculate old_log_probs for replay buffer data
+                        # This computation was also missing in the replay buffer training path
+                        mb.meta_info["is_offload_states"] = False
+                        old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(mb, blocking=False)
+                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                        mb.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
+                        
+                        # 🔥 ADD MISSING COMPUTATION: Calculate advantages for replay buffer data
+                        # This computation was also missing in the replay buffer training path
+                        # Follow the same advantage computation steps as the main training path
+                        mb = compute_discounted_returns(mb, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
+                        mb = compute_response_level_rewards(batch=mb, pipeline_config=self.pipeline_config)
+                        mb, _ = apply_kl_penalty(data=mb, kl_ctrl=self.kl_ctrl, kl_penalty=self.pipeline_config.kl_penalty)
+                        mb = compute_advantage(
+                            data=mb,
+                            gamma=self.pipeline_config.gamma,
+                            lambd=self.pipeline_config.lambd,
+                            adv_estimator=self.pipeline_config.adv_estimator,
+                            advantage_clip=self.pipeline_config.advantage_clip,
+                            whiten_advantages=self.pipeline_config.whiten_advantages,
+                            whiten_rewards=self.pipeline_config.whiten_rewards,
+                        )
+                        
+                        # Batch training with non-blocking Ray calls
+                        if self.pipeline_config.adv_estimator == "gae":
+                            critic_refs = self.critic.train_step(mb, blocking=False)
+                            # Flatten refs list
+                            all_critic_refs.extend(critic_refs)
+                        if self.pipeline_config.critic_warmup <= global_step:
+                            actor_refs = self.actor_train.train_step(mb, blocking=False)
+                            # Flatten refs list
+                            all_actor_refs.extend(actor_refs)
+                    
+                    # Collect all results efficiently
+                    if all_actor_refs:
+                        actor_metrics = DataProto.materialize_concat(data_refs=all_actor_refs)
+                        metrics.update(reduce_metrics(actor_metrics.meta_info.pop("metrics", {})))
+                    
+                    if all_critic_refs and self.pipeline_config.adv_estimator == "gae":
+                        critic_metrics = DataProto.materialize_concat(data_refs=all_critic_refs)
+                        metrics.update(reduce_metrics(critic_metrics.meta_info.pop("metrics", {})))
+                    
+                    # Add step-based buffer stats to metrics
+                    buffer_stats = self.replay_buffer.get_stats()
+                    metrics.update({
+                        "replay_buffer/step_transitions": buffer_stats["size"],
+                        "replay_buffer/episodes": buffer_stats.get("episodes", 0),
+                        "replay_buffer/steps_per_episode": buffer_stats.get("steps_per_episode", 0.0),
+                        "replay_buffer/utilization": buffer_stats["utilization"],
+                        "replay_buffer/avg_reward": buffer_stats.get("avg_reward", 0.0),
+                        "replay_buffer/batch_size": buffer_stats["batch_size"],
+                        "replay_buffer/storage_mode": buffer_stats.get("storage_mode", "step_based"),
+                    })
                 tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
 
             data_metrics = compute_data_metrics(batch=batch)
@@ -313,6 +458,8 @@ class AgenticPipeline(BasePipeline):
         batch.meta_info["is_offload_states"] = False
         batch.meta_info["global_step"] = global_step
         eval_batch = ray.get(self.val_rollout_scheduler.get_batch.remote(batch, self.pipeline_config.val_batch_size))
+        
+        # ✅ PADDING HANDLED: Padding already applied in rollout_scheduler using pipeline's strategy
         eval_metrics = reduce_metrics(eval_batch.meta_info.get("metrics", {}))
         eval_score = get_episode_scores(eval_batch)
         eval_metrics["score/mean"] = torch.mean(eval_score).detach().item()
@@ -397,6 +544,154 @@ class AgenticPipeline(BasePipeline):
         adjusted_batch.meta_info["metrics"] = metrics
 
         return adjusted_batch
+
+    def integrate_replay_buffer_data(self, fresh_batch: DataProto, global_step: int) -> DataProto:
+        """
+        Integrate replay buffer data with fresh rollout data.
+        Replay buffer acts as a virtual environment worker, providing additional training data.
+        
+        Args:
+            fresh_batch: Fresh rollout data from real environments
+            global_step: Current training step
+            
+        Returns:
+            Combined batch with both fresh and replay data
+        """
+        if self.replay_buffer is None:
+            return fresh_batch
+        
+        # Determine replay buffer sampling ratio based on config
+        replay_config = self.pipeline_config.replay
+        replay_ratio = replay_config.replay_ratio
+        
+        fresh_batch_size = fresh_batch.batch.batch_size[0]
+        replay_batch_size = int(fresh_batch_size * replay_ratio)
+        
+        if replay_batch_size == 0:
+            logger.debug(f"Replay batch size is 0, using only fresh data")
+            return fresh_batch
+        
+        try:
+            # Store fresh data to replay buffer first (environment → replay buffer)
+            self.store_fresh_data_to_replay_buffer(fresh_batch, global_step)
+            
+            # Sample replay data (replay buffer → training) 
+            with Timer(name="replay_buffer_sample", logger=None) as timer:
+                replay_batch = self.replay_buffer.sample_for_training(
+                    batch_size=replay_batch_size,
+                    device=fresh_batch.batch.device,
+                    tokenizer=self.tokenizer,
+                    sequence_length=self.pipeline_config.sequence_length,
+                    sampling_mode=self.pipeline_config.replay.sampling_mode,
+                    steps_per_episode=self.pipeline_config.replay.steps_per_episode,
+                )
+            
+            if replay_batch is None:
+                logger.debug(f"Replay buffer returned None, using only fresh data")
+                return fresh_batch
+            
+            # Combine fresh and replay data (this is the key integration!)
+            # Both batches are now in env_worker format with sequence_length padding
+            combined_batch = DataProto.concat([fresh_batch, replay_batch])
+            
+            # Add metrics
+            combined_batch.meta_info.update({
+                "replay_buffer_sample_time": timer.last,
+                "fresh_batch_size": fresh_batch_size,
+                "replay_batch_size": replay_batch_size,
+                "replay_ratio": replay_ratio,
+                "total_batch_size": combined_batch.batch.batch_size[0]
+            })
+            
+            logger.debug(f"Integrated replay buffer: fresh={fresh_batch_size}, replay={replay_batch_size}, total={combined_batch.batch.batch_size[0]}")
+            
+            return combined_batch
+            
+        except Exception as e:
+            logger.error(f"Replay buffer integration failed: {e}")
+            logger.debug(f"Falling back to fresh data only")
+            return fresh_batch
+
+    def store_fresh_data_to_replay_buffer(self, fresh_batch: DataProto, global_step: int):
+        """Store fresh rollout data to replay buffer for future training."""
+        try:
+            # Use replay buffer's native push_from_dataproto method
+            # This method can extract step transitions from any DataProto batch
+            steps_added = self.replay_buffer.push_from_dataproto(fresh_batch, self.tokenizer)
+            
+            if steps_added > 0:
+                logger.debug(f"Stored {steps_added} step transitions to replay buffer from fresh batch")
+            
+        except Exception as e:
+            logger.error(f"Failed to store fresh data to replay buffer: {e}")
+            logger.debug(f"Error details: {str(e)}", exc_info=True)
+
+    def apply_sequence_padding(self, batch: DataProto) -> DataProto:
+        """
+        Apply unified sequence padding to all tensors in the batch.
+        
+        This method implements the centralized padding strategy, moving padding logic
+        from env_manager and replay_buffer to the pipeline for consistency and efficiency.
+        
+        Args:
+            batch: DataProto with potentially variable-length sequences
+            
+        Returns:
+            DataProto with all sequences padded to pipeline_config.sequence_length
+        """
+        from roll.utils.functionals import pad_to_length
+        
+        try:
+            sequence_length = self.pipeline_config.sequence_length
+            
+            # Check if batch is already padded (optimization)
+            if hasattr(batch.batch, "input_ids") and batch.batch["input_ids"].size(-1) == sequence_length:
+                logger.debug(f"Batch already padded to sequence_length {sequence_length}, skipping")
+                return batch
+            
+            # Get tokenizer for pad_token_id
+            tokenizer = self.tokenizer
+            
+            # Apply padding to all tensor fields that need it
+            tensor_fields_to_pad = {
+                "input_ids": tokenizer.pad_token_id,
+                "attention_mask": 0,
+                "position_ids": 0,
+                "response_mask": 0,
+                "prompt_mask": 0,
+                "scores": 0.0,
+            }
+            
+            padded_tensors = {}
+            for field_name, pad_value in tensor_fields_to_pad.items():
+                if field_name in batch.batch:
+                    original_tensor = batch.batch[field_name]
+                    padded_tensor = pad_to_length(
+                        original_tensor, 
+                        length=sequence_length, 
+                        pad_value=pad_value
+                    )
+                    padded_tensors[field_name] = padded_tensor
+                    
+                    logger.debug(f"Padded {field_name}: {original_tensor.shape} -> {padded_tensor.shape}")
+            
+            # Update batch with padded tensors
+            batch.batch.update(padded_tensors)
+            
+            # Add padding metadata
+            batch.meta_info.update({
+                "padding_applied": True,
+                "sequence_length": sequence_length,
+                "padded_fields": list(padded_tensors.keys())
+            })
+            
+            logger.debug(f"Applied unified padding to {len(padded_tensors)} tensor fields")
+            return batch
+            
+        except Exception as e:
+            logger.error(f"Failed to apply sequence padding: {e}")
+            logger.debug(f"Error details: {str(e)}", exc_info=True)
+            return batch
 
 def get_episode_scores(batch: DataProto) -> torch.Tensor:
     batch_group_by_traj: Dict[str, DataProto] = batch.group_by(keys="traj_id")

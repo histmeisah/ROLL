@@ -309,6 +309,66 @@ class RolloutScheduler:
 
         self.running = False
         self.rollout_refs = None # only used by async training
+        
+        # Padding configuration (set by pipeline)
+        self.tokenizer = None
+        self.sequence_length = None
+
+    def setup_padding(self, tokenizer, sequence_length):
+        """
+        Setup padding configuration from pipeline.
+        
+        This ensures padding policy is unified in pipeline while execution 
+        happens in rollout_scheduler to enable successful concat operations.
+        """
+        self.tokenizer = tokenizer
+        self.sequence_length = sequence_length
+        logger.info(f"RolloutScheduler padding setup: sequence_length={sequence_length}")
+
+    def _apply_pipeline_padding(self, data_batch: List[DataProto]) -> List[DataProto]:
+        """
+        Apply padding to each DataProto in the batch using pipeline's strategy.
+        
+        This method applies the same padding logic as pipeline's apply_sequence_padding
+        but at the individual DataProto level before concat.
+        """
+        if not self.tokenizer or not self.sequence_length:
+            logger.warning("Padding not configured, skipping padding in rollout_scheduler")
+            return data_batch
+        
+        from roll.utils.functionals import pad_to_length
+        
+        padded_batch = []
+        for data_proto in data_batch:
+            try:
+                # Apply padding to tensor fields
+                tensor_fields_to_pad = {
+                    "input_ids": self.tokenizer.pad_token_id,
+                    "attention_mask": 0,
+                    "position_ids": 0,
+                    "response_mask": 0,
+                    "prompt_mask": 0,
+                    "scores": 0.0,
+                }
+                
+                for field_name, pad_value in tensor_fields_to_pad.items():
+                    if field_name in data_proto.batch:
+                        original_tensor = data_proto.batch[field_name]
+                        padded_tensor = pad_to_length(
+                            original_tensor, 
+                            length=self.sequence_length, 
+                            pad_value=pad_value
+                        )
+                        data_proto.batch[field_name] = padded_tensor
+                
+                padded_batch.append(data_proto)
+                
+            except Exception as e:
+                logger.error(f"Failed to apply padding to DataProto: {e}")
+                # Fallback: use original data_proto
+                padded_batch.append(data_proto)
+        
+        return padded_batch
 
     async def _start_env_manager(self, global_step):
         assert self.running
@@ -414,6 +474,10 @@ class RolloutScheduler:
         data_batch: List[DataProto] = await asyncio.wrap_future(ref.future())
         metrics = {}
         [append_to_dict(metrics, meta_info.meta_info["metrics"]) for meta_info in data_batch]
+        
+        # 🎯 APPLY PADDING BEFORE CONCAT: Use pipeline's padding strategy
+        data_batch = self._apply_pipeline_padding(data_batch)
+        
         batch = DataProto.concat(data_batch)
 
         if self.config.async_generation_ratio == 0 or self.mode != "train":
