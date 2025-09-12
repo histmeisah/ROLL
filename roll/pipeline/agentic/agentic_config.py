@@ -70,6 +70,33 @@ class ReplayConfig:
         metadata={"help": "When sampling_mode='step', number of steps to sample per episode in one minibatch."}
     )
 
+    # Unified sampling method across buffer strategies
+    sample_method: Literal["uniform", "fifo", "lifo"] = field(
+        default="uniform",
+        metadata={
+            "help": "Sampling method: uniform (random), fifo (oldest first by timestamp), lifo (newest first by timestamp)."
+        }
+    )
+
+    # Grouped sampling for GRPO-style training (K candidates per prompt)
+    candidates_per_group: int = field(
+        default=1,
+        metadata={"help": "Number of candidates per group (K). Use K>1 for GRPO; K=1 for reinforce/GAE."}
+    )
+    group_sampling: Literal["uniform", "fifo", "lifo"] = field(
+        default="uniform",
+        metadata={"help": "Group selection strategy when candidates_per_group>1."}
+    )
+    min_groups: int = field(
+        default=0,
+        metadata={"help": "Warmup threshold in groups when using grouped sampling (optional)."}
+    )
+    # Train updates use only replay minibatches (fresh rollouts are only pushed into buffer)
+    train_from_replay_only: bool = field(
+        default=False,
+        metadata={"help": "If true, skip main on-policy update and train only from replay minibatches."}
+    )
+
 
 @dataclass
 class EnvManagerConfig(WorkerConfig):
@@ -128,6 +155,8 @@ class AgenticConfig(BaseConfig):
         default_factory=RewardNormalizationConfig, metadata={"help": "Reward normalization configuration."}
     )
     replay: ReplayConfig = field(default_factory=ReplayConfig, metadata={"help": "Replay buffer configuration."})
+    # If true, skip the main on-policy update and train only from replay minibatches
+    train_from_replay_only: bool = field(default=False, metadata={"help": "Train updates use only replay minibatches (fresh rollouts only push to buffer)."})
 
     # role related
     pretrain: str = field(
@@ -225,7 +254,7 @@ class AgenticConfig(BaseConfig):
 
         if (
             self.actor_train.model_args.model_name_or_path is None
-            or self.actor_infer.model_args.model_name_or_path
+            or self.actor_infer.model_args.model_name_or_path is None
             or self.reference.model_args.model_name_or_path is None
         ):
             self.actor_train.model_args.model_name_or_path = self.pretrain

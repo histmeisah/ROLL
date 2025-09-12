@@ -20,7 +20,6 @@ import logging
 import time
 import numpy as np
 import torch
-from transformers import PreTrainedTokenizerBase
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.agentic.rollout.token_mask_utils import token_ids_to_assistant_mask, split_by_token
@@ -56,6 +55,8 @@ class StepTransition:
     advantage: float = 0.0
     old_log_prob: float = 0.0
     ref_log_prob: float = 0.0
+    penalty: float = 0.0
+    behavior_log_prob: float = 0.0
     
     # Metadata
     episode_id: str = ""
@@ -104,6 +105,8 @@ class TextualReplayBuffer:
         
         # Episode tracking for optional trajectory reconstruction
         self.episode_steps: Dict[str, List[int]] = {}  # episode_id -> step indices
+        # Grouped sampling support: map traj_group_id (or prompt hash) -> list of episode indices
+        self.group_to_step_indices: Dict[str, List[int]] = {}
         
         logger.info(f"Initialized StepBasedTextualReplayBuffer:")
         logger.info(f"  - Capacity: {capacity:,} step transitions")
@@ -135,25 +138,71 @@ class TextualReplayBuffer:
             logger.error(f"Missing messages_list: {len(messages_list)} != {len(batch)}")
             return 0
         
-        # Extract basic episode rewards from scores (env_manager original format)
-        episode_rewards = []
+        # Extract rewards: prefer step-level rewards if available, otherwise episode-level
+        episode_rewards = []  # list of dicts: { 'reward': episode_total_reward, 'step_rewards': List[float] }
+        has_step_scores = 'step_scores' in batch.non_tensor_batch
+        step_scores_arr = batch.non_tensor_batch.get('step_scores', []) if has_step_scores else []
         if 'scores' in batch.batch:
             scores = batch.batch['scores'].cpu().numpy()
-            for i in range(len(batch)):
-                # Sum scores for this episode (basic reward)
-                episode_reward = float(scores[i].sum()) if len(scores.shape) > 1 else float(scores[i])
-                episode_rewards.append({'reward': episode_reward})
         else:
-            # Fallback: use episode_scores from non_tensor_batch
-            episode_scores = batch.non_tensor_batch.get('episode_scores', [])
-            for score in episode_scores:
-                episode_rewards.append({'reward': float(score)})
+            scores = None
+        episode_scores_nt = batch.non_tensor_batch.get('episode_scores', [])
+        penalties_tensor = batch.batch.get('penalty', None)
+
+        for i in range(len(batch)):
+            # episode-level total reward
+            if scores is not None:
+                ep_total = float(scores[i].sum()) if len(scores.shape) > 1 else float(scores[i])
+            else:
+                # Fallback to episode_scores non-tensor
+                try:
+                    ep_total = float(episode_scores_nt[i])
+                except Exception:
+                    ep_total = 0.0
+
+            # step-level rewards (if provided)
+            step_rewards: List[float] = []
+            if has_step_scores:
+                try:
+                    val = step_scores_arr[i]
+                    # val can be list/np array (trajectory) or scalar (step env)
+                    if isinstance(val, np.ndarray):
+                        if val.dtype == object:
+                            # likely a list wrapped in object array
+                            val = list(val)
+                        else:
+                            val = val.tolist()
+                    if isinstance(val, (list, tuple)):
+                        step_rewards = [float(x) for x in val]
+                    else:
+                        step_rewards = [float(val)]
+                except Exception:
+                    step_rewards = []
+
+            # penalty (episode-level or per-sample)
+            penalty_val = 0.0
+            try:
+                if penalties_tensor is not None:
+                    penalty_val = float(penalties_tensor[i].item())
+            except Exception:
+                penalty_val = 0.0
+
+            episode_rewards.append({'reward': ep_total, 'step_rewards': step_rewards, 'penalty': penalty_val})
                 
         timestamp = time.time()
         global_step = batch.meta_info.get('global_step', 0)
         
         total_steps_added = 0
         
+        # Optional behavior log_probs per sample
+        behavior_log_probs = None
+        if 'behavior_log_probs' in batch.batch:
+            try:
+                behavior_log_probs = batch.batch['behavior_log_probs'].detach().cpu().numpy()
+            except Exception:
+                behavior_log_probs = None
+
+        traj_group_ids_arr = batch.non_tensor_batch.get('traj_group_id', None)
         for episode_idx, messages in enumerate(messages_list):
             try:
                 # Use ROLL's efficient tokenization (matching traj_env_manager.py)
@@ -188,12 +237,28 @@ class TextualReplayBuffer:
                 
                 for step in episode_steps:
                     step.episode_id = episode_id
+                    # store behavior logprob if available (per-sample scalar expanded to step)
+                    if behavior_log_probs is not None:
+                        try:
+                            step.behavior_log_prob = float(behavior_log_probs[episode_idx].mean())
+                        except Exception:
+                            pass
                     self.step_transitions.append(step)
                     step_indices.append(len(self.step_transitions) - 1)
                     total_steps_added += 1
                 
                 # Track episode for optional reconstruction
                 self.episode_steps[episode_id] = step_indices
+
+                # index to group (if available). When absent, fall back to episode_id as group key
+                if traj_group_ids_arr is not None:
+                    try:
+                        group_key = str(traj_group_ids_arr[episode_idx])
+                    except Exception:
+                        group_key = episode_id
+                else:
+                    group_key = episode_id
+                self.group_to_step_indices.setdefault(group_key, []).extend(step_indices)
                 
                 logger.debug(f"Episode {episode_idx}: extracted {len(episode_steps)} conversation steps")
                 
@@ -252,13 +317,20 @@ class TextualReplayBuffer:
         
         # Always store context messages for reconstruction
         # Only store basic reward - other training signals will be computed by pipeline
+        # Prefer per-step reward if provided, otherwise use episode-level reward
+        step_level_rewards: List[float] = episode_signals.get('step_rewards', []) if isinstance(episode_signals, dict) else []
+        reward_value = step_level_rewards[step_index] if 0 <= step_index < len(step_level_rewards) else (
+            episode_signals['reward'] if isinstance(episode_signals, dict) and 'reward' in episode_signals else 0.0
+        )
+
         base_step = StepTransition(
             context_messages=context_messages,
             response_message=response_message,
-            reward=episode_signals['reward'],
+            reward=reward_value,
             advantage=0.0,  # Will be computed by pipeline
             old_log_prob=0.0,  # Will be computed by pipeline
             ref_log_prob=0.0,  # Will be computed by pipeline
+            penalty=float(episode_signals.get('penalty', 0.0)) if isinstance(episode_signals, dict) else 0.0,
             episode_id="",  # Will be set later
             step_index=step_index,
             total_steps=total_steps,
@@ -294,9 +366,12 @@ class TextualReplayBuffer:
         return "\n".join(formatted_parts)
     
     def sample_for_training(self, batch_size: Optional[int] = None, device: str = 'cpu', tokenizer=None, sequence_length: int = 4096,
-                             sampling_mode: str = "trajectory", steps_per_episode: int = 1) -> Optional[DataProto]:
+                             sampling_mode: str = "trajectory", steps_per_episode: int = 1, sample_method: str = "uniform",
+                             candidates_per_group: int = 1, group_sampling: str = "uniform") -> Optional[DataProto]:
         """
-        Sample step transitions for training based on storage mode.
+        Sample transitions for training with two granularities:
+        - sampling_mode == "step": sample contiguous K-step chunks (K == steps_per_episode here)
+        - sampling_mode == "trajectory": sample full episodes as single samples
         
         Args:
             batch_size: Number of step transitions to sample
@@ -313,48 +388,253 @@ class TextualReplayBuffer:
             logger.debug(f"Insufficient step samples: {len(self.step_transitions)} < {batch_size}")
             return None
         
-        # Select sampling mode
-        if sampling_mode == "step":
-            try:
-                sampled_steps = self.rng.sample(list(self.step_transitions), batch_size)
-            except ValueError as e:
-                logger.error(f"Step sampling error: {e}")
+        # Build mapping: episode_id -> sorted steps
+        episode_to_steps: Dict[str, List[StepTransition]] = {}
+        for step in self.step_transitions:
+            episode_to_steps.setdefault(step.episode_id, []).append(step)
+        if not episode_to_steps:
+            return None
+
+        for ep_id in list(episode_to_steps.keys()):
+            episode_to_steps[ep_id] = sorted(episode_to_steps[ep_id], key=lambda s: s.step_index)
+
+        # Determine episode order according to sample_method
+        episode_ids_all = list(episode_to_steps.keys())
+        if sample_method == "uniform":
+            self.rng.shuffle(episode_ids_all)
+        elif sample_method == "fifo":
+            # oldest first: sort by first step timestamp ascending
+            episode_ids_all.sort(key=lambda eid: episode_to_steps[eid][0].timestamp)
+        elif sample_method == "lifo":
+            # newest first
+            episode_ids_all.sort(key=lambda eid: episode_to_steps[eid][0].timestamp, reverse=True)
+        else:
+            logger.warning(f"Unknown sample_method '{sample_method}', fallback to uniform")
+            self.rng.shuffle(episode_ids_all)
+
+        if candidates_per_group > 1:
+            # Grouped trajectory sampling (GRPO-style): pick groups, each returns K candidates
+            # Build groups from group_to_step_indices; each group collapses to its last-step context as trajectory
+            all_group_keys = list(self.group_to_step_indices.keys())
+            if group_sampling == "uniform":
+                self.rng.shuffle(all_group_keys)
+            elif group_sampling == "fifo":
+                # approximate fifo by using earliest step timestamp order via index
+                pass
+            elif group_sampling == "lifo":
+                all_group_keys = list(reversed(all_group_keys))
+            # Choose as many groups as possible
+            if not all_group_keys:
                 return None
-        elif sampling_mode == "trajectory":
-            # Sample episodes, then within each episode take up to steps_per_episode assistant steps
-            # Build index by episode_id
-            episode_to_steps: Dict[str, List[StepTransition]] = {}
-            for step in self.step_transitions:
-                episode_to_steps.setdefault(step.episode_id, []).append(step)
-            if not episode_to_steps:
-                return None
-            # Randomize episode order
-            episode_ids = list(episode_to_steps.keys())
-            self.rng.shuffle(episode_ids)
-            sampled_steps = []
-            for ep_id in episode_ids:
-                steps = episode_to_steps[ep_id]
-                # sort by step_index to maintain order, then take head
-                steps_sorted = sorted(steps, key=lambda s: s.step_index)
-                take = min(steps_per_episode, len(steps_sorted))
-                sampled_steps.extend(steps_sorted[:take])
-                if len(sampled_steps) >= batch_size:
+            # Flatten: for each group, select up to K episode-steps (prefer last K)
+            messages_batch, episode_rewards, episode_penalties = [], [], []
+            env_ids, group_ids, tags, traj_group_ids, traj_ids, step_scores_list = [], [], [], [], [], []
+            for g in all_group_keys:
+                step_idxs = self.group_to_step_indices.get(g, [])
+                if not step_idxs:
+                    continue
+                # build per-episode trajectories from step indices (keep last step context)
+                # fetch corresponding StepTransition objects
+                steps = [self.step_transitions[idx] for idx in step_idxs]
+                # group by episode_id, take each episode's last step
+                ep_to_steps: Dict[str, List[StepTransition]] = {}
+                for s in steps:
+                    ep_to_steps.setdefault(s.episode_id, []).append(s)
+                cands: List[StepTransition] = [sorted(v, key=lambda s: s.step_index)[-1] for v in ep_to_steps.values()]
+                if not cands:
+                    continue
+                # take up to K candidates
+                selected = cands[-candidates_per_group:]
+                for sel in selected:
+                    messages_batch.append(sel.context_messages)
+                    episode_rewards.append(float(sel.reward))
+                    episode_penalties.append(float(sel.penalty))
+                    env_ids.append(f"replay_{sel.episode_id}_{sel.step_index}")
+                    group_ids.append("replay_group")
+                    tags.append("replay")
+                    traj_group_ids.append(g)
+                    traj_ids.append(f"{g}_laststep{sel.step_index}")
+                    step_scores_list.append([float(sel.reward)])
+                # stop when enough
+                if len(messages_batch) >= batch_size:
                     break
-            if len(sampled_steps) > batch_size:
-                sampled_steps = sampled_steps[:batch_size]
-            if len(sampled_steps) < batch_size:
-                logger.debug(f"Trajectory sampling returned {len(sampled_steps)} < requested {batch_size}")
+            if len(messages_batch) == 0:
+                return None
+            # If we have stored behavior logp per step, pass as behavior_logps (scalar per sample)
+            beh_lps = None
+            try:
+                beh_lps = [float(0.0) for _ in messages_batch]  # default zeros if not available
+            except Exception:
+                beh_lps = None
+            return self._build_dataproto_from_messages(
+                messages_batch=messages_batch,
+                rewards=episode_rewards,
+                penalties=episode_penalties,
+                step_scores_list=step_scores_list,
+                env_ids=env_ids,
+                group_ids=group_ids,
+                tags=tags,
+                traj_group_ids=traj_group_ids,
+                traj_ids=traj_ids,
+                device=device,
+                tokenizer=tokenizer,
+                sequence_length=sequence_length,
+                behavior_logps=beh_lps,
+            )
+
+        if sampling_mode == "step":
+            k = max(1, steps_per_episode)
+            # Enumerate all windows (ep_id, start_idx, length)
+            windows = []  # List[Tuple[str, int, int]]
+            for ep_id in episode_ids_all:
+                steps = episode_to_steps[ep_id]
+                m = len(steps)
+                if m == 0:
+                    continue
+                if m >= k:
+                    for start in range(0, m - k + 1):
+                        windows.append((ep_id, start, k))
+                else:
+                    # Not enough steps; still allow using the whole episode as one shorter window
+                    windows.append((ep_id, 0, m))
+
+            if not windows:
+                return None
+
+            # Sample windows with replacement if needed
+            # Select windows according to sample_method
+            if sample_method == "uniform":
+                selected = [self.rng.choice(windows) for _ in range(batch_size)]
+            elif sample_method == "fifo":
+                selected = windows[:batch_size] if len(windows) >= batch_size else windows
+            elif sample_method == "lifo":
+                selected = list(reversed(windows))[:batch_size] if len(windows) >= batch_size else list(reversed(windows))
+            else:
+                selected = [self.rng.choice(windows) for _ in range(batch_size)]
+
+            # Build messages and rewards for each selected window
+            messages_batch: List[List[Dict]] = []
+            window_rewards: List[float] = []
+            window_penalties: List[float] = []
+            env_ids = []
+            group_ids = []
+            tags = []
+            traj_group_ids = []
+            traj_ids = []
+            step_scores_list = []
+
+            beh_lps = []
+            for sel_idx, (ep_id, start, length) in enumerate(selected):
+                steps = episode_to_steps[ep_id]
+                end = start + length
+                window_steps = steps[start:end]
+                # messages: slice last K assistant turns from the last step's context
+                full_messages = window_steps[-1].context_messages
+                sliced_messages = self._slice_messages_last_k_steps(full_messages, length)
+                messages_batch.append(sliced_messages)
+
+                # window reward: sum of step rewards in window
+                rewards_in_window = [float(s.reward) for s in window_steps]
+                window_rewards.append(float(np.sum(rewards_in_window)))
+                step_scores_list.append(rewards_in_window)
+
+                penalties_in_window = [float(s.penalty) for s in window_steps]
+                window_penalties.append(float(np.sum(penalties_in_window)))
+
+                # ids
+                env_ids.append(f"replay_{ep_id}_{window_steps[-1].step_index}")
+                group_ids.append("replay_group")
+                tags.append("replay")
+                traj_group_id = f"replay_replay_group_{ep_id}_win{start}_{length}"
+                traj_id = f"{traj_group_id}_laststep{window_steps[-1].step_index}"
+                traj_group_ids.append(traj_group_id)
+                traj_ids.append(traj_id)
+                # behavior logp: use last step's recorded behavior logp if available
+                try:
+                    beh_lps.append(float(window_steps[-1].behavior_log_prob))
+                except Exception:
+                    beh_lps.append(0.0)
+
+            return self._build_dataproto_from_messages(
+                messages_batch=messages_batch,
+                rewards=window_rewards,
+                penalties=window_penalties,
+                step_scores_list=step_scores_list,
+                env_ids=env_ids,
+                group_ids=group_ids,
+                tags=tags,
+                traj_group_ids=traj_group_ids,
+                traj_ids=traj_ids,
+                device=device,
+                tokenizer=tokenizer,
+                sequence_length=sequence_length,
+                behavior_logps=beh_lps,
+            )
+
+        elif sampling_mode == "trajectory":
+            # Sample whole episodes as single samples according to episode order
+            episode_ids = episode_ids_all
+            episode_ids_selected = episode_ids[:batch_size] if len(episode_ids) >= batch_size else episode_ids
+
+            messages_batch: List[List[Dict]] = []
+            episode_rewards: List[float] = []
+            episode_penalties: List[float] = []
+            env_ids = []
+            group_ids = []
+            tags = []
+            traj_group_ids = []
+            traj_ids = []
+            step_scores_list = []
+
+            beh_lps = []
+            for ep_id in episode_ids_selected:
+                steps = episode_to_steps[ep_id]
+                if not steps:
+                    continue
+                # use the last step's full conversation
+                full_messages = steps[-1].context_messages
+                messages_batch.append(full_messages)
+                # episode total reward = sum of step rewards recorded in buffer
+                step_rewards = [float(s.reward) for s in steps]
+                episode_rewards.append(float(np.sum(step_rewards)))
+                step_scores_list.append(step_rewards)
+
+                step_penalties = [float(s.penalty) for s in steps]
+                episode_penalties.append(float(np.sum(step_penalties)))
+                env_ids.append(f"replay_{ep_id}_{steps[-1].step_index}")
+                group_ids.append("replay_group")
+                tags.append("replay")
+                traj_group_id = f"replay_replay_group_{ep_id}_full"
+                traj_id = f"{traj_group_id}_laststep{steps[-1].step_index}"
+                traj_group_ids.append(traj_group_id)
+                traj_ids.append(traj_id)
+                # behavior logp for this episode: last step's value
+                try:
+                    beh_lps.append(float(steps[-1].behavior_log_prob))
+                except Exception:
+                    beh_lps.append(0.0)
+
+            if len(messages_batch) == 0:
+                return None
+
+            return self._build_dataproto_from_messages(
+                messages_batch=messages_batch,
+                rewards=episode_rewards,
+                penalties=episode_penalties,
+                step_scores_list=step_scores_list,
+                env_ids=env_ids,
+                group_ids=group_ids,
+                tags=tags,
+                traj_group_ids=traj_group_ids,
+                traj_ids=traj_ids,
+                device=device,
+                tokenizer=tokenizer,
+                sequence_length=sequence_length,
+                behavior_logps=beh_lps,
+            )
         else:
             logger.error(f"Unknown sampling_mode: {sampling_mode}")
             return None
-        
-        # Handle different storage modes
-        if self.storage_mode == "tokens_only":
-            return self._sample_tokens_only(sampled_steps, batch_size, device)
-        elif self.storage_mode == "text_only":
-            return self._sample_text_only(sampled_steps, batch_size, device, tokenizer)
-        else:  # hybrid - use env_worker compatible output
-            return self._sample_hybrid_as_env_worker(sampled_steps, batch_size, device, sequence_length, tokenizer)
     
     def _sample_tokens_only(self, sampled_steps: List[StepTransition], batch_size: int, device: str) -> DataProto:
         """Sample for tokens_only storage mode."""
@@ -372,15 +652,21 @@ class TextualReplayBuffer:
         
         # Training signals
         rewards = torch.tensor([step.reward for step in sampled_steps], dtype=torch.float32, device=device)
+        penalties = torch.tensor([step.penalty for step in sampled_steps], dtype=torch.float32, device=device)
         advantages = torch.tensor([step.advantage for step in sampled_steps], dtype=torch.float32, device=device)
-        old_log_probs = torch.tensor([step.old_log_prob for step in sampled_steps], dtype=torch.float32, device=device)
+        # Prefer behavior_log_prob when available; fallback to stored old_log_prob
+        old_log_probs = torch.tensor([
+            (step.behavior_log_prob if getattr(step, 'behavior_log_prob', 0.0) != 0.0 else step.old_log_prob)
+            for step in sampled_steps
+        ], dtype=torch.float32, device=device)
         ref_log_probs = torch.tensor([step.ref_log_prob for step in sampled_steps], dtype=torch.float32, device=device)
         
-        # Expand to sequence length (ROLL format requirement)
-        old_log_probs_expanded = old_log_probs.unsqueeze(-1).expand(-1, max_len)
-        ref_log_probs_expanded = ref_log_probs.unsqueeze(-1).expand(-1, max_len)
+        # Expand to sequence length - 1 (align with labels/input_ids[:, 1:])
+        time_len = max(max_len - 1, 1)
+        old_log_probs_expanded = old_log_probs.unsqueeze(-1).expand(-1, time_len)
+        ref_log_probs_expanded = ref_log_probs.unsqueeze(-1).expand(-1, time_len)
         
-        return DataProto.from_dict(
+        dp = DataProto.from_dict(
             tensors={
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
@@ -389,6 +675,7 @@ class TextualReplayBuffer:
                 'advantages': advantages,
                 'old_log_probs': old_log_probs_expanded,
                 'ref_log_probs': ref_log_probs_expanded,
+                'penalty': penalties,
             },
             non_tensors={
                 'step_indices': [step.step_index for step in sampled_steps],
@@ -400,6 +687,7 @@ class TextualReplayBuffer:
                 'storage_mode': self.storage_mode
             }
         )
+        return dp
     
     def _sample_text_only(self, sampled_steps: List[StepTransition], batch_size: int, device: str, tokenizer) -> DataProto:
         """Sample for text_only storage mode - tokenize on demand."""
@@ -457,11 +745,12 @@ class TextualReplayBuffer:
         old_log_probs = torch.tensor([step.old_log_prob for step in sampled_steps], dtype=torch.float32, device=device)
         ref_log_probs = torch.tensor([step.ref_log_prob for step in sampled_steps], dtype=torch.float32, device=device)
         
-        # Expand to sequence length
-        old_log_probs_expanded = old_log_probs.unsqueeze(-1).expand(-1, max_len)
-        ref_log_probs_expanded = ref_log_probs.unsqueeze(-1).expand(-1, max_len)
+        # Expand to sequence length - 1 (align with labels/input_ids[:, 1:])
+        time_len = max(max_len - 1, 1)
+        old_log_probs_expanded = old_log_probs.unsqueeze(-1).expand(-1, time_len)
+        ref_log_probs_expanded = ref_log_probs.unsqueeze(-1).expand(-1, time_len)
         
-        return DataProto.from_dict(
+        dp = DataProto.from_dict(
             tensors={
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
@@ -483,13 +772,13 @@ class TextualReplayBuffer:
                 'storage_mode': self.storage_mode
             }
         )
+        return dp
     
     def _sample_hybrid_as_env_worker(self, sampled_steps: List[StepTransition], batch_size: int, 
                                     device: str, sequence_length: int, tokenizer) -> DataProto:
         """
         Sample stored step transitions and return original dynamic-length data.
         
-        ✅ PADDING MOVED TO PIPELINE: No longer padding here, let pipeline handle unified padding.
         This acts as environment buffer providing raw pre-computed data to ROLL's training pipeline.
         """
         from roll.distributed.scheduler.protocol import TensorDict
@@ -509,8 +798,6 @@ class TextualReplayBuffer:
         
         for step in sampled_steps:
             # Use stored pre-tokenized data (no re-tokenization!)
-            # ✅ PADDING MOVED TO PIPELINE: Return original dynamic lengths
-            # ⚠️ FIX DTYPE: Convert int32 to int64 for PyTorch compatibility
             input_ids = torch.from_numpy(step.input_ids).long().unsqueeze(0).to(device)
             attention_mask = torch.from_numpy(step.attention_mask).unsqueeze(0).to(device)
             response_mask = torch.from_numpy(step.response_mask).unsqueeze(0).to(device)
@@ -614,6 +901,187 @@ class TextualReplayBuffer:
             "storage_mode": self.storage_mode
         }
         
+        return lm_input
+
+    def _slice_messages_last_k_steps(self, messages: List[Dict], k: int) -> List[Dict]:
+        """Return a slice of messages that contains only the last k assistant turns.
+        Always keeps the initial system message.
+        """
+        if k <= 0:
+            k = 1
+        # Find indices of assistant messages
+        assistant_indices = [idx for idx, m in enumerate(messages) if m.get('role') == 'assistant']
+        if not assistant_indices:
+            # no assistant yet, keep as-is (system + possibly user)
+            return messages
+        if len(assistant_indices) <= k:
+            # already <= k steps
+            return messages
+        first_assistant_to_keep = assistant_indices[-k]
+        # include from the closest user/system before that assistant
+        start_idx = first_assistant_to_keep
+        while start_idx > 0 and messages[start_idx - 1].get('role') == 'user':
+            start_idx -= 1
+        # Always ensure system message at position 0 is kept
+        if start_idx > 0 and messages[0].get('role') == 'system':
+            return [messages[0]] + messages[start_idx:]
+        return messages[start_idx:]
+
+    def _build_dataproto_from_messages(self,
+                                       messages_batch: List[List[Dict]],
+                                       rewards: List[float],
+                                       penalties: List[float],
+                                       step_scores_list: List[List[float]],
+                                       env_ids: List[str],
+                                       group_ids: List[str],
+                                       tags: List[str],
+                                       traj_group_ids: List[str],
+                                       traj_ids: List[str],
+                                       device: str,
+                                       tokenizer,
+                                       sequence_length: int,
+                                       behavior_logps: Optional[List[float]] = None) -> DataProto:
+        from roll.distributed.scheduler.protocol import TensorDict
+        # Tokenize per sample, build masks, then pad to sequence_length
+        input_ids_list = []
+        attention_masks_list = []
+        response_masks_list = []
+        score_tensors_list = []
+
+        for messages in messages_batch:
+            lm_input_texts = tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
+            inputs = tokenizer(lm_input_texts, return_tensors="pt", padding=True, padding_side="left", truncation=False)
+            token_ids = inputs.input_ids[0].tolist()
+            token_ids_split = split_by_token(token_ids, token_ids[0])
+            resp_masks_list = token_ids_to_assistant_mask(messages=messages, input_ids_list=token_ids_split, tokenizer=tokenizer)
+            # Flatten
+            flat_ids = []
+            flat_resp_mask = []
+            for ids, rm in zip(token_ids_split, resp_masks_list):
+                flat_ids.extend(ids)
+                flat_resp_mask.extend(rm)
+
+            # Prompt/response boundaries
+            if 1 in flat_resp_mask:
+                first_resp_idx = flat_resp_mask.index(1)
+                last_resp_idx = len(flat_resp_mask) - 1 - flat_resp_mask[::-1].index(1)
+            else:
+                first_resp_idx = len(flat_resp_mask)
+                last_resp_idx = len(flat_resp_mask) - 1
+
+            attention_mask = [1] * len(flat_ids)
+            prompt_mask = [1] * first_resp_idx + [0] * (len(flat_ids) - first_resp_idx)
+            response_mask = flat_resp_mask
+
+            # Score tensor: place reward at last response token
+            score_tensor = [0.0] * len(flat_ids)
+            if 0 <= last_resp_idx < len(score_tensor):
+                # pop from rewards list in outer scope later; here pass placeholder
+                pass
+
+            input_ids_list.append(torch.tensor(flat_ids, dtype=torch.long, device=device).unsqueeze(0))
+            attention_masks_list.append(torch.tensor(attention_mask, dtype=torch.bool, device=device).unsqueeze(0))
+            response_masks_list.append(torch.tensor(response_mask, dtype=torch.bool, device=device).unsqueeze(0))
+            score_tensors_list.append((last_resp_idx, score_tensor))
+
+        # Pad and assemble batch
+        max_len = sequence_length
+        padded_input_ids = []
+        padded_attention_mask = []
+        padded_response_mask = []
+        padded_position_ids = []
+        padded_prompt_mask = []
+        padded_scores = []
+
+        for i in range(len(messages_batch)):
+            input_ids = input_ids_list[i]
+            attention_mask = attention_masks_list[i]
+            response_mask = response_masks_list[i]
+            last_resp_idx, score_tensor = score_tensors_list[i]
+
+            # set reward now
+            if 0 <= last_resp_idx < len(score_tensor):
+                score_tensor[last_resp_idx] = float(rewards[i])
+
+            if input_ids.size(1) < max_len:
+                pad_len = max_len - input_ids.size(1)
+                input_ids = torch.nn.functional.pad(input_ids, (0, pad_len), value=tokenizer.pad_token_id)
+                attention_mask = torch.nn.functional.pad(attention_mask, (0, pad_len), value=0)
+                response_mask = torch.nn.functional.pad(response_mask, (0, pad_len), value=0)
+                prompt_mask = torch.nn.functional.pad(torch.tensor([score_tensor], dtype=torch.bool, device=device), (0, pad_len), value=0)  # placeholder, will recompute
+            else:
+                input_ids = input_ids[:, :max_len]
+                attention_mask = attention_mask[:, :max_len]
+                response_mask = response_mask[:, :max_len]
+
+            # recompute prompt_mask from attention/response
+            prompt_mask_tensor = attention_mask.bool() & torch.logical_not(response_mask.bool())
+            position_ids = attention_mask.cumsum(dim=-1)
+            scores_tensor = torch.zeros_like(input_ids, dtype=torch.float, device=device)
+            # place reward again after potential truncation
+            valid_len = input_ids.size(1)
+            lr = min(last_resp_idx, valid_len - 1)
+            if lr >= 0:
+                scores_tensor[0, lr] = float(rewards[i])
+
+            padded_input_ids.append(input_ids)
+            padded_attention_mask.append(attention_mask)
+            padded_response_mask.append(response_mask)
+            padded_position_ids.append(position_ids)
+            padded_prompt_mask.append(prompt_mask_tensor)
+            padded_scores.append(scores_tensor)
+
+        batch_input_ids = torch.cat(padded_input_ids, dim=0)
+        batch_attention_mask = torch.cat(padded_attention_mask, dim=0)
+        batch_response_mask = torch.cat(padded_response_mask, dim=0)
+        batch_position_ids = torch.cat(padded_position_ids, dim=0)
+        batch_prompt_mask = torch.cat(padded_prompt_mask, dim=0)
+        batch_scores = torch.cat(padded_scores, dim=0)
+
+        # Optional: build old_log_probs from behavior_logps (scalar per sample)
+        old_log_probs = None
+        if behavior_logps is not None and len(behavior_logps) == len(messages_batch):
+            beh = torch.tensor(behavior_logps, dtype=torch.float, device=device).unsqueeze(-1)
+            # broadcast scalar to sequence then take shifted positions (time_len = seq_len-1)
+            seq_len = batch_response_mask.shape[1]
+            time_len = max(seq_len - 1, 1)
+            old_log_probs_full = beh.expand(batch_response_mask.shape[0], seq_len)
+            old_log_probs = (old_log_probs_full * batch_response_mask.float())[:, 1:][:, :time_len]
+
+        penalty = torch.tensor(penalties, dtype=torch.float, device=device)
+
+        lm_input = DataProto()
+        lm_input.batch = TensorDict(
+            {
+                "input_ids": batch_input_ids,
+                "attention_mask": batch_attention_mask,
+                "position_ids": batch_position_ids,
+                "response_mask": batch_response_mask,
+                "prompt_mask": batch_prompt_mask,
+                "scores": batch_scores,
+                "penalty": penalty,
+                **({"old_log_probs": old_log_probs} if old_log_probs is not None else {}),
+            },
+            batch_size=batch_input_ids.shape[0]
+        )
+
+        lm_input.non_tensor_batch = {
+            "messages_list": np.array(messages_batch, dtype=object),
+            "env_ids": np.array(env_ids, dtype=object),
+            "group_ids": np.array(group_ids, dtype=object),
+            "tags": np.array(tags, dtype=object),
+            "frames": np.array([[] for _ in range(len(messages_batch))], dtype=object),
+            "step_scores": np.array(step_scores_list, dtype=object),
+            "episode_scores": np.array(rewards, dtype=object),
+            "traj_group_id": np.array(traj_group_ids, dtype=object),
+            "traj_id": np.array(traj_ids, dtype=object),
+        }
+
+        lm_input.meta_info = {
+            "from_replay_buffer": True,
+            "storage_mode": self.storage_mode,
+        }
+
         return lm_input
     
     def sample_for_text_ops(self, batch_size: Optional[int] = None) -> List[Tuple[str, str]]:

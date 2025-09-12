@@ -40,9 +40,9 @@ system_envs:
 track_with: wandb
 tracker_kwargs:
   project: roll-agentic-replay
-  name: ${timestamp}_${exp_name}_step_buffer_hybrid
-  notes: "Step-based Replay: hybrid storage, 100K transitions, ROLL-native tokenization"
-  tags: [agentic, roll, frozen_lake, step_based, hybrid, optimized, v3]
+  name: ${timestamp}_${exp_name}_trajectory_replay
+  notes: "Trajectory Replay: full-episode sampling via replay buffer (hybrid storage)"
+  tags: [agentic, roll, frozen_lake, trajectory_replay, hybrid, test]
   mode: offline
   dir: ${base_output_dir}/${timestamp}/wandb
 
@@ -82,6 +82,8 @@ init_kl_coef: 0.0               # No KL penalty
 whiten_advantages: true          # Normalize advantages
 entropy_loss_coef: 0            # No entropy bonus
 max_grad_norm: 1.0              # Gradient clipping
+
+## NOTE: Using trajectory replay; no step window length is needed.
 
 # =============================================================================
 # MODEL CONFIGURATION
@@ -201,6 +203,10 @@ custom_envs:
       Respond with one action token only, within {max_response_length} tokens.
     reward_template: "Feedback: Your previous action received reward {reward}. Revise your plan if needed."
     env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    # NOTE (env manager selection):
+    # - For trajectory replay testing, keep TrajEnvManager. Fresh on-policy data will be full-trajectory samples.
+    # - You do NOT need StepEnvManager to use step-level replay from the buffer.
+    # - Switch to StepEnvManager ONLY if you also want fresh on-policy data to be emitted as step samples.
     use_thread_lock: true
     env_config:
       env_instruction: "You are solving the FrozenLake puzzle. Forbid the whole and go to the target. You may move to the unintended direction due to the slippery ice. The answer must be one of action in a turn, format is <answer>Right</answer>"
@@ -226,11 +232,22 @@ replay:
   use_rollout_batch_size: true  # Use rollout_batch_size (1024) for consistency
   
   # Data mixing configuration  
-  replay_ratio: 0.1             # 30% replay data, 70% fresh data (conservative start)
+  replay_ratio: 0.1             # Replay-to-fresh ratio by count.
+                                 # replay_batch_size = int(fresh_batch_size * replay_ratio)
+                                 # 0.0 => 100% fresh (no replay)
+                                 # 0.1 => ~10% replay + ~90% fresh (total batch ≈ 1.1x fresh)
+                                 # 1.0 => replay count ≈ fresh count (total batch ≈ 2x fresh)
   
-  # Sampling mode (trajectory-level by default for fair comparison with original ROLL)
+  # Sampling mode (trajectory-level for testing full-episode replay)
   sampling_mode: trajectory      # trajectory | step
-  steps_per_episode: ${max_actions_per_traj}   # sample a full episode each time
+  steps_per_episode: ${max_actions_per_traj}   # sample a full episode each time or a K-step window for step mode
+  # Sample method controls global selection order:
+  # - uniform: random shuffle（默认）
+  # - fifo: 按 timestamp 升序（更老的样本优先）
+  # - lifo: 按 timestamp 降序（最新样本优先）
+  sample_method: fifo
+  # 将训练更新切换为仅使用 Replay Buffer（fresh 仅用于入库）
+  train_from_replay_only: true
   
   # =========================================================================== 
   # STORAGE MODE CONFIGURATION - Choose one configuration below
@@ -247,4 +264,16 @@ replay:
   # ⚡ TOKENS-ONLY MODE (Uncomment for pure training performance)
   # storage_mode: tokens_only   # Stores only tokens, no text analysis capability
   # lazy_tokenization: false   # Not used in tokens_only mode
+
+# =============================
+# REPLAY-ONLY TRAINING SWITCH
+# =============================
+# 设置为 true 表示训练更新仅使用 Replay Buffer 的 minibatch；fresh rollout 仅用于采样与入库。
+# 若要近似“100%重放训练”，推荐：
+# - replay.enabled: true
+# - replay.min_size: 512（或更高，确保热身）
+# - replay.minibatch_size: 128~256（建议小一点，提高稳定性）
+# - replay.train_steps_per_env_step: 4~8（或更高）
+# - train_from_replay_only: true
+
 
