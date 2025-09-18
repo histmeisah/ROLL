@@ -49,6 +49,12 @@ class ReplayConfig:
         metadata={"help": "Storage mode: 'hybrid' (text+tokens), 'text_only' (pure text), 'tokens_only' (pure tokens)"}
     )
     
+    # Manager type detection (for advanced users)
+    source_manager_type: str = field(
+        default="auto",
+        metadata={"help": "Source env_manager type: 'auto' (detect), 'trajectory' (TrajEnvManager), 'step' (StepEnvManager)"}
+    )
+    
     lazy_tokenization: bool = field(
         default=False,
         metadata={"help": "If True, tokenize only during sampling (memory efficient, but slower sampling)"}

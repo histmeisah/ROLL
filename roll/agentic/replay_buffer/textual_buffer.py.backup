@@ -76,6 +76,7 @@ class TextualReplayBuffer:
     3. Memory optimization: avoids redundant context storage
     4. Backward compatibility: can reconstruct trajectory format for training
     5. High capacity: supports 1M+ steps with minimal memory footprint
+    6. Manager-aware: adapts to different env_manager semantics (traj vs step)
     """
     
     def __init__(
@@ -84,7 +85,8 @@ class TextualReplayBuffer:
         seed: int = 42,
         batch_size: int = 128,  # Should match rollout_batch_size
         storage_mode: Literal["hybrid", "text_only", "tokens_only"] = "hybrid",
-        lazy_tokenization: bool = False
+        lazy_tokenization: bool = False,
+        source_manager_type: str = "auto"  # "trajectory" | "step" | "auto"
     ):
         """
         Initialize step-based textual replay buffer with configurable storage mode.
@@ -100,6 +102,7 @@ class TextualReplayBuffer:
         self.batch_size = batch_size
         self.storage_mode = storage_mode
         self.lazy_tokenization = lazy_tokenization
+        self.source_manager_type = source_manager_type
         self.step_transitions: deque[StepTransition] = deque(maxlen=capacity)
         self.rng = random.Random(seed)
         
@@ -112,6 +115,7 @@ class TextualReplayBuffer:
         logger.info(f"  - Capacity: {capacity:,} step transitions")
         logger.info(f"  - Batch size: {batch_size}")
         logger.info(f"  - Storage mode: {storage_mode}")
+        logger.info(f"  - Source manager type: {source_manager_type}")
         logger.info(f"  - Lazy tokenization: {lazy_tokenization}")
     
     def push_from_dataproto(self, batch: DataProto, tokenizer) -> int:
@@ -131,6 +135,11 @@ class TextualReplayBuffer:
         if len(batch) == 0:
             logger.warning("Received empty batch for replay buffer storage")
             return 0
+        
+        # Auto-detect manager type on first batch if needed
+        if self.source_manager_type == "auto":
+            self.source_manager_type = self._detect_manager_type(batch)
+            logger.info(f"Auto-detected env_manager type: {self.source_manager_type}")
             
         # Extract messages from ROLL's native format
         messages_list = batch.non_tensor_batch.get('messages_list', [])
@@ -398,31 +407,24 @@ class TextualReplayBuffer:
         for ep_id in list(episode_to_steps.keys()):
             episode_to_steps[ep_id] = sorted(episode_to_steps[ep_id], key=lambda s: s.step_index)
 
-        # Determine episode order according to sample_method
+        # Determine episode order (drop FIFO support): prefer lifo or uniform
         episode_ids_all = list(episode_to_steps.keys())
-        if sample_method == "uniform":
-            self.rng.shuffle(episode_ids_all)
-        elif sample_method == "fifo":
-            # oldest first: sort by first step timestamp ascending
-            episode_ids_all.sort(key=lambda eid: episode_to_steps[eid][0].timestamp)
-        elif sample_method == "lifo":
+        if sample_method == "lifo":
             # newest first
             episode_ids_all.sort(key=lambda eid: episode_to_steps[eid][0].timestamp, reverse=True)
         else:
-            logger.warning(f"Unknown sample_method '{sample_method}', fallback to uniform")
+            # default to uniform
             self.rng.shuffle(episode_ids_all)
 
         if candidates_per_group > 1:
             # Grouped trajectory sampling (GRPO-style): pick groups, each returns K candidates
             # Build groups from group_to_step_indices; each group collapses to its last-step context as trajectory
             all_group_keys = list(self.group_to_step_indices.keys())
-            if group_sampling == "uniform":
-                self.rng.shuffle(all_group_keys)
-            elif group_sampling == "fifo":
-                # approximate fifo by using earliest step timestamp order via index
-                pass
-            elif group_sampling == "lifo":
+            if group_sampling == "lifo":
                 all_group_keys = list(reversed(all_group_keys))
+            else:
+                # default to uniform
+                self.rng.shuffle(all_group_keys)
             # Choose as many groups as possible
             if not all_group_keys:
                 return None
@@ -503,13 +505,10 @@ class TextualReplayBuffer:
 
             # Sample windows with replacement if needed
             # Select windows according to sample_method
-            if sample_method == "uniform":
-                selected = [self.rng.choice(windows) for _ in range(batch_size)]
-            elif sample_method == "fifo":
-                selected = windows[:batch_size] if len(windows) >= batch_size else windows
-            elif sample_method == "lifo":
+            if sample_method == "lifo":
                 selected = list(reversed(windows))[:batch_size] if len(windows) >= batch_size else list(reversed(windows))
             else:
+                # default to uniform
                 selected = [self.rng.choice(windows) for _ in range(batch_size)]
 
             # Build messages and rewards for each selected window
@@ -538,14 +537,19 @@ class TextualReplayBuffer:
                 window_rewards.append(float(np.sum(rewards_in_window)))
                 step_scores_list.append(rewards_in_window)
 
-                penalties_in_window = [float(s.penalty) for s in window_steps]
-                window_penalties.append(float(np.sum(penalties_in_window)))
+                # Use last step penalty as representative (not cumulative sum)
+                window_penalties.append(float(window_steps[-1].penalty))
 
                 # ids
                 env_ids.append(f"replay_{ep_id}_{window_steps[-1].step_index}")
                 group_ids.append("replay_group")
                 tags.append("replay")
-                traj_group_id = f"replay_replay_group_{ep_id}_win{start}_{length}"
+                # Generate traj_group_id consistent with TrajEnvManager format
+                tag = "replay"
+                group_id = "replay_group" 
+                episode_id = ep_id
+                group_seed = f"win{start}_{length}"  # Use window info as seed
+                traj_group_id = f"{tag}_{group_id}_{episode_id}_{group_seed}"
                 traj_id = f"{traj_group_id}_laststep{window_steps[-1].step_index}"
                 traj_group_ids.append(traj_group_id)
                 traj_ids.append(traj_id)
@@ -599,12 +603,25 @@ class TextualReplayBuffer:
                 episode_rewards.append(float(np.sum(step_rewards)))
                 step_scores_list.append(step_rewards)
 
-                step_penalties = [float(s.penalty) for s in steps]
-                episode_penalties.append(float(np.sum(step_penalties)))
+                # Handle penalty based on source manager semantics
+                if self.source_manager_type == "trajectory":
+                    # TrajEnvManager: penalty is episode-level, use last step
+                    episode_penalties.append(float(steps[-1].penalty))
+                else:
+                    # StepEnvManager: penalty is step-level, sum is appropriate
+                    step_penalties = [float(s.penalty) for s in steps]
+                    episode_penalties.append(float(np.sum(step_penalties)))
                 env_ids.append(f"replay_{ep_id}_{steps[-1].step_index}")
                 group_ids.append("replay_group")
                 tags.append("replay")
-                traj_group_id = f"replay_replay_group_{ep_id}_full"
+                # Generate traj_group_id consistent with TrajEnvManager format
+                # Use first step's metadata to reconstruct original format
+                first_step = steps[0]
+                tag = "replay"  # Use replay as tag
+                group_id = "replay_group"  # Consistent with env_ids generation
+                episode_id = ep_id
+                group_seed = "0"  # Default seed for replay
+                traj_group_id = f"{tag}_{group_id}_{episode_id}_{group_seed}"
                 traj_id = f"{traj_group_id}_laststep{steps[-1].step_index}"
                 traj_group_ids.append(traj_group_id)
                 traj_ids.append(traj_id)
@@ -650,32 +667,38 @@ class TextualReplayBuffer:
             attention_mask[i, :seq_len] = torch.from_numpy(step.attention_mask)
             response_mask[i, :seq_len] = torch.from_numpy(step.response_mask)
         
-        # Training signals
+        # Extract data needed for pipeline computation
         rewards = torch.tensor([step.reward for step in sampled_steps], dtype=torch.float32, device=device)
         penalties = torch.tensor([step.penalty for step in sampled_steps], dtype=torch.float32, device=device)
-        advantages = torch.tensor([step.advantage for step in sampled_steps], dtype=torch.float32, device=device)
-        # Prefer behavior_log_prob when available; fallback to stored old_log_prob
-        old_log_probs = torch.tensor([
-            (step.behavior_log_prob if getattr(step, 'behavior_log_prob', 0.0) != 0.0 else step.old_log_prob)
-            for step in sampled_steps
-        ], dtype=torch.float32, device=device)
-        ref_log_probs = torch.tensor([step.ref_log_prob for step in sampled_steps], dtype=torch.float32, device=device)
         
-        # Expand to sequence length - 1 (align with labels/input_ids[:, 1:])
-        time_len = max(max_len - 1, 1)
-        old_log_probs_expanded = old_log_probs.unsqueeze(-1).expand(-1, time_len)
-        ref_log_probs_expanded = ref_log_probs.unsqueeze(-1).expand(-1, time_len)
+        # Add missing required fields that pipeline expects
+        position_ids = attention_mask.cumsum(dim=-1)
+        prompt_mask = attention_mask.bool() & torch.logical_not(response_mask.bool())
+        
+        # Create token-level scores tensor (similar to TrajEnvManager)
+        # Put reward on the last response token for each sample
+        scores = torch.zeros_like(input_ids, dtype=torch.float32, device=device)
+        for i, (reward, resp_mask) in enumerate(zip(rewards, response_mask)):
+            # Find last response token position
+            response_positions = torch.where(resp_mask)[0]
+            if len(response_positions) > 0:
+                last_resp_pos = response_positions[-1]
+                scores[i, last_resp_pos] = reward
         
         dp = DataProto.from_dict(
             tensors={
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
+                'position_ids': position_ids,
                 'response_mask': response_mask,
-                'response_level_rewards': rewards,
-                'advantages': advantages,
-                'old_log_probs': old_log_probs_expanded,
-                'ref_log_probs': ref_log_probs_expanded,
+                'prompt_mask': prompt_mask,
+                'scores': scores,
                 'penalty': penalties,
+                # ❌ 删除预计算的training signals，让pipeline重新计算：
+                # 'response_level_rewards': rewards,
+                # 'advantages': advantages, 
+                # 'old_log_probs': old_log_probs_expanded,
+                # 'ref_log_probs': ref_log_probs_expanded,
             },
             non_tensors={
                 'step_indices': [step.step_index for step in sampled_steps],
@@ -739,26 +762,36 @@ class TextualReplayBuffer:
             attention_mask[i, :seq_len] = torch.from_numpy(att_mask)
             response_mask[i, :seq_len] = torch.from_numpy(resp_mask)
         
-        # Training signals
+        # Extract data needed for pipeline computation
         rewards = torch.tensor([step.reward for step in sampled_steps], dtype=torch.float32, device=device)
-        advantages = torch.tensor([step.advantage for step in sampled_steps], dtype=torch.float32, device=device)
-        old_log_probs = torch.tensor([step.old_log_prob for step in sampled_steps], dtype=torch.float32, device=device)
-        ref_log_probs = torch.tensor([step.ref_log_prob for step in sampled_steps], dtype=torch.float32, device=device)
         
-        # Expand to sequence length - 1 (align with labels/input_ids[:, 1:])
-        time_len = max(max_len - 1, 1)
-        old_log_probs_expanded = old_log_probs.unsqueeze(-1).expand(-1, time_len)
-        ref_log_probs_expanded = ref_log_probs.unsqueeze(-1).expand(-1, time_len)
+        # Add missing required fields that pipeline expects
+        position_ids = attention_mask.cumsum(dim=-1)
+        prompt_mask = attention_mask.bool() & torch.logical_not(response_mask.bool())
+        
+        # Create token-level scores tensor (similar to TrajEnvManager)
+        # Put reward on the last response token for each sample
+        scores = torch.zeros_like(input_ids, dtype=torch.float32, device=device)
+        for i, (reward, resp_mask) in enumerate(zip(rewards, response_mask)):
+            # Find last response token position
+            response_positions = torch.where(resp_mask)[0]
+            if len(response_positions) > 0:
+                last_resp_pos = response_positions[-1]
+                scores[i, last_resp_pos] = reward
         
         dp = DataProto.from_dict(
             tensors={
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
+                'position_ids': position_ids,
                 'response_mask': response_mask,
-                'response_level_rewards': rewards,
-                'advantages': advantages,
-                'old_log_probs': old_log_probs_expanded,
-                'ref_log_probs': ref_log_probs_expanded,
+                'prompt_mask': prompt_mask,
+                'scores': scores,
+                # ❌ 删除预计算的training signals，让pipeline重新计算：
+                # 'response_level_rewards': rewards,
+                # 'advantages': advantages,
+                # 'old_log_probs': old_log_probs_expanded, 
+                # 'ref_log_probs': ref_log_probs_expanded,
             },
             non_tensors={
                 'context_texts': [step.context_text for step in sampled_steps],
@@ -1060,7 +1093,8 @@ class TextualReplayBuffer:
                 "prompt_mask": batch_prompt_mask,
                 "scores": batch_scores,
                 "penalty": penalty,
-                **({"old_log_probs": old_log_probs} if old_log_probs is not None else {}),
+                # ❌ 删除old_log_probs，让pipeline重新计算
+                # **({"old_log_probs": old_log_probs} if old_log_probs is not None else {}),
             },
             batch_size=batch_input_ids.shape[0]
         )
@@ -1083,6 +1117,55 @@ class TextualReplayBuffer:
         }
 
         return lm_input
+    
+    def _detect_manager_type(self, batch: DataProto) -> str:
+        """
+        Auto-detect the source env_manager type from batch characteristics.
+        
+        Args:
+            batch: DataProto from env_manager
+            
+        Returns:
+            "step" for StepEnvManager, "trajectory" for TrajEnvManager
+        """
+        try:
+            # StepEnvManager characteristics:
+            # 1. Multiple samples per episode (batch_size > 1 usually)
+            # 2. Has 'step' field in non_tensor_batch
+            # 3. step_scores contains single values (not lists)
+            
+            # TrajEnvManager characteristics:
+            # 1. Single sample per episode (batch_size = 1 usually)  
+            # 2. step_scores contains lists of rewards
+            # 3. No 'step' field
+            
+            if "step" in batch.non_tensor_batch:
+                logger.debug("Detected StepEnvManager: 'step' field present")
+                return "step"
+            
+            # Check step_scores structure
+            if "step_scores" in batch.non_tensor_batch:
+                step_scores = batch.non_tensor_batch["step_scores"]
+                if len(step_scores) > 0:
+                    first_score = step_scores[0]
+                    if isinstance(first_score, (list, np.ndarray)) and len(first_score) > 1:
+                        logger.debug("Detected TrajEnvManager: step_scores contains lists")
+                        return "trajectory"
+                    else:
+                        logger.debug("Detected StepEnvManager: step_scores contains scalars")
+                        return "step"
+            
+            # Fallback: check batch size (trajectory usually has batch_size=1)
+            if len(batch) == 1:
+                logger.debug("Detected TrajEnvManager: batch_size=1")
+                return "trajectory"
+            else:
+                logger.debug("Detected StepEnvManager: batch_size>1")
+                return "step"
+                
+        except Exception as e:
+            logger.warning(f"Failed to auto-detect manager type: {e}, defaulting to 'trajectory'")
+            return "trajectory"
     
     def sample_for_text_ops(self, batch_size: Optional[int] = None) -> List[Tuple[str, str]]:
         """

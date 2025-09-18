@@ -67,6 +67,8 @@ class StepEnvManager(TrajEnvManager):
         self.cfg_template = self.pipeline_config.custom_envs[self.env_config["tag"]]
         self.agent_system_template = self.cfg_template["agent_system_template"]
         self.agent_template = self.cfg_template["agent_template"]
+        # reward_template is optional for StepEnvManager since rewards are handled step-by-step
+        self.reward_template = self.cfg_template.get("reward_template", "")
 
         if self.env_config["env_id"] == 0:
             self.logger.info(f"agent_system_template: {self.agent_system_template}")
@@ -126,6 +128,12 @@ class StepEnvManager(TrajEnvManager):
             "observation": None
         })
 
+        # Optional rendering frames to align with TrajEnvManager (key always present later)
+        if self.mode == "val" and self.pipeline_config.render_save_dir:
+            frame = self.env.render(mode='rgb_array')
+            if isinstance(frame, np.ndarray):
+                self.rollout_cache.frames.append(frame)
+
         return self.rollout_cache
 
     def make_decision(self, rollout_cache: RolloutCache):
@@ -139,6 +147,7 @@ class StepEnvManager(TrajEnvManager):
             if not action_is_valid:
                 action += "(IMPORTANT TIPS: this action is not valid, your new response *must* strictly adhere to the format according to env instructions.)"
             sar_history.append(f"(step: {self.rollout_cache.step - len(memory_history) + history_step + 1}, state: {entry['state']}, action: {action}, reward: {entry['reward']})")
+        # Build messages directly for StepEnvManager, matching original implementation
         messages = [
             {"role": "system", "content": self.agent_system_template},
             {"role": "user", "content": self.agent_template.format(
@@ -227,7 +236,18 @@ class StepEnvManager(TrajEnvManager):
             attention_mask = inputs.attention_mask[:, :last_response_idx+1]
             position_ids = attention_mask.cumsum(dim=-1)
 
-            # Do not pad here; let RolloutScheduler apply unified padding
+            # Truncate masks/scores to align with next-token semantics length
+            response_mask = response_mask[:, :last_response_idx+1]
+            prompt_mask = prompt_mask[:, :last_response_idx+1]
+            score_tensor = score_tensor[:, :last_response_idx+1]
+
+            # Locally pad to sequence_length before concat (step-level requires uniform shapes per sample)
+            input_ids = pad_to_length(input_ids, length=self.pipeline_config.sequence_length, pad_value=self.tokenizer.pad_token_id)
+            attention_mask = pad_to_length(attention_mask, length=self.pipeline_config.sequence_length, pad_value=0)
+            position_ids = pad_to_length(position_ids, length=self.pipeline_config.sequence_length, pad_value=0)
+            response_mask = pad_to_length(response_mask, length=self.pipeline_config.sequence_length, pad_value=0)
+            prompt_mask = pad_to_length(prompt_mask, length=self.pipeline_config.sequence_length, pad_value=0)
+            score_tensor = pad_to_length(score_tensor, length=self.pipeline_config.sequence_length, pad_value=0.0)
 
             samples.append(DataProto(
                 batch=TensorDict(
@@ -248,6 +268,7 @@ class StepEnvManager(TrajEnvManager):
                     "env_ids": np.array([self.rollout_cache.env_id], dtype=object),
                     "group_ids": np.array([self.rollout_cache.group_id], dtype=object),
                     "messages_list": np.array([messages], dtype=object),
+                    "frames": np.array([self.rollout_cache.frames], dtype=object),
                     "state_hash": np.array([compute_object_hash(history["state"])], dtype=object),
                     "step": np.array([step], dtype=object),
                 }
