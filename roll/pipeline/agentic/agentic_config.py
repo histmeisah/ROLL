@@ -161,6 +161,19 @@ class AgenticConfig(BaseConfig):
         default_factory=RewardNormalizationConfig, metadata={"help": "Reward normalization configuration."}
     )
     replay: ReplayConfig = field(default_factory=ReplayConfig, metadata={"help": "Replay buffer configuration."})
+    # Old policy log-prob configuration
+    old_prob_mode: Literal["trajectory", "step"] = field(
+        default="trajectory",
+        metadata={
+            "help": "Scope of old log prob computation: 'trajectory' (full response over trajectory) or 'step' (only current generation)."
+        },
+    )
+    old_prob_compute: Literal["trainer", "engine"] = field(
+        default="trainer",
+        metadata={
+            "help": "Where to compute old log prob: 'trainer' (Actor-Train recompute, accurate) or 'engine' (inference engine returns, simple)."
+        },
+    )
     # If true, skip the main on-policy update and train only from replay minibatches
     train_from_replay_only: bool = field(default=False, metadata={"help": "Train updates use only replay minibatches (fresh rollouts only push to buffer)."})
 

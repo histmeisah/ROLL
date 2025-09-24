@@ -708,15 +708,33 @@ class AgenticPipeline(BasePipeline):
     def store_fresh_data_to_replay_buffer(self, fresh_batch: DataProto, global_step: int):
         """Store fresh rollout data to replay buffer for future training."""
         try:
-            # Compute behavior policy log_probs at data collection time (use actor_train for stability)
+            # Decide old prob compute path and scope
+            old_prob_compute = getattr(self.pipeline_config, "old_prob_compute", "trainer")
+            old_prob_mode = getattr(self.pipeline_config, "old_prob_mode", "step")
+            fresh_batch.meta_info["old_prob_compute"] = old_prob_compute
+            fresh_batch.meta_info["old_prob_mode"] = old_prob_mode
+
+            # Compute prompt_length if available (useful for step mode in some envs)
             try:
-                behavior_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(fresh_batch, blocking=False)
-                behavior = DataProto.materialize_concat(data_refs=behavior_refs)
-                if behavior.batch is not None and "log_probs" in behavior.batch:
-                    # Attach as behavior_log_probs for replay buffer to consume
-                    fresh_batch.batch["behavior_log_probs"] = behavior.batch["log_probs"]
+                if "prompt_mask" in fresh_batch.batch:
+                    fresh_batch.batch["prompt_length"] = fresh_batch.batch["prompt_mask"].sum(dim=1)
+            except Exception:
+                pass
+
+            # Compute behavior policy log_probs according to config
+            try:
+                if old_prob_compute == "engine" and fresh_batch.batch is not None and "generation_log_probs" in fresh_batch.batch:
+                    # Use engine-provided log probs directly
+                    fresh_batch.batch["behavior_log_probs"] = fresh_batch.batch["generation_log_probs"]
+                else:
+                    # Fallback or preferred path: trainer-side recomputation
+                    # For step mode, env/data flow ensures response_mask already marks current generation span
+                    behavior_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(fresh_batch, blocking=False)
+                    behavior = DataProto.materialize_concat(data_refs=behavior_refs)
+                    if behavior.batch is not None and "log_probs" in behavior.batch:
+                        fresh_batch.batch["behavior_log_probs"] = behavior.batch["log_probs"]
             except Exception as e:
-                logger.warning(f"Failed to compute behavior log_probs for replay storage: {e}")
+                logger.warning(f"Failed to compute behavior log_probs for replay storage (mode={old_prob_mode}, compute={old_prob_compute}): {e}")
 
             # Push once per fresh batch (new interface doesn't need tokenizer)
             self.replay_buffer.push_from_dataproto(fresh_batch, global_step)

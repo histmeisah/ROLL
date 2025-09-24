@@ -340,6 +340,30 @@ replay:
   use_rollout_batch_size: false
 ```
 
+### 4.3 Old Log Prob 计算配置（作用域 & 计算路径）
+
+除 replay 配置外，Agentic 层新增了两项与 old policy 概率相关的控制参数（定义于 `AgenticConfig`）：
+
+```python
+# 作用域：old log prob 计算覆盖范围（默认 trajectory）
+old_prob_mode: Literal["trajectory", "step"] = "trajectory"
+
+# 计算路径：在哪个侧计算 old log prob（默认 trainer）
+old_prob_compute: Literal["trainer", "engine"] = "trainer"
+```
+
+- **old_prob_mode**
+  - trajectory（默认）：沿用传统整轨迹方式，`response_mask` 覆盖完整 response 段进行一次性计算。
+  - step：按“本轮生成”的 response 计算。环境/数据流端负责提供对齐的 `response_mask` 以仅覆盖当前轮。
+
+- **old_prob_compute**
+  - trainer（默认）：Actor-Train 侧前向重算 log_probs（更准确、对引擎无依赖）。
+  - engine：推理引擎直接回传生成时的 token 级 log_probs（实现简单；若引擎未返回则自动回退到 trainer）。
+
+数据流对接（与损失计算兼容）：
+- 训练侧统一将 old log prob 写入 `behavior_log_probs` 入库；回放采样时还原为 `batch["old_log_probs"]`。
+- `agentic_pipeline.store_fresh_data_to_replay_buffer` 会记录 `meta_info["old_prob_mode"]` 与 `meta_info["old_prob_compute"]`，并按配置优先使用引擎回传（`generation_log_probs`），否则回退到训练侧重算。
+
 ## 5. 数据存储格式详解
 
 ### 5.1 StepEntry完整结构

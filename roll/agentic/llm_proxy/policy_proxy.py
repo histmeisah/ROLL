@@ -17,6 +17,9 @@ class PolicyProxy(BaseLLMProxy):
                  lm_input: DataProto,
                  generation_config: Dict[str, Any]) -> DataProto:
 
+        # pass through old_prob_compute to enable engine logprobs when requested
+        if "old_prob_compute" not in generation_config:
+            generation_config["old_prob_compute"] = getattr(self.worker.pipeline_config, "old_prob_compute", "trainer") if hasattr(self, "worker") else "trainer"
         lm_input.meta_info["generation_config"] = generation_config
         lm_input.meta_info['response_callback_fn'] = self.generate_scheduler.report_response.remote
 

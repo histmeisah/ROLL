@@ -808,6 +808,20 @@ class RequestScheduler:
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
         )
+        # Attach engine logprobs if provided by engine in response_data.meta_info
+        try:
+            if "output_logprobs" in response_data.meta_info:
+                engine_logprobs = response_data.meta_info["output_logprobs"]
+                logprob_tensors = [torch.tensor(lp) for lp in engine_logprobs]
+                padded = pad_sequence(logprob_tensors, batch_first=True, padding_value=0.0)
+                # Ensure padded length matches response length
+                response_len = output.batch["response_mask"].size(1)
+                if padded.size(1) < response_len:
+                    pad_size = response_len - padded.size(1)
+                    padded = torch.nn.functional.pad(padded, (0, pad_size), value=0.0)
+                output.batch["generation_log_probs"] = padded
+        except Exception:
+            pass
         request_repeat = data.repeat(repeat_times=len(output_tokens))
         output.non_tensor_batch = request_repeat.non_tensor_batch
         output.meta_info = request_repeat.meta_info

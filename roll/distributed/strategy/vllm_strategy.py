@@ -336,6 +336,9 @@ def gather_outputs_to_pad_tensor(request_outputs: List["RequestOutput"], pad_tok
 
 
 def create_sampling_params_for_vllm(gen_kwargs):
+    # enable engine logprobs when user selects engine compute path
+    want_engine_logprobs = gen_kwargs.get("old_prob_compute", "trainer") == "engine"
+    logprobs_flag = 1 if want_engine_logprobs else 0
     if gen_kwargs["num_beams"] > 1:
         return SamplingParams(
             max_tokens=gen_kwargs["max_new_tokens"],
@@ -344,7 +347,7 @@ def create_sampling_params_for_vllm(gen_kwargs):
             n=gen_kwargs["num_return_sequences"],
             best_of=gen_kwargs["num_beams"],
             use_beam_search=True,
-            logprobs=0,
+            logprobs=logprobs_flag,
         )
     return SamplingParams(
         max_tokens=gen_kwargs["max_new_tokens"],
@@ -354,7 +357,7 @@ def create_sampling_params_for_vllm(gen_kwargs):
         stop_token_ids=gen_kwargs["eos_token_id"],
         repetition_penalty=gen_kwargs["repetition_penalty"],
         n=gen_kwargs["num_return_sequences"],
-        logprobs=0,
+        logprobs=logprobs_flag,
     )
 
 
