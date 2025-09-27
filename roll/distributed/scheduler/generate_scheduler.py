@@ -814,12 +814,29 @@ class RequestScheduler:
                 engine_logprobs = response_data.meta_info["output_logprobs"]
                 logprob_tensors = [torch.tensor(lp) for lp in engine_logprobs]
                 padded = pad_sequence(logprob_tensors, batch_first=True, padding_value=0.0)
-                # Ensure padded length matches response length
-                response_len = output.batch["response_mask"].size(1)
-                if padded.size(1) < response_len:
-                    pad_size = response_len - padded.size(1)
-                    padded = torch.nn.functional.pad(padded, (0, pad_size), value=0.0)
-                output.batch["generation_log_probs"] = padded
+                
+                # Important: generation_log_probs should match the FULL sequence length
+                # because response_mask is for the full sequence
+                full_seq_len = output.batch["input_ids"].size(1)
+                response_mask = output.batch["response_mask"]
+                
+                # Find where responses start in the full sequence
+                # response_mask marks the response tokens in the full sequence
+                batch_size = response_mask.size(0)
+                full_log_probs = torch.zeros(batch_size, full_seq_len, dtype=padded.dtype, device=padded.device)
+                
+                for i in range(batch_size):
+                    # Find the start of response in the full sequence
+                    response_indices = response_mask[i].nonzero(as_tuple=True)[0]
+                    if len(response_indices) > 0 and i < padded.size(0):
+                        response_start = response_indices[0].item()
+                        response_length = min(padded.size(1), len(response_indices))
+                        # Place the generated log probs at the correct position
+                        full_log_probs[i, response_start:response_start+response_length] = padded[i, :response_length]
+                
+                output.batch["generation_log_probs"] = full_log_probs
+                logger.debug(f"Attached generation_log_probs with shape {full_log_probs.shape}, "
+                           f"aligned with response_mask")
         except Exception:
             pass
         request_repeat = data.repeat(repeat_times=len(output_tokens))

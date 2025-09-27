@@ -180,10 +180,30 @@ class VllmStrategy(InferenceStrategy):
             request_id = request_output.request_id
             if request_id not in self.request_metas:
                 continue
-            for completion_output in request_output.outputs:
+            output_logprobs = []
+            for i, completion_output in enumerate(request_output.outputs):
                 output_token_ids.append(completion_output.token_ids)
+                # Extract logprobs if available
+                if hasattr(completion_output, 'logprobs') and completion_output.logprobs is not None:
+                    # VLLM returns logprobs as a list of Logprob objects
+                    # Each position contains the logprob of the generated token
+                    token_logprobs = []
+                    for logprob_obj in completion_output.logprobs:
+                        if logprob_obj is not None:
+                            # VLLM Logprob object has a 'logprob' attribute
+                            token_logprobs.append(logprob_obj.logprob if hasattr(logprob_obj, 'logprob') else 0.0)
+                        else:
+                            # If logprob not available, use 0.0 as placeholder
+                            token_logprobs.append(0.0)
+                    output_logprobs.append(token_logprobs)
             output_data = DataProto(meta_info=self.request_metas[request_id])
             output_data.meta_info["output_token_ids"] = output_token_ids
+            if output_logprobs:
+                output_data.meta_info["output_logprobs"] = output_logprobs
+                # Debug log
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.debug(f"VLLM extracted {len(output_logprobs)} sequences with logprobs, "
+                                    f"first sequence has {len(output_logprobs[0]) if output_logprobs else 0} tokens")
             request_complete_callback(data=output_data)
 
     def start_server(self, data: DataProto, request_complete_callback):

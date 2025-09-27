@@ -221,6 +221,8 @@ class AgenticPipeline(BasePipeline):
                 # 当启用 replay 时，下方 off-policy 训练路径会对采样批次重新计算 log_probs/adv。
                 # 为避免重复计算，这里仅在 off-policy 关闭时计算。
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
+                    # Pass old_prob_mode to compute_log_probs
+                    batch.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
                     ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(batch, blocking=False)
                     ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
                     ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
@@ -237,6 +239,7 @@ class AgenticPipeline(BasePipeline):
                 with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
                     # TODO: use engine log_probs as old_log_probs
                     batch.meta_info["is_offload_states"] = False
+                    batch.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
                     old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
                     if self.pipeline_config.adv_estimator == "gae":
                         values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
@@ -392,6 +395,7 @@ class AgenticPipeline(BasePipeline):
                                 break
 
                             # Compute ref/old log_probs and advantages for replay mb
+                            mb.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
                             ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(mb, blocking=False)
                             ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
                             ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
@@ -710,7 +714,7 @@ class AgenticPipeline(BasePipeline):
         try:
             # Decide old prob compute path and scope
             old_prob_compute = getattr(self.pipeline_config, "old_prob_compute", "trainer")
-            old_prob_mode = getattr(self.pipeline_config, "old_prob_mode", "step")
+            old_prob_mode = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
             fresh_batch.meta_info["old_prob_compute"] = old_prob_compute
             fresh_batch.meta_info["old_prob_mode"] = old_prob_mode
 
@@ -724,8 +728,47 @@ class AgenticPipeline(BasePipeline):
             # Compute behavior policy log_probs according to config
             try:
                 if old_prob_compute == "engine" and fresh_batch.batch is not None and "generation_log_probs" in fresh_batch.batch:
-                    # Use engine-provided log probs directly
-                    fresh_batch.batch["behavior_log_probs"] = fresh_batch.batch["generation_log_probs"]
+                    logger.debug(f"Using engine mode for old_prob_compute with generation_log_probs shape {fresh_batch.batch['generation_log_probs'].shape}")
+                    # Use engine-provided log probs
+                    if old_prob_mode == "turn" and "prompt_mask" in fresh_batch.batch:
+                        # Apply turn mask to engine log probs
+                        from roll.utils.turn_mode_utils import create_turn_mode_response_mask
+                        
+                        # Get the original response mask
+                        response_mask = fresh_batch.batch.get("response_mask")
+                        prompt_mask = fresh_batch.batch.get("prompt_mask")
+                        messages_list = fresh_batch.non_tensor_batch.get("messages_list", None) if hasattr(fresh_batch, 'non_tensor_batch') else None
+                        
+                        if response_mask is not None:
+                            # Create turn-specific mask
+                            turn_mask, _ = create_turn_mode_response_mask(
+                                response_mask=response_mask,
+                                prompt_mask=prompt_mask,
+                                messages_list=messages_list
+                            )
+                            
+                            # Apply mask to engine log probs
+                            engine_log_probs = fresh_batch.batch["generation_log_probs"]
+                            
+                            # Ensure shapes match
+                            if engine_log_probs.shape != turn_mask.shape:
+                                logger.warning(f"Shape mismatch: engine_log_probs {engine_log_probs.shape} vs turn_mask {turn_mask.shape}")
+                                # If shapes don't match, try to broadcast or truncate
+                                if engine_log_probs.shape[1] > turn_mask.shape[1]:
+                                    # Truncate log probs to match mask
+                                    engine_log_probs = engine_log_probs[:, :turn_mask.shape[1]]
+                                elif engine_log_probs.shape[1] < turn_mask.shape[1]:
+                                    # Truncate mask to match log probs
+                                    turn_mask = turn_mask[:, :engine_log_probs.shape[1]]
+                            
+                            masked_log_probs = engine_log_probs * turn_mask.float()
+                            fresh_batch.batch["behavior_log_probs"] = masked_log_probs
+                        else:
+                            # Fallback if no response mask
+                            fresh_batch.batch["behavior_log_probs"] = fresh_batch.batch["generation_log_probs"]
+                    else:
+                        # Trajectory mode: use engine log probs directly
+                        fresh_batch.batch["behavior_log_probs"] = fresh_batch.batch["generation_log_probs"]
                 else:
                     # Fallback or preferred path: trainer-side recomputation
                     # For step mode, env/data flow ensures response_mask already marks current generation span

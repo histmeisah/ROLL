@@ -346,7 +346,7 @@ replay:
 
 ```python
 # 作用域：old log prob 计算覆盖范围（默认 trajectory）
-old_prob_mode: Literal["trajectory", "step"] = "trajectory"
+old_prob_mode: Literal["trajectory", "turn"] = "trajectory"
 
 # 计算路径：在哪个侧计算 old log prob（默认 trainer）
 old_prob_compute: Literal["trainer", "engine"] = "trainer"

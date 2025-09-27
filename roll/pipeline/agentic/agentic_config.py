@@ -162,10 +162,10 @@ class AgenticConfig(BaseConfig):
     )
     replay: ReplayConfig = field(default_factory=ReplayConfig, metadata={"help": "Replay buffer configuration."})
     # Old policy log-prob configuration
-    old_prob_mode: Literal["trajectory", "step"] = field(
+    old_prob_mode: Literal["trajectory", "turn"] = field(
         default="trajectory",
         metadata={
-            "help": "Scope of old log prob computation: 'trajectory' (full response over trajectory) or 'step' (only current generation)."
+            "help": "Scope of old log prob computation: 'trajectory' (full response over trajectory) or 'turn' (only current turn generation)."
         },
     )
     old_prob_compute: Literal["trainer", "engine"] = field(
