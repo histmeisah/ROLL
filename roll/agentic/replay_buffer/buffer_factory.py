@@ -22,6 +22,7 @@ def create_replay_buffer(
     batch_size: int = 128,
     seed: int = 42,
     use_tensordict: bool = True,  # Default to new efficient implementation
+    distributed: bool = False,  # Whether to use distributed Ray-based implementation
     **kwargs
 ) -> BaseReplayBuffer:
     """
@@ -33,7 +34,11 @@ def create_replay_buffer(
         batch_size: Default sampling batch size
         seed: Random seed for reproducibility
         use_tensordict: Whether to use TensorDict-based implementation (recommended)
+        distributed: Whether to use distributed Ray-based implementation
         **kwargs: Additional arguments specific to buffer types
+            - num_shards: Number of shards for distributed buffer (default: 4)
+            - enable_priority: Enable priority sampling (distributed only)
+            - enable_checkpoint: Enable checkpointing (distributed only)
 
     Returns:
         Appropriate replay buffer instance
@@ -43,7 +48,21 @@ def create_replay_buffer(
     """
     manager_type = manager_type.lower()
 
-    if use_tensordict:
+    if distributed:
+        # Use distributed Ray-based implementation for multi-machine training
+        from .distributed_buffer import DistributedReplayBuffer
+
+        num_shards = kwargs.pop("num_shards", 4)
+        logger.info(f"Creating DistributedReplayBuffer with {num_shards} shards, capacity={capacity}")
+
+        return DistributedReplayBuffer(
+            capacity=capacity,
+            batch_size=batch_size,
+            num_shards=num_shards,
+            **kwargs
+        )
+
+    elif use_tensordict:
         # Use new efficient TensorDict-based implementation
         if manager_type == "trajectory":
             logger.info(f"Creating TensorDictTrajectoryBuffer with capacity={capacity}")
