@@ -155,7 +155,13 @@ class StepReplayBuffer(BaseReplayBuffer):
             
             self.steps.append(step_entry)
             self.total_stored += 1
-            
+
+        # Periodic garbage collection to prevent memory leaks
+        if self.total_stored % 100000 == 0 and self.total_stored > 0:
+            import gc
+            gc.collect()
+            logger.info(f"Replay buffer GC triggered at {self.total_stored} steps stored")
+
         logger.debug(f"Stored {batch_size} steps. Total stored: {len(self.steps)}")
     
     def can_sample(self, batch_size: Optional[int] = None) -> bool:

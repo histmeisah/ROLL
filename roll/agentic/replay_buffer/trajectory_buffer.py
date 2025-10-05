@@ -147,7 +147,13 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             
             self.trajectories.append(trajectory)
             self.total_stored += 1
-            
+
+        # Periodic garbage collection to prevent memory leaks
+        if self.total_stored % 100000 == 0 and self.total_stored > 0:
+            import gc
+            gc.collect()
+            logger.info(f"Replay buffer GC triggered at {self.total_stored} trajectories stored")
+
         logger.debug(f"Stored {batch_size} trajectories. Total stored: {len(self.trajectories)}")
     
     def can_sample(self, batch_size: Optional[int] = None) -> bool:
