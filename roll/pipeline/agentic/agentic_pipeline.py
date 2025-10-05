@@ -149,11 +149,15 @@ class AgenticPipeline(BasePipeline):
             batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
             
             # Create appropriate replay buffer using factory
+            # Use TensorDict implementation for better performance
             self.replay_buffer = create_replay_buffer(
                 manager_type=manager_type,
                 capacity=rb_cfg.capacity,
                 batch_size=batch_size,
-                seed=42
+                seed=42,
+                use_tensordict=True,  # Use new efficient implementation
+                use_compression=True,  # Save memory with dtype optimization
+                gc_interval=100000  # GC interval
             )
             logger.info(f"Initialized {self.replay_buffer.__class__.__name__} for {manager_type} env_manager")
         else:

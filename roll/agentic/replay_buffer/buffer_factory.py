@@ -11,6 +11,7 @@ from typing import Union, Dict, Any
 from .base_buffer import BaseReplayBuffer
 from .trajectory_buffer import TrajectoryReplayBuffer
 from .step_buffer import StepReplayBuffer
+from .tensordict_buffer import TensorDictTrajectoryBuffer, TensorDictStepBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -20,45 +21,72 @@ def create_replay_buffer(
     capacity: int = 100000,
     batch_size: int = 128,
     seed: int = 42,
+    use_tensordict: bool = True,  # Default to new efficient implementation
     **kwargs
 ) -> BaseReplayBuffer:
     """
     Factory function to create the appropriate replay buffer type.
-    
+
     Args:
         manager_type: Type of environment manager ("trajectory" or "step")
         capacity: Buffer capacity (trajectories for trajectory buffer, steps for step buffer)
         batch_size: Default sampling batch size
         seed: Random seed for reproducibility
+        use_tensordict: Whether to use TensorDict-based implementation (recommended)
         **kwargs: Additional arguments specific to buffer types
-        
+
     Returns:
         Appropriate replay buffer instance
-        
+
     Raises:
         ValueError: If manager_type is not supported
     """
     manager_type = manager_type.lower()
-    
-    if manager_type == "trajectory":
-        logger.info(f"Creating TrajectoryReplayBuffer with capacity={capacity}")
-        return TrajectoryReplayBuffer(
-            capacity=capacity,
-            batch_size=batch_size,
-            seed=seed
-        )
-    elif manager_type == "step":
-        logger.info(f"Creating StepReplayBuffer with capacity={capacity}")
-        return StepReplayBuffer(
-            capacity=capacity,
-            batch_size=batch_size,
-            seed=seed
-        )
+
+    if use_tensordict:
+        # Use new efficient TensorDict-based implementation
+        if manager_type == "trajectory":
+            logger.info(f"Creating TensorDictTrajectoryBuffer with capacity={capacity}")
+            return TensorDictTrajectoryBuffer(
+                capacity=capacity,
+                batch_size=batch_size,
+                seed=seed,
+                **kwargs
+            )
+        elif manager_type == "step":
+            logger.info(f"Creating TensorDictStepBuffer with capacity={capacity}")
+            return TensorDictStepBuffer(
+                capacity=capacity,
+                batch_size=batch_size,
+                seed=seed,
+                **kwargs
+            )
+        else:
+            raise ValueError(
+                f"Unsupported manager_type: {manager_type}. "
+                f"Supported types: 'trajectory', 'step'"
+            )
     else:
-        raise ValueError(
-            f"Unsupported manager_type: {manager_type}. "
-            f"Supported types: 'trajectory', 'step'"
-        )
+        # Use original implementation (for compatibility)
+        if manager_type == "trajectory":
+            logger.info(f"Creating TrajectoryReplayBuffer with capacity={capacity}")
+            return TrajectoryReplayBuffer(
+                capacity=capacity,
+                batch_size=batch_size,
+                seed=seed
+            )
+        elif manager_type == "step":
+            logger.info(f"Creating StepReplayBuffer with capacity={capacity}")
+            return StepReplayBuffer(
+                capacity=capacity,
+                batch_size=batch_size,
+                seed=seed
+            )
+        else:
+            raise ValueError(
+                f"Unsupported manager_type: {manager_type}. "
+                f"Supported types: 'trajectory', 'step'"
+            )
 
 
 def detect_manager_type_from_config(pipeline_config) -> str:
