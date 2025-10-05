@@ -688,6 +688,51 @@ class DynamicSamplingScheduler:
         request_repeat = request.repeat(repeat_times=len(output_tokens))
         output.non_tensor_batch = request_repeat.non_tensor_batch
         output.meta_info = request_repeat.meta_info
+
+        # Process engine log probs if available
+        if "output_logprobs" in data.meta_info:
+            try:
+                output_logprobs = data.meta_info["output_logprobs"]
+                batch_size = len(output_logprobs)
+
+                # Get input length from original request
+                input_length = request.batch["input_ids"].shape[1]
+
+                # Create tensor for generation_log_probs
+                # Shape: [batch_size, sequence_length-1] for next-token prediction
+                seq_len = self.pipeline_config.sequence_length
+                generation_log_probs = torch.zeros(batch_size, seq_len - 1, dtype=torch.float32)
+
+                # Fill in the generated token log probs
+                for i, seq_logprobs in enumerate(output_logprobs):
+                    if seq_logprobs:
+                        # Position where generation starts (in next-token indexing)
+                        start_idx = input_length - 1
+                        # Number of generated tokens
+                        num_generated = len(seq_logprobs)
+                        end_idx = min(start_idx + num_generated, seq_len - 1)
+
+                        # Fill the tensor with log probs
+                        generation_log_probs[i, start_idx:end_idx] = torch.tensor(
+                            seq_logprobs[:end_idx-start_idx],
+                            dtype=torch.float32
+                        )
+
+                # Attach to output
+                output.batch["generation_log_probs"] = generation_log_probs
+
+                # Add debug info to meta_info
+                output.meta_info["has_engine_logprobs"] = True
+                output.meta_info["engine_logprobs_shape"] = list(generation_log_probs.shape)
+
+                # Log for debugging
+                logger.debug(f"Attached engine log probs: shape={generation_log_probs.shape}, "
+                            f"input_len={input_length}, first_batch_generated={len(output_logprobs[0]) if output_logprobs else 0}")
+
+            except Exception as e:
+                logger.warning(f"Failed to process engine log probs: {e}")
+                output.meta_info["engine_logprobs_error"] = str(e)
+
         return output
 
     def expand_requests(self, data: DataProto):
