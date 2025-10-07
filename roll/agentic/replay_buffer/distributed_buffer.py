@@ -22,7 +22,7 @@ from tensordict import TensorDict
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.utils.logging import get_logger
-from roll.utils.utils import pad_to_length
+from roll.utils.functionals import pad_to_length
 from .base_buffer import BaseReplayBuffer
 
 logger = get_logger()
