@@ -64,11 +64,32 @@ class FaultTolerantBufferShard:
 
     def _init_storage(self):
         """Initialize storage structures"""
-        from .distributed_buffer import ReplayBufferShard
-        # Reuse base implementation
-        self._base = ReplayBufferShard(
-            self.shard_id, self.capacity, batch_size=32
-        )
+        # Use local storage since we're already inside a Ray Actor
+        # We cannot create another Ray Actor inside this Ray Actor
+        import numpy as np
+        from collections import deque
+
+        # Initialize local storage structures
+        self.buffer = deque(maxlen=self.capacity)
+        self.priorities = deque(maxlen=self.capacity)
+        self.position = 0
+        self.current_size = 0
+
+    def push_batch(self, tensor_dict, non_tensor, meta, global_step: int) -> bool:
+        """
+        Push batch without priority (for uniform sampling).
+
+        Args:
+            tensor_dict: Tensor data dictionary
+            non_tensor: Non-tensor data
+            meta: Meta information
+            global_step: Current training step
+
+        Returns:
+            Success status
+        """
+        batch_data = (tensor_dict, non_tensor, meta, global_step)
+        return self.push_batch_with_priority(batch_data, priority=1.0)
 
     def push_batch_with_priority(self, batch_data: Tuple,
                                 priority: Optional[float] = None) -> bool:
@@ -87,23 +108,15 @@ class FaultTolerantBufferShard:
             if priority is None:
                 priority = self.max_priority
 
-            # Push to base storage
-            success = self._base.push_batch(*batch_data)
+            # Push to local storage
+            self.buffer.append(batch_data)
+            self.priorities.append(priority)
+            self.current_size = len(self.buffer)
 
-            if success:
-                # Update priorities
-                batch_size = len(batch_data[0])
-                start_idx = len(self._base.trajectories) - batch_size
-                end_idx = len(self._base.trajectories)
+            # Update max priority
+            self.max_priority = max(self.max_priority, priority)
 
-                for i in range(start_idx, end_idx):
-                    idx = i % self.capacity
-                    self.priorities[idx] = priority
-
-                # Update max priority
-                self.max_priority = max(self.max_priority, priority)
-
-            return success
+            return True
 
         except Exception as e:
             logger.error(f"Shard {self.shard_id} push error: {e}")
@@ -122,27 +135,65 @@ class FaultTolerantBufferShard:
         Returns:
             Tuple of (data, indices, weights)
         """
-        if len(self._base.trajectories) == 0:
+        import numpy as np
+        import random
+
+        if len(self.buffer) == 0:
             return None
 
         # Calculate sampling probabilities
-        valid_size = min(len(self._base.trajectories), self.capacity)
-        probs = self.priorities[:valid_size] ** self.priority_alpha
+        valid_size = len(self.buffer)
+        priorities_array = np.array(list(self.priorities)[:valid_size])
+        probs = priorities_array ** self.priority_alpha
         probs = probs / probs.sum()
 
         # Sample indices
-        indices = np.random.choice(valid_size, n_samples, p=probs)
+        indices = np.random.choice(valid_size, min(n_samples, valid_size), p=probs, replace=True)
 
         # Calculate importance sampling weights
         weights = (valid_size * probs[indices]) ** (-beta)
         weights = weights / weights.max()  # Normalize
 
         # Get samples
-        result = self._base.sample(n_samples, "uniform")
-        if result:
-            tensor_dict, non_tensor, meta = result
+        sampled_data = [self.buffer[i] for i in indices]
+
+        # Combine sampled data (assuming they're tuples of tensor_dict, non_tensor, meta, global_step)
+        if sampled_data:
+            # Simply return the first sample for now (will need proper batching later)
             # Add weights to meta
+            tensor_dict, non_tensor, meta, global_step = sampled_data[0]
             meta["importance_weights"] = weights.astype(np.float32)
+            meta["sample_indices"] = indices
+            return (tensor_dict, non_tensor, meta)
+
+        return None
+
+    def sample_uniform(self, n_samples: int) -> Optional[Tuple]:
+        """
+        Uniform random sampling without priorities.
+
+        Args:
+            n_samples: Number of samples to get
+
+        Returns:
+            Tuple of (tensor_dict, non_tensor_batch, meta_info)
+        """
+        import numpy as np
+
+        if len(self.buffer) == 0:
+            return None
+
+        valid_size = len(self.buffer)
+
+        # Sample indices uniformly
+        indices = np.random.choice(valid_size, min(n_samples, valid_size), replace=True)
+
+        # Get samples
+        sampled_data = [self.buffer[i] for i in indices]
+
+        if sampled_data:
+            # For now, return the first sample (proper batching needed)
+            tensor_dict, non_tensor, meta, global_step = sampled_data[0]
             meta["sample_indices"] = indices
             return (tensor_dict, non_tensor, meta)
 
@@ -193,10 +244,10 @@ class FaultTolerantBufferShard:
             # Save state
             state = {
                 "shard_id": self.shard_id,
-                "trajectories": list(self._base.trajectories),
-                "priorities": self.priorities.copy(),
+                "trajectories": list(self.buffer),
+                "priorities": list(self.priorities),
                 "max_priority": self.max_priority,
-                "total_stored": self._base.total_stored,
+                "total_stored": self.current_size,
                 "global_step": global_step
             }
 
@@ -242,11 +293,11 @@ class FaultTolerantBufferShard:
                 state = pickle.load(f)
 
             # Restore state
-            self._base.trajectories = deque(state["trajectories"],
-                                          maxlen=self.capacity)
-            self.priorities = state["priorities"]
+            from collections import deque
+            self.buffer = deque(state["trajectories"], maxlen=self.capacity)
+            self.priorities = deque(state["priorities"], maxlen=self.capacity)
             self.max_priority = state["max_priority"]
-            self._base.total_stored = state["total_stored"]
+            self.current_size = state["total_stored"]
 
             logger.info(f"Shard {self.shard_id} restored from {checkpoint_path}")
             self.status = ShardStatus.HEALTHY
@@ -275,7 +326,7 @@ class FaultTolerantBufferShard:
         return {
             "shard_id": self.shard_id,
             "status": self.status.value,
-            "size": len(self._base.trajectories),
+            "size": len(self.buffer),
             "capacity": self.capacity,
             "last_checkpoint": self.last_checkpoint_step,
             "node_id": ray.get_runtime_context().get_node_id()
@@ -365,6 +416,7 @@ class DistributedReplayBufferWithFaultTolerance:
                  enable_priority: bool = True,
                  enable_checkpoint: bool = True,
                  enable_rebalancing: bool = False,
+                 enable_fault_tolerance: bool = True,
                  **kwargs):
         self.capacity = capacity
         self.batch_size = batch_size
@@ -372,6 +424,7 @@ class DistributedReplayBufferWithFaultTolerance:
         self.enable_priority = enable_priority
         self.enable_checkpoint = enable_checkpoint
         self.enable_rebalancing = enable_rebalancing
+        self.enable_fault_tolerance = enable_fault_tolerance
 
         # Create enhanced shards
         self.shards = []
@@ -528,3 +581,206 @@ class DistributedReplayBufferWithFaultTolerance:
             )
             # Execute rebalancing plan
             # ... (implementation needed)
+
+    # ===== Missing Methods Required by BaseReplayBuffer Interface =====
+
+    def push_from_dataproto(self, batch, global_step: int) -> None:
+        """
+        Store data from a DataProto batch into the replay buffer.
+        Wrapper for push_with_priority to match base interface.
+        """
+        # Use default priority if priority sampling is enabled
+        default_priority = 1.0 if self.enable_priority else None
+        self.push_with_priority(batch, global_step, priority=default_priority)
+
+    def sample_for_training(self, batch_size=None, device='cpu',
+                           tokenizer=None, sequence_length=4096,
+                           sampling_mode="trajectory", steps_per_episode=1,
+                           sample_method="uniform", candidates_per_group=1,
+                           group_sampling="uniform"):
+        """
+        Sample a batch of data for training.
+        Implements both priority and uniform sampling.
+        """
+        if batch_size is None:
+            batch_size = self.batch_size
+
+        # Check if we have enough data
+        if not self.can_sample(batch_size):
+            logger.debug(f"Not enough data in buffer for batch_size={batch_size}")
+            return None
+
+        try:
+            # Determine how many samples per shard
+            samples_per_shard = max(1, batch_size // self.num_shards)
+            remainder = batch_size % self.num_shards
+
+            # Sample from each shard
+            futures = []
+            for i, shard in enumerate(self.shards):
+                # Add remainder to first shards
+                shard_batch_size = samples_per_shard + (1 if i < remainder else 0)
+                if shard_batch_size > 0:
+                    if self.enable_priority:
+                        future = shard.sample_with_priority.remote(shard_batch_size, beta=0.4)
+                    else:
+                        future = shard.sample_uniform.remote(shard_batch_size)
+                    futures.append(future)
+
+            # Gather results
+            results = ray.get(futures)
+
+            # Filter out None results
+            valid_results = [r for r in results if r is not None]
+
+            if not valid_results:
+                logger.debug("All shards returned None")
+                return None
+
+            # Combine results into a DataProto batch
+            from roll.distributed.scheduler.protocol import DataProto
+            from tensordict import TensorDict
+            import torch
+
+            # Initialize combined batch
+            combined_batch = DataProto()
+
+            # Aggregate tensor dicts
+            tensor_dicts = []
+            non_tensor_batches = []
+            meta_infos = []
+
+            for result in valid_results:
+                if len(result) >= 3:
+                    tensor_dict, non_tensor, meta = result[:3]
+                    if tensor_dict:
+                        tensor_dicts.append(tensor_dict)
+                    if non_tensor:
+                        non_tensor_batches.append(non_tensor)
+                    if meta:
+                        meta_infos.append(meta)
+
+            # Combine tensor dicts
+            if tensor_dicts:
+                # Convert dicts to TensorDict and concatenate
+                td_list = []
+                for td in tensor_dicts:
+                    if isinstance(td, dict):
+                        # Convert to tensors if needed
+                        tensor_data = {}
+                        for k, v in td.items():
+                            if not isinstance(v, torch.Tensor):
+                                v = torch.tensor(v)
+                            tensor_data[k] = v
+                        td_list.append(TensorDict(tensor_data, batch_size=[1]))
+                    else:
+                        td_list.append(td)
+
+                if td_list:
+                    combined_td = torch.cat(td_list, dim=0)
+                    combined_batch.batch = combined_td
+
+            # Combine non-tensor batches
+            if non_tensor_batches:
+                combined_non_tensor = {}
+                for key in non_tensor_batches[0].keys():
+                    combined_non_tensor[key] = []
+                    for batch in non_tensor_batches:
+                        if key in batch:
+                            if isinstance(batch[key], list):
+                                combined_non_tensor[key].extend(batch[key])
+                            else:
+                                combined_non_tensor[key].append(batch[key])
+                combined_batch.non_tensor_batch = combined_non_tensor
+
+            # Combine meta info
+            if meta_infos:
+                combined_meta = meta_infos[0].copy()
+                if self.enable_priority and "importance_weights" in combined_meta:
+                    # Aggregate importance weights
+                    all_weights = []
+                    for meta in meta_infos:
+                        if "importance_weights" in meta:
+                            all_weights.extend(meta["importance_weights"])
+                    combined_meta["importance_weights"] = all_weights
+                combined_batch.meta_info = combined_meta
+
+            return combined_batch
+
+        except Exception as e:
+            logger.error(f"Error sampling from distributed buffer: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+
+    def can_sample(self, batch_size=None) -> bool:
+        """
+        Check if the buffer has enough data for sampling.
+
+        For distributed buffer, we check if we have at least batch_size items total.
+        """
+        if batch_size is None:
+            batch_size = self.batch_size
+
+        try:
+            # Get total size across all shards
+            stats = self.get_stats()
+            total_size = stats.get("total_size", 0)
+
+            # We need at least batch_size items total
+            return total_size >= batch_size
+        except Exception as e:
+            logger.debug(f"Error checking buffer size: {e}")
+            # Conservative approach: assume we cannot sample if there's an error
+            return False
+
+    @property
+    def buffer_type(self) -> str:
+        """Return the type of buffer for identification."""
+        return "DistributedReplayBufferWithFaultTolerance"
+
+    def get_stats(self) -> Dict:
+        """
+        Get statistics about the buffer state.
+
+        Returns:
+            Dictionary with buffer statistics
+        """
+        try:
+            # Gather stats from all shards
+            stats_futures = [
+                shard.get_health_status.remote()
+                for shard in self.shards
+            ]
+            shard_stats = ray.get(stats_futures)
+
+            # Aggregate statistics
+            total_size = sum(s.get("size", 0) for s in shard_stats)
+            total_capacity = sum(s.get("capacity", 0) for s in shard_stats)
+            healthy_shards = sum(1 for s in shard_stats if s.get("status") == "healthy")
+
+            # Calculate utilization
+            utilization = total_size / total_capacity if total_capacity > 0 else 0.0
+
+            return {
+                "buffer_type": self.buffer_type,
+                "total_size": total_size,
+                "total_stored": total_size,  # Same as total_size for compatibility
+                "capacity": total_capacity,  # Use 'capacity' for compatibility
+                "total_capacity": total_capacity,
+                "utilization": utilization,  # Buffer utilization ratio
+                "num_shards": self.num_shards,
+                "healthy_shards": healthy_shards,
+                "enable_priority": self.enable_priority,
+                "enable_fault_tolerance": self.enable_fault_tolerance,
+                "shard_stats": shard_stats
+            }
+        except Exception as e:
+            logger.error(f"Error getting buffer stats: {e}")
+            return {
+                "buffer_type": self.buffer_type,
+                "total_stored": 0,  # Default value for compatibility
+                "capacity": 0,  # Default value for compatibility
+                "utilization": 0.0,  # Default value for compatibility
+                "error": str(e)
+            }

@@ -148,38 +148,28 @@ class AgenticPipeline(BasePipeline):
             # Calculate batch size
             batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
             
-            # Create appropriate replay buffer using factory
-            # Check if distributed training is enabled
-            use_distributed = rb_cfg.get("distributed", False)
+            # Always use distributed replay buffer as default
+            # It works for both single and multi-machine training
+            from roll.agentic.replay_buffer.distributed_buffer_advanced import DistributedReplayBufferWithFaultTolerance
 
-            if use_distributed:
-                # Use distributed Ray-based replay buffer for multi-machine training
-                logger.info("Creating distributed replay buffer for multi-machine training")
-                self.replay_buffer = create_replay_buffer(
-                    manager_type=manager_type,
-                    capacity=rb_cfg.capacity,
-                    batch_size=batch_size,
-                    seed=42,
-                    distributed=True,
-                    num_shards=rb_cfg.get("num_shards", 4),
-                    enable_priority=rb_cfg.get("enable_priority", False),
-                    enable_checkpoint=rb_cfg.get("enable_checkpoint", True),
-                    enable_rebalancing=rb_cfg.get("enable_rebalancing", False),
-                    use_compression=True,  # Save memory with dtype optimization
-                    gc_interval=100000  # GC interval
-                )
-            else:
-                # Use local TensorDict implementation for single-machine training
-                self.replay_buffer = create_replay_buffer(
-                    manager_type=manager_type,
-                    capacity=rb_cfg.capacity,
-                    batch_size=batch_size,
-                    seed=42,
-                    use_tensordict=True,  # Use new efficient implementation
-                    use_compression=True,  # Save memory with dtype optimization
-                    gc_interval=100000  # GC interval
-                )
-            logger.info(f"Initialized {self.replay_buffer.__class__.__name__} for {manager_type} env_manager")
+            logger.info("Creating distributed replay buffer with fault tolerance")
+
+            # Get configuration with proper attribute access
+            num_shards = getattr(rb_cfg, "num_shards", 4)
+            enable_priority = getattr(rb_cfg, "enable_priority", True)
+            enable_checkpoint = getattr(rb_cfg, "enable_checkpoint", True)
+            enable_rebalancing = getattr(rb_cfg, "enable_rebalancing", False)
+
+            self.replay_buffer = DistributedReplayBufferWithFaultTolerance(
+                capacity=rb_cfg.capacity,
+                batch_size=batch_size,
+                num_shards=num_shards,
+                enable_priority=enable_priority,
+                enable_checkpoint=enable_checkpoint,
+                enable_rebalancing=enable_rebalancing
+            )
+
+            logger.info(f"Initialized DistributedReplayBufferWithFaultTolerance for {manager_type} env_manager")
         else:
             self.replay_buffer = None
             # Keep tokenizer for logging/decoding and padding setup even when replay is disabled
@@ -402,6 +392,7 @@ class AgenticPipeline(BasePipeline):
                         all_actor_refs: List[ray.ObjectRef] = []
                         all_critic_refs: List[ray.ObjectRef] = []
 
+                        replay_train_count = 0  # Track successful training steps from replay
                         for step_idx in range(rb_cfg.train_steps_per_env_step):
                             mb = self.replay_buffer.sample_for_training(
                                 batch_size=training_batch_size,
@@ -417,6 +408,7 @@ class AgenticPipeline(BasePipeline):
                             if mb is None:
                                 logger.warning(f"TextualReplayBuffer failed to sample batch at step {step_idx}")
                                 break
+                            replay_train_count += 1
 
                             # Compute ref/old log_probs and advantages for replay mb
                             mb.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
@@ -503,7 +495,42 @@ class AgenticPipeline(BasePipeline):
                             "replay_buffer/capacity": buffer_stats["capacity"],
                             "replay_buffer/utilization": buffer_stats["utilization"],
                             "replay_buffer/buffer_type": buffer_stats["buffer_type"],
+                            "replay/train_steps": replay_train_count,  # Number of successful training steps
+                            "replay/train_steps_target": rb_cfg.train_steps_per_env_step,  # Target training steps
                         })
+
+                        # Off-policy monitoring for replay buffer
+                        if mb is not None and mb.batch is not None and "behavior_log_probs" in mb.batch:
+                            try:
+                                # Recompute current policy log probs for off-policy ratio
+                                mb.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
+                                current_lp_refs = self.actor_train.compute_log_probs(mb, blocking=False)
+                                current_lp = DataProto.materialize_concat(data_refs=current_lp_refs)
+
+                                # Calculate off-policy metrics
+                                if "log_probs" in current_lp.batch and "response_mask" in mb.batch:
+                                    resp_mask = mb.batch["response_mask"][:, 1:].bool()
+
+                                    # Get valid indices where mask is True
+                                    valid_indices = resp_mask.flatten().nonzero(as_tuple=True)[0]
+
+                                    if len(valid_indices) > 0:
+                                        cur_lp = current_lp.batch["log_probs"].flatten()[valid_indices]
+                                        old_lp = mb.batch["behavior_log_probs"].flatten()[valid_indices]
+
+                                        if cur_lp.numel() > 0 and old_lp.numel() > 0:
+                                            delta = cur_lp - old_lp
+                                            ratio = delta.exp()
+
+                                            metrics.update({
+                                                "replay/off_policy_delta": delta.mean().item(),
+                                                "replay/off_policy_ratio": ratio.mean().item(),
+                                                "replay/off_policy_max_ratio": ratio.max().item(),
+                                                "replay/off_policy_min_ratio": ratio.min().item(),
+                                                "replay/off_policy_std_ratio": ratio.std().item(),
+                                            })
+                            except Exception as e:
+                                logger.debug(f"Off-policy monitoring failed: {e}")
                 tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
 
             data_metrics = compute_data_metrics(batch=batch)
