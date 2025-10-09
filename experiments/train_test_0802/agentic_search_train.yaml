@@ -1,0 +1,330 @@
+defaults:
+  - ../../examples/config/envs@_here_
+  - ../../examples/config/deepspeed_zero@_here_
+  - ../../examples/config/deepspeed_zero2@_here_
+  - ../../examples/config/deepspeed_zero3@_here_
+  - ../../examples/config/deepspeed_zero3_cpuoffload@_here_
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "dual_env_agentic_pipeline"
+seed: 42
+logging_dir: ./output/logs
+output_dir: ./output
+render_save_dir: ./output/render
+system_envs:
+  USE_MODELSCOPE: '1'
+
+track_with: ml_tracker
+tracker_kwargs:
+ project: dual_env_pipeline_exp
+ notes: "dual environment (search + math) agentic training with outcome-based rewards"
+ tags:
+   - search
+   - math
+   - dual_env
+   - agentic
+   - roll
+   - outcome_reward
+   - xverify
+ # Wandb configuration
+ mode: "offline"  # Save logs locally, can be synced later
+ dir: "./output/wandb"  # Local wandb directory
+ save_code: true
+ # Custom logging configuration
+ log_model: false  # Don't upload model artifacts automatically
+ log_frequency: 10  # Log every 10 steps
+
+checkpoint_config:
+  type: file_system
+  output_dir: /data/cpfs_0/rl_examples/models/${exp_name}
+
+# Multi-node multi-GPU configuration
+num_gpus_per_node: 8  # GPUs per node
+num_nodes: 4  # Total number of nodes
+
+max_steps: 512
+save_steps: 50
+logging_steps: 1
+eval_steps: 20
+resume_from_checkpoint: false
+
+# Async training configuration
+async_generation_ratio: 1  # Enable async generation (1 = fully async)
+
+# Schedule configuration for async training
+schedule_config:
+  generate_opt_level: 1  # Use scheduler process requests
+  max_running_requests: 256  # Increased for async training
+  is_use_additional_prompts: true
+  max_additional_running_prompts: 32
+
+rollout_batch_size: 1024
+val_batch_size: 64
+sequence_length: 10240
+response_length: 1024  # Required for async training
+
+advantage_clip: 0.2
+ppo_epochs: 1
+adv_estimator: "reinforce"
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+pretrain: Qwen/Qwen2.5-0.5B-Instruct
+reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
+
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 32
+    warmup_steps: 10
+    lr_scheduler_type: cosine
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: megatron_train
+    strategy_config:
+      tensor_model_parallel_size: 2  # 2-way tensor parallelism
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+      use_distributed_optimizer: true
+      recompute_granularity: full
+      sequence_parallel: true  # Enable sequence parallelism
+      overlap_grad_reduce: true  # Overlap gradient reduction
+  device_mapping: list(range(0,16))  # Use all 16 GPUs (2 nodes × 8 GPUs)
+  world_size: 8  # Number of training workers
+  infer_batch_size: 1
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: 256
+    top_p: 0.95
+    top_k: 50
+    num_beams: 1
+    temperature: 0.7
+    num_return_sequences: 1
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.8
+      block_size: 16
+      load_format: auto
+      tensor_parallel_size: 2  # 2-way tensor parallelism for inference
+      # Async training optimizations
+      max_num_seqs: 512  # Increased for async training
+      max_num_batched_tokens: 8192  # Increased batch processing
+  device_mapping: list(range(8,16))  # Use GPUs 8-15 for inference (separate from training)
+  world_size: 4  # Number of inference workers
+  num_gpus_per_worker: 2  # 2 GPUs per inference worker
+
+reference:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  data_args:
+    template: qwen2_5
+  strategy_args:
+    strategy_name: hf_infer
+    strategy_config: ~
+  device_mapping: list(range(0,8))  # Use first 8 GPUs for reference model
+  world_size: 4  # Number of reference workers
+  infer_batch_size: 1
+
+# Search environment specific patterns
+action_pattern: <answer>(.*?)</answer>
+think_action_pattern: <think>(.*?)</think>\s*<answer>(.*?)</answer>
+code_pattern: <code>(.*?)</code>
+user_prompt_format: <think> [Your reasoning] </think> <code> [Your search code] </code> or <answer> [Your final answer] </answer>
+added_text: <think>
+
+# Remove sokoban-specific variables that cause interpolation errors
+user_prompt_no_think_format: <answer> [your answer] </answer>
+user_prompt_think_format: <think> [Your thoughts] </think> <answer> [your answer] </answer>
+added_text_no_think: <answer>
+added_text_think: <think>
+
+max_tokens_per_step: 1024
+max_actions_per_traj: 8
+
+reward_normalization:
+  grouping: traj_group_id
+  method: mean_std
+
+# Trajectory logging configuration
+trajectory_logging:
+  enabled: true
+  save_ratio: 0.1  # Save 10% of trajectories for analysis
+  save_dir: "./output/trajectories"
+  log_frequency: 50  # Log trajectories every 50 steps
+  include_reward_breakdown: true  # Include detailed reward info
+  include_score_vs_reward: true  # Distinguish score vs reward
+  max_trajectories_per_file: 100  # Split large trajectory files
+
+train_env_manager:
+  format_penalty: -0.2
+  max_env_num_per_worker: 16  # Increased for async training
+  num_env_groups: 1025  # 512 for search + 512 for math
+  group_size: 4
+  tags: [SearchEnvTrain, MathEnvTrain]
+  num_groups_partition: [512, 512]  # 1:1 ratio between search and math
+  # Async training specific settings
+  max_traj_per_env: 4  # Maximum trajectories per environment for async
+
+val_env_manager:
+  max_env_num_per_worker: 16
+  num_env_groups: 64  # 32 for search + 32 for math
+  group_size: 1
+  tags: [SearchEnvVal, MathEnvVal]
+  num_groups_partition: [32, 32]  # 1:1 ratio between search and math
+
+custom_envs:
+  SearchEnvTrain:
+    env_type: search
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_format}
+    added_text: ${added_text}
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      dataset_path: "/mnt/chensiheng/ai_researcher_data/xhpang_search/train.parquet"
+      max_instances: 1000
+      max_steps: ${max_actions_per_traj}
+      max_search_calls: 5
+      use_mock_api: false
+      use_remote_service: true
+      remote_service_url: "http://172.26.104.240:30002"
+      disable_limiter: false
+      max_concurrent_calls: 20000  # 20k per minute for search env
+      limiter_tag: "search_env"
+      think_pattern: <think>(.*?)</think>
+      code_pattern: ${code_pattern}
+      answer_pattern: ${action_pattern}
+      # Outcome-based reward settings
+      use_outcome_reward_only: true
+      correct_answer_reward: 1.0
+      step_penalty: 0.0  # Disabled
+      invalid_action_penalty: 0.0  # Disabled
+      # Advanced reward computation
+      use_xverify: true
+      use_otc: false  # Can be enabled for OTC experiments
+      otc_method: "ppo"
+      otc_alpha: 1.0
+      otc_c: 1.0
+
+  MathEnvTrain:
+    env_type: numina_math
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_format}
+    added_text: ${added_text}
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      dataset_path: "/mnt/chensiheng/ai_researcher_data/numinamath_new/train_subset.parquet"
+      max_instances: 1000
+      max_steps: ${max_actions_per_traj}
+      max_search_calls: 5
+      use_mock_api: false
+      use_remote_service: true
+      remote_service_url: "http://172.26.104.240:30002"
+      disable_limiter: false
+      max_concurrent_calls: 20000  # 20k per minute for math env
+      limiter_tag: "numina_math_env"
+      think_pattern: <think>(.*?)</think>
+      code_pattern: ${code_pattern}
+      answer_pattern: ${action_pattern}
+      # Outcome-based reward settings
+      use_outcome_reward_only: true
+      correct_answer_reward: 1.0
+      step_penalty: 0.0  # Disabled
+      invalid_action_penalty: 0.0  # Disabled
+      # Math-specific reward settings
+      use_xverify: true
+      use_otc: false  # Can be enabled for OTC experiments
+      otc_method: "ppo"
+      otc_alpha: 1.0
+      otc_c: 1.0
+  SearchEnvVal:
+    env_type: search
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_format}
+    added_text: ${added_text}
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      dataset_path: "/mnt/chensiheng/ai_researcher_data/xhpang_search/validation.parquet"
+      max_instances: 200
+      max_steps: ${max_actions_per_traj}
+      max_search_calls: 5
+      use_mock_api: false
+      use_remote_service: true
+      remote_service_url: "http://172.26.104.240:30002"
+      disable_limiter: false
+      max_concurrent_calls: 20000  # 20k per minute for search env
+      limiter_tag: "search_env"
+      think_pattern: <think>(.*?)</think>
+      code_pattern: ${code_pattern}
+      answer_pattern: ${action_pattern}
+      # Outcome-based reward settings
+      use_outcome_reward_only: true
+      correct_answer_reward: 1.0
+      step_penalty: 0.0  # Disabled
+      invalid_action_penalty: 0.0  # Disabled
+      # Advanced reward computation
+      use_xverify: true
+      use_otc: false
+      otc_method: "ppo"
+      otc_alpha: 1.0
+      otc_c: 1.0
+
+  MathEnvVal:
+    env_type: numina_math
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_format}
+    added_text: ${added_text}
+    env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+    use_thread_lock: true
+    env_config:
+      dataset_path: "/mnt/chensiheng/ai_researcher_data/numinamath_new/validation_subset.parquet"
+      max_instances: 200
+      max_steps: ${max_actions_per_traj}
+      max_search_calls: 5
+      use_mock_api: false
+      use_remote_service: true
+      remote_service_url: "http://172.26.104.240:30002"
+      disable_limiter: false
+      max_concurrent_calls: 20000  # 20k per minute for math env
+      limiter_tag: "numina_math_env"
+      think_pattern: <think>(.*?)</think>
+      code_pattern: ${code_pattern}
+      answer_pattern: ${action_pattern}
+      # Outcome-based reward settings
+      use_outcome_reward_only: true
+      correct_answer_reward: 1.0
+      step_penalty: 0.0  # Disabled
+      invalid_action_penalty: 0.0  # Disabled
+      # Math-specific reward settings
+      use_xverify: true
+      use_otc: false  # Can be enabled for OTC experiments
+      otc_method: "ppo"
+      otc_alpha: 1.0
+      otc_c: 1.0

@@ -3,6 +3,8 @@ base agentic codes reference: https://github.com/RAGEN-AI/RAGEN
 """
 from roll.utils.logging import get_logger
 
+logger = get_logger()
+
 # from .alfworld.config import AlfredEnvConfig
 # from .alfworld.env import AlfredTXTEnv
 # from .bandit.config import BanditEnvConfig
@@ -15,26 +17,41 @@ from .frozen_lake.config import FrozenLakeEnvConfig
 from .frozen_lake.env import FrozenLakeEnv
 # from .metamathqa.env import MetaMathQAEnv
 # from .metamathqa.config import MetaMathQAEnvConfig
+try:
+    from .search.config import SearchEnvConfig
+    from .search.env import SearchEnv
+    _search_import_success = True
+except Exception as e:
+    logger.info(f"Failed to import search environment: {e}")
+    _search_import_success = False
 
-logger = get_logger()
+try:
+    from .numina_math.config import NuminaMathEnvConfig
+    from .numina_math.env import NuminaMathEnv
+    _numina_math_import_success = True
+except Exception as e:
+    logger.info(f"Failed to import numina_math environment: {e}")
+    _numina_math_import_success = False
 
 REGISTERED_ENVS = {
-    # "bandit": BanditEnv,
-    # "countdown": CountdownEnv,
     "sokoban": SokobanEnv,
     "frozen_lake": FrozenLakeEnv,
-    # 'alfworld': AlfredTXTEnv,
-    # "metamathqa": MetaMathQAEnv,
 }
 
 REGISTERED_ENV_CONFIGS = {
-    # "bandit": BanditEnvConfig,
-    # "countdown": CountdownEnvConfig,
     "sokoban": SokobanEnvConfig,
     "frozen_lake": FrozenLakeEnvConfig,
-    # 'alfworld': AlfredEnvConfig,
-    # "metamathqa": MetaMathQAEnvConfig,
 }
+
+# Register search environment only if import was successful
+if _search_import_success:
+    REGISTERED_ENVS["search"] = SearchEnv
+    REGISTERED_ENV_CONFIGS["search"] = SearchEnvConfig
+
+# Register numina_math environment only if import was successful
+if _numina_math_import_success:
+    REGISTERED_ENVS["numina_math"] = NuminaMathEnv
+    REGISTERED_ENV_CONFIGS["numina_math"] = NuminaMathEnvConfig
 
 try:
     # add webshop-minimal to PYTHONPATH
