@@ -31,9 +31,14 @@ from roll.utils.functionals import (
 from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
 from roll.agentic.replay_buffer import (
-    create_replay_buffer, 
+    create_replay_buffer,
     detect_manager_type_from_config,
     BaseReplayBuffer
+)
+from roll.pipeline.agentic.offpolicy_monitor import (
+    compute_offpolicy_metrics,
+    validate_replay_batch_fields,
+    log_offpolicy_diagnostics
 )
 
 logger = get_logger()
@@ -378,6 +383,18 @@ class AgenticPipeline(BasePipeline):
                     critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
                     metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
 
+                # Also compute off-policy metrics for fresh batch if it came from replay buffer
+                # This helps track how "off-policy" our echo/through-route batch is
+                if batch.meta_info.get("through_route", False) and "behavior_log_probs" in batch.batch:
+                    fresh_offpolicy_metrics = compute_offpolicy_metrics(
+                        current_batch=batch,
+                        actor_train_cluster=self.actor_train,
+                        old_prob_mode=getattr(self.pipeline_config, "old_prob_mode", "trajectory"),
+                        metric_prefix="fresh/offpolicy",
+                        pg_clip=self.pipeline_config.pg_clip
+                    )
+                    metrics.update(fresh_offpolicy_metrics)
+
                 # Optionally perform additional replay buffer training steps
                 if self.pipeline_config.replay.enabled:
                     rb_cfg = self.pipeline_config.replay
@@ -406,8 +423,14 @@ class AgenticPipeline(BasePipeline):
                                 group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
                             )
                             if mb is None:
-                                logger.warning(f"TextualReplayBuffer failed to sample batch at step {step_idx}")
+                                logger.warning(f"Replay buffer failed to sample batch at step {step_idx} (global_step={global_step})")
                                 break
+
+                            # Validate the sampled batch
+                            validation = validate_replay_batch_fields(mb)
+                            if not validation.get("is_valid", False):
+                                logger.warning(f"Invalid replay batch at step {step_idx}: {validation}")
+
                             replay_train_count += 1
 
                             # Compute ref/old log_probs and advantages for replay mb
@@ -424,34 +447,24 @@ class AgenticPipeline(BasePipeline):
                                 behavior_old = DataProto.materialize_concat(data_refs=behavior_old_refs)
                                 mb.batch["old_log_probs"] = behavior_old.batch["log_probs"]
 
-                            # Off-policy monitor: compare current (actor_train) vs behavior (old)
-                            try:
-                                current_lp_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(mb, blocking=False)
-                                current_lp = DataProto.materialize_concat(data_refs=current_lp_refs)
-                                resp_mask = mb.batch["response_mask"][:, 1:].bool()
-                                # masked indexing aggregation on response positions only
-                                cur = current_lp.batch["log_probs"][:, :resp_mask.shape[1]]
-                                old = mb.batch["old_log_probs"][:, :resp_mask.shape[1]]
-                                idx_vals = resp_mask
-                                delta = (cur - old)[idx_vals]
-                                ratio_vals = delta.exp()
-                                mean_delta = delta.mean().detach().item() if ratio_vals.numel() > 0 else 0.0
-                                mean_ratio = ratio_vals.mean().detach().item() if ratio_vals.numel() > 0 else 1.0
-                                p95_ratio = torch.quantile(ratio_vals, 0.95).detach().item() if ratio_vals.numel() > 0 else 1.0
-                                if self.pipeline_config.pg_clip is not None and ratio_vals.numel() > 0:
-                                    clip_low = 1 - self.pipeline_config.pg_clip
-                                    clip_high = 1 + self.pipeline_config.pg_clip
-                                    clip_frac = ((ratio_vals < clip_low) | (ratio_vals > clip_high)).float().mean().detach().item()
-                                else:
-                                    clip_frac = 0.0
-                                metrics.update({
-                                    "offpolicy/delta_logp/mean": mean_delta,
-                                    "offpolicy/ratio/mean": mean_ratio,
-                                    "offpolicy/ratio/p95": p95_ratio,
-                                    "offpolicy/ratio/clip_frac": clip_frac,
-                                })
-                            except Exception:
-                                pass
+                            # Unified off-policy monitoring for replay training
+                            offpolicy_metrics = compute_offpolicy_metrics(
+                                current_batch=mb,
+                                actor_train_cluster=self.actor_train,
+                                old_prob_mode=getattr(self.pipeline_config, "old_prob_mode", "trajectory"),
+                                metric_prefix="replay/offpolicy",
+                                pg_clip=self.pipeline_config.pg_clip
+                            )
+                            metrics.update(offpolicy_metrics)
+
+                            # Log diagnostics for debugging
+                            if global_step % self.pipeline_config.logging_steps == 0 and offpolicy_metrics:
+                                log_offpolicy_diagnostics(
+                                    metrics=offpolicy_metrics,
+                                    batch=mb,
+                                    global_step=global_step,
+                                    logger_func=logger.debug
+                                )
 
                             mb = compute_discounted_returns(mb, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
                             mb = compute_response_level_rewards(batch=mb, pipeline_config=self.pipeline_config)
@@ -499,38 +512,8 @@ class AgenticPipeline(BasePipeline):
                             "replay/train_steps_target": rb_cfg.train_steps_per_env_step,  # Target training steps
                         })
 
-                        # Off-policy monitoring for replay buffer
-                        if mb is not None and mb.batch is not None and "behavior_log_probs" in mb.batch:
-                            try:
-                                # Recompute current policy log probs for off-policy ratio
-                                mb.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
-                                current_lp_refs = self.actor_train.compute_log_probs(mb, blocking=False)
-                                current_lp = DataProto.materialize_concat(data_refs=current_lp_refs)
-
-                                # Calculate off-policy metrics
-                                if "log_probs" in current_lp.batch and "response_mask" in mb.batch:
-                                    resp_mask = mb.batch["response_mask"][:, 1:].bool()
-
-                                    # Get valid indices where mask is True
-                                    valid_indices = resp_mask.flatten().nonzero(as_tuple=True)[0]
-
-                                    if len(valid_indices) > 0:
-                                        cur_lp = current_lp.batch["log_probs"].flatten()[valid_indices]
-                                        old_lp = mb.batch["behavior_log_probs"].flatten()[valid_indices]
-
-                                        if cur_lp.numel() > 0 and old_lp.numel() > 0:
-                                            delta = cur_lp - old_lp
-                                            ratio = delta.exp()
-
-                                            metrics.update({
-                                                "replay/off_policy_delta": delta.mean().item(),
-                                                "replay/off_policy_ratio": ratio.mean().item(),
-                                                "replay/off_policy_max_ratio": ratio.max().item(),
-                                                "replay/off_policy_min_ratio": ratio.min().item(),
-                                                "replay/off_policy_std_ratio": ratio.std().item(),
-                                            })
-                            except Exception as e:
-                                logger.debug(f"Off-policy monitoring failed: {e}")
+                        # Note: Off-policy monitoring is now done inside the replay training loop
+                        # This ensures we compute metrics for each sampled batch, not just the last one
                 tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
 
             data_metrics = compute_data_metrics(batch=batch)
