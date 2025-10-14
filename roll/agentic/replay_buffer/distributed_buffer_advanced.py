@@ -487,23 +487,61 @@ class DistributedReplayBufferWithFaultTolerance:
 
     def push_with_priority(self, batch: DataProto, global_step: int,
                           priority: Optional[float] = None) -> None:
-        """Push with optional priority"""
-        # Select shard
-        shard_idx = global_step % self.num_shards
-        shard = self.shards[shard_idx]
+        """Push with optional priority - stores individual samples, not batches"""
 
-        # Prepare data
-        batch_data = (
-            batch.batch.to_dict(),
-            batch.non_tensor_batch,
-            batch.meta_info,
-            global_step
-        )
+        # Get batch size from tensor dict
+        batch_size = batch.batch.shape[0] if batch.batch is not None else 0
 
-        if self.enable_priority:
-            shard.push_batch_with_priority.remote(batch_data, priority)
-        else:
-            shard.push_batch.remote(*batch_data)
+        if batch_size == 0:
+            logger.warning("Empty batch received in push_with_priority")
+            return
+
+        # Split batch into individual samples and distribute to shards
+        tensor_dict = batch.batch.to_dict()
+        non_tensor = batch.non_tensor_batch
+
+        for sample_idx in range(batch_size):
+            # Extract single sample from batch
+            single_sample_dict = {}
+            for key, tensor in tensor_dict.items():
+                if isinstance(tensor, torch.Tensor):
+                    # Extract single sample (keeping all dimensions except batch)
+                    single_sample_dict[key] = tensor[sample_idx]
+                else:
+                    single_sample_dict[key] = tensor[sample_idx] if hasattr(tensor, '__getitem__') else tensor
+
+            # Extract corresponding non-tensor data
+            single_non_tensor = {}
+            if non_tensor:
+                for key, values in non_tensor.items():
+                    if isinstance(values, (list, np.ndarray)) and len(values) >= batch_size:
+                        single_non_tensor[key] = values[sample_idx]
+                    else:
+                        # Keep as is if not indexable or wrong size
+                        single_non_tensor[key] = values
+
+            # Create meta info for single sample
+            single_meta = batch.meta_info.copy() if batch.meta_info else {}
+            single_meta["original_batch_size"] = batch_size
+            single_meta["sample_index_in_batch"] = sample_idx
+
+            # Select shard for this sample (round-robin)
+            shard_idx = (global_step * batch_size + sample_idx) % self.num_shards
+            shard = self.shards[shard_idx]
+
+            # Prepare single sample data
+            sample_data = (
+                single_sample_dict,
+                single_non_tensor,
+                single_meta,
+                global_step
+            )
+
+            # Push single sample to shard
+            if self.enable_priority:
+                shard.push_batch_with_priority.remote(sample_data, priority)
+            else:
+                shard.push_batch.remote(*sample_data)
 
     def sample_with_importance_weights(self, batch_size: int,
                                       beta: float = 0.4) -> Optional[DataProto]:
@@ -716,14 +754,28 @@ class DistributedReplayBufferWithFaultTolerance:
                         for k, v in td.items():
                             if not isinstance(v, torch.Tensor):
                                 v = torch.tensor(v)
+                            # Ensure all tensors have batch dimension
+                            if v.dim() == 1:
+                                v = v.unsqueeze(0)  # Add batch dimension if missing
+                            elif v.dim() == 0:
+                                v = v.unsqueeze(0)  # Scalar to batch size 1
                             tensor_data[k] = v
-                        td_list.append(TensorDict(tensor_data, batch_size=[1]))
-                    else:
+                        # Get actual batch size from first tensor
+                        batch_dim = list(tensor_data.values())[0].shape[0] if tensor_data else 1
+                        td_list.append(TensorDict(tensor_data, batch_size=[batch_dim]))
+                    elif isinstance(td, TensorDict):
                         td_list.append(td)
+                    else:
+                        logger.warning(f"Unknown tensor dict type: {type(td)}")
 
                 if td_list:
+                    # Concatenate all TensorDicts along batch dimension
                     combined_td = torch.cat(td_list, dim=0)
                     combined_batch.batch = combined_td
+
+                    # Log if behavior_log_probs is missing
+                    if "behavior_log_probs" not in combined_td:
+                        logger.warning("behavior_log_probs missing after combining tensor dicts in sample_for_training")
 
             # Combine non-tensor batches
             if non_tensor_batches:
