@@ -815,12 +815,10 @@ class AgenticPipeline(BasePipeline):
 
             # Push once per fresh batch (new interface doesn't need tokenizer)
             self.replay_buffer.push_from_dataproto(fresh_batch, global_step)
-            # Drop temporary field to keep concat schema identical with replay batches
-            if "behavior_log_probs" in fresh_batch.batch:
-                try:
-                    del fresh_batch.batch["behavior_log_probs"]
-                except Exception:
-                    pass
+
+            # IMPORTANT: Do NOT delete behavior_log_probs here!
+            # The replay buffer needs this field for off-policy monitoring.
+            # The field will be properly managed by the replay buffer itself.
             
             logger.debug(f"Stored fresh batch to replay buffer (buffer_type={self.replay_buffer.buffer_type})")
             

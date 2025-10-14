@@ -179,6 +179,7 @@ class FaultTolerantBufferShard:
             Tuple of (tensor_dict, non_tensor_batch, meta_info)
         """
         import numpy as np
+        import torch
 
         if len(self.buffer) == 0:
             return None
@@ -192,10 +193,47 @@ class FaultTolerantBufferShard:
         sampled_data = [self.buffer[i] for i in indices]
 
         if sampled_data:
-            # For now, return the first sample (proper batching needed)
-            tensor_dict, non_tensor, meta, global_step = sampled_data[0]
-            meta["sample_indices"] = indices
-            return (tensor_dict, non_tensor, meta)
+            # Properly batch all samples together
+            all_tensor_dicts = []
+            all_non_tensors = []
+            all_metas = []
+
+            for data in sampled_data:
+                tensor_dict, non_tensor, meta, global_step = data
+                all_tensor_dicts.append(tensor_dict)
+                all_non_tensors.append(non_tensor)
+                all_metas.append(meta)
+
+            # Combine tensor dicts - convert to actual batch
+            if all_tensor_dicts:
+                # Create a proper batched tensor dict
+                batched_tensor_dict = {}
+                for key in all_tensor_dicts[0].keys():
+                    # Stack tensors along batch dimension
+                    tensors = []
+                    for td in all_tensor_dicts:
+                        if key in td:
+                            if isinstance(td[key], torch.Tensor):
+                                tensors.append(td[key])
+                            else:
+                                tensors.append(torch.tensor(td[key]))
+                    if tensors:
+                        batched_tensor_dict[key] = torch.stack(tensors, dim=0)
+            else:
+                batched_tensor_dict = {}
+
+            # Combine non-tensor data
+            batched_non_tensor = {}
+            if all_non_tensors:
+                for key in all_non_tensors[0].keys():
+                    batched_non_tensor[key] = [nt[key] for nt in all_non_tensors if key in nt]
+
+            # Combine meta info
+            combined_meta = all_metas[0] if all_metas else {}
+            combined_meta["sample_indices"] = indices
+            combined_meta["num_samples"] = len(sampled_data)
+
+            return (batched_tensor_dict, batched_non_tensor, combined_meta)
 
         return None
 
@@ -588,7 +626,14 @@ class DistributedReplayBufferWithFaultTolerance:
         """
         Store data from a DataProto batch into the replay buffer.
         Wrapper for push_with_priority to match base interface.
+
+        IMPORTANT: This method preserves ALL fields in the batch, including
+        behavior_log_probs which is critical for off-policy monitoring.
         """
+        # Verify critical fields are present and warn if missing
+        if batch.batch is not None and "behavior_log_probs" not in batch.batch:
+            logger.warning(f"push_from_dataproto: behavior_log_probs missing in batch at step {global_step}")
+
         # Use default priority if priority sampling is enabled
         default_priority = 1.0 if self.enable_priority else None
         self.push_with_priority(batch, global_step, priority=default_priority)
