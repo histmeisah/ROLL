@@ -771,11 +771,16 @@ class DistributedReplayBufferWithFaultTolerance:
                 if td_list:
                     # Concatenate all TensorDicts along batch dimension
                     combined_td = torch.cat(td_list, dim=0)
-                    combined_batch.batch = combined_td
 
-                    # Log if behavior_log_probs is missing
-                    if "behavior_log_probs" not in combined_td:
+                    # CRITICAL FIX: Rename behavior_log_probs to old_log_probs for training compatibility
+                    # Training code expects "old_log_probs", but we store as "behavior_log_probs"
+                    if "behavior_log_probs" in combined_td:
+                        combined_td["old_log_probs"] = combined_td["behavior_log_probs"]
+                        logger.debug(f"Renamed behavior_log_probs to old_log_probs for training, shape={combined_td['old_log_probs'].shape}")
+                    else:
                         logger.warning("behavior_log_probs missing after combining tensor dicts in sample_for_training")
+
+                    combined_batch.batch = combined_td
 
             # Combine non-tensor batches
             if non_tensor_batches:
