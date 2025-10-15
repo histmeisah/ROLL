@@ -217,6 +217,215 @@ old_prob_compute: engine
    - 需要确认HF策略是否支持返回log probs
    - 可能需要额外实现
 
+## Off-Policy监控指标
+
+### 1. 指标概述
+
+Off-policy监控系统通过比较behavior policy（行为策略，生成数据时的策略）和current policy（当前策略，训练时的策略）的log probabilities来评估replay训练的off-policy程度。
+
+**核心实现**：`roll/pipeline/agentic/offpolicy_monitor.py`
+
+### 2. 指标分类
+
+#### 2.1 基础统计指标
+
+**Log Ratio（对数比率）**：
+- `{prefix}/log_ratio/mean` - 平均对数比率：`log(π_current/π_behavior)`
+- `{prefix}/log_ratio/std` - 对数比率标准差
+- `{prefix}/log_ratio/max` - 最大对数比率
+- `{prefix}/log_ratio/min` - 最小对数比率
+
+**Importance Ratio（重要性采样比率）**：
+- `{prefix}/ratio/mean` - 平均比率：`exp(log_ratio)`
+- `{prefix}/ratio/std` - 比率标准差
+- `{prefix}/ratio/max` - 最大比率
+- `{prefix}/ratio/min` - 最小比率
+- `{prefix}/ratio/median` - 中位数比率
+- `{prefix}/ratio/p95` - 95分位数
+- `{prefix}/ratio/p05` - 5分位数
+- `{prefix}/ratio/p99` - 99分位数
+
+**解读**：
+- `ratio = 1.0` 表示策略完全一致（on-policy）
+- `ratio > 1.0` 表示当前策略更倾向于生成该action
+- `ratio < 1.0` 表示当前策略不太倾向于生成该action
+- 训练初期ratio接近1是正常的，随着训练进行会逐渐偏离
+
+#### 2.2 Clipping分析
+
+**Clip Fraction（裁剪比例）**：
+- `{prefix}/ratio/clip_frac` - 被裁剪的token比例
+- `{prefix}/ratio/clip_threshold` - 裁剪阈值（通常为0.2）
+- `{prefix}/ratio/extreme_low_frac` - 极低比率（<0.5）的token比例
+- `{prefix}/ratio/extreme_high_frac` - 极高比率（>2.0）的token比例
+
+**解读**：
+- `clip_frac` 高表示off-policy程度严重，可能需要：
+  - 减小replay buffer容量
+  - 增加训练频率（减小train_steps_per_env_step）
+  - 使用importance sampling weights
+- `extreme_*_frac` 帮助识别异常的off-policy样本
+
+#### 2.3 有效性指标
+
+**Effective Sample Size (ESS)**：
+- `{prefix}/ess` - 有效样本大小：`(Σw)² / Σw²`
+- `{prefix}/ess_ratio` - 有效样本比率：`ess / total_samples`
+
+**解读**：
+- ESS衡量重要性采样的有效性
+- `ess_ratio = 1.0` 表示所有样本权重相等（完美on-policy）
+- `ess_ratio` 越低，说明少数样本主导训练，可能需要：
+  - 增加replay更新频率
+  - 减小buffer capacity
+  - 应用importance sampling truncation
+
+**KL Divergence（KL散度）**：
+- `{prefix}/kl_divergence` - 近似KL散度：`mean(ratio * log_ratio - (ratio - 1))`
+
+**解读**：
+- 衡量当前策略和行为策略的分布差异
+- 值越大，off-policy程度越严重
+
+#### 2.4 Token统计
+
+**Token Counts（Token计数）**：
+- `{prefix}/valid_tokens` - 有效token数量（response_mask=1的位置）
+- `{prefix}/total_tokens` - 总token数量（包括prompt）
+- `{prefix}/mask_rate` - 有效token占比：`valid_tokens / total_tokens`
+
+**解读**：
+- `mask_rate` 低表示大部分token是prompt，实际训练的response少
+- 可以用来验证response_mask的正确性
+
+### 3. 指标前缀
+
+系统使用不同前缀区分数据来源：
+
+- `fresh/offpolicy/*` - 新采样数据的off-policy指标（echo模式）
+- `replay/offpolicy/*` - Replay buffer采样数据的off-policy指标
+
+**为什么fresh也有offpolicy指标？**
+- 在echo模式下，fresh数据先存入buffer再立即采样训练
+- 由于存储和采样之间可能有微小的策略更新，也会有轻微的off-policy
+- 通常`fresh/offpolicy/ratio/mean`应该非常接近1.0
+
+### 4. 使用示例
+
+#### 4.1 监控训练健康度
+
+```python
+# 在wandb或tensorboard中观察以下指标组合：
+- replay/offpolicy/ratio/mean  # 应该在[0.8, 1.5]范围内
+- replay/offpolicy/ratio/p95   # 不应该超过2.0
+- replay/offpolicy/clip_frac   # 应该<0.1
+- replay/offpolicy/ess_ratio   # 应该>0.5
+- replay/offpolicy/kl_divergence  # 应该<0.5
+```
+
+#### 4.2 诊断Off-Policy问题
+
+**症状1：ratio/mean远离1.0**
+```
+replay/offpolicy/ratio/mean: 1.8
+replay/offpolicy/clip_frac: 0.35
+```
+**原因**：Replay buffer数据过旧，策略已大幅偏离
+**解决方案**：
+- 减小buffer capacity
+- 增加replay更新频率
+- 减少train_steps_per_env_step
+
+**症状2：ess_ratio过低**
+```
+replay/offpolicy/ess_ratio: 0.2
+replay/offpolicy/ratio/std: 0.8
+```
+**原因**：样本权重分布不均，少数样本主导训练
+**解决方案**：
+- 应用importance sampling weight clipping
+- 使用更aggressive的sample_method（如LIFO）
+
+**症状3：extreme_high_frac过高**
+```
+replay/offpolicy/ratio/extreme_high_frac: 0.15
+```
+**原因**：存在大量异常高权重样本
+**解决方案**：
+- 检查log_probs计算是否正确
+- 应用ratio clipping (如PPO的clip_range)
+
+#### 4.3 对比不同配置
+
+```yaml
+# 配置A：Trajectory + Trainer
+old_prob_mode: trajectory
+old_prob_compute: trainer
+
+# 配置B：Turn + Engine
+old_prob_mode: turn
+old_prob_compute: engine
+```
+
+**预期差异**：
+- Turn模式的`valid_tokens`会少于Trajectory模式（只计算最后一轮）
+- Engine模式可能因为数值差异导致略高的`kl_divergence`
+- 两种配置的`ratio/mean`应该接近（相差<0.05）
+
+### 5. 实现细节
+
+**代码位置**：`roll/pipeline/agentic/offpolicy_monitor.py`
+
+**核心逻辑**：
+```python
+# 1. 提取log probs
+behavior_log_probs = batch["old_log_probs"]  # 存储时的
+current_log_probs = actor_train.compute_log_probs(batch)  # 当前策略重新计算
+
+# 2. 应用response_mask
+valid_behavior = behavior_log_probs[response_mask]
+valid_current = current_log_probs[response_mask]
+
+# 3. 计算ratio
+log_ratio = valid_current - valid_behavior
+ratio = torch.exp(log_ratio)
+
+# 4. 统计指标
+metrics = {
+    "ratio/mean": ratio.mean().item(),
+    "ratio/std": ratio.std().item(),
+    "ess": compute_ess(ratio),
+    # ... 更多指标
+}
+```
+
+**调用时机**：
+1. **主训练路径**（第250-260行）：计算`fresh/offpolicy/*`指标
+2. **Replay训练循环**（第450-458行）：计算`replay/offpolicy/*`指标
+
+### 6. 常见问题
+
+**Q1: 为什么训练初期所有ratio都是1.0？**
+- **A**: 正常现象。训练初期策略几乎没变化，所以current和behavior policy相同。等待几十个step后会逐渐偏离。
+
+**Q2: fresh/offpolicy和replay/offpolicy有什么区别？**
+- **A**:
+  - `fresh` - 刚采样的数据（echo模式下也会经过buffer）
+  - `replay` - 从buffer中采样的历史数据
+  - `fresh`的off-policy程度应该远小于`replay`
+
+**Q3: 为什么wandb只显示前25步的数据？**
+- **A**: Wandb配置为offline模式，需要手动sync：
+  ```bash
+  wandb sync /path/to/wandb/offline-run-xxx
+  ```
+
+**Q4: valid_tokens为什么这么少？**
+- **A**: 检查：
+  - `mask_rate` 是否合理（应该>0.01）
+  - `old_prob_mode` 是否为turn（会减少valid tokens）
+  - response是否太短
+
 ## 未来改进方向
 
 1. **Engine模式的完整实现**：
