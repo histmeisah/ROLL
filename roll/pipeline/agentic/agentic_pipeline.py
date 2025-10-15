@@ -487,6 +487,11 @@ class AgenticPipeline(BasePipeline):
                                 whiten_rewards=self.pipeline_config.whiten_rewards,
                             )
 
+                            # CRITICAL FIX: Apply adjust_batch to replay samples to ensure batch size compatibility
+                            # Replay buffer may return smaller batches that need to be adjusted for training
+                            mb = self.adjust_batch(mb, mode=self.pipeline_config.batch_adjust_mode)
+                            metrics.update(reduce_metrics(mb.meta_info.pop("metrics", {})))
+
                             if self.pipeline_config.adv_estimator == "gae":
                                 critic_refs = self.critic.train_step(mb, blocking=False)
                                 all_critic_refs.extend(critic_refs)
