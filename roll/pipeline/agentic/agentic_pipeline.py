@@ -640,6 +640,9 @@ class AgenticPipeline(BasePipeline):
         if threshold == 0:
             return data
 
+        # Debug logging for batch adjustment
+        logger.debug(f"adjust_batch: batch_size={batch_size}, size_divide={size_divide}, threshold={threshold}")
+
         if mode == "auto":
             if threshold >= 0.5 * batch_size or  batch_size // size_divide == 0:
                 mode = "copy"
@@ -661,7 +664,13 @@ class AgenticPipeline(BasePipeline):
             metrics["system/batch_remove_count"] = len(remove_indices)
         elif mode == "copy":
             to_add = size_divide - threshold
-            dup_indices = np.random.choice(batch_size, to_add, replace=False)
+            # Allow replace=True when to_add > batch_size (need to duplicate some samples multiple times)
+            allow_replace = to_add > batch_size
+            if allow_replace:
+                logger.warning(f"adjust_batch copy mode: batch_size={batch_size} < to_add={to_add}, "
+                             f"will use replace=True to duplicate samples. "
+                             f"This usually happens when replay buffer returns small batches.")
+            dup_indices = np.random.choice(batch_size, to_add, replace=allow_replace)
             dup_proto = data.select_idxs(dup_indices)
             # TODO: set dup_proto response_mask to 0
             adjusted_batch = DataProto.concat([data, dup_proto])
