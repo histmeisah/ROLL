@@ -793,6 +793,13 @@ class DistributedReplayBufferWithFaultTolerance:
                                 combined_non_tensor[key].extend(batch[key])
                             else:
                                 combined_non_tensor[key].append(batch[key])
+
+                # CRITICAL FIX: Convert all lists to numpy arrays for compatibility with DataProto.select_idxs
+                # The DataProto.select_idxs() method expects numpy arrays, not Python lists
+                for key, val in combined_non_tensor.items():
+                    if isinstance(val, list):
+                        combined_non_tensor[key] = np.array(val, dtype=object)
+
                 combined_batch.non_tensor_batch = combined_non_tensor
 
             # Combine meta info
