@@ -24,6 +24,10 @@ from .jidi.env import CliffWalkingEnv, GridWorldEnv, MiniGridEnv, SokobanEnv
 from .search.config import SearchEnvConfig
 from .search.env import SearchEnv
 
+# NQ Search environment
+from .nq_search.config import NQSearchEnvConfig
+from .nq_search.env import NQSearchEnv
+
 logger = get_logger()
 
 REGISTERED_ENVS = {
@@ -40,6 +44,8 @@ REGISTERED_ENVS = {
     "jidi_sokoban": SokobanEnv,
     # Search environment
     "search": SearchEnv,
+    # NQ Search environment
+    "nq_search": NQSearchEnv,
 }
 
 REGISTERED_ENV_CONFIGS = {
@@ -56,6 +62,8 @@ REGISTERED_ENV_CONFIGS = {
     "jidi_sokoban": SokobanConfig,
     # Search environment
     "search": SearchEnvConfig,
+    # NQ Search environment
+    "nq_search": NQSearchEnvConfig,
 }
 
 # Webshop environment disabled due to missing dependencies

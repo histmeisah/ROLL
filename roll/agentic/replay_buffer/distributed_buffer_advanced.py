@@ -836,10 +836,21 @@ class DistributedReplayBufferWithFaultTolerance:
             stats = self.get_stats()
             total_size = stats.get("total_size", 0)
 
+            # DEBUG: Log can_sample check
+            can_sample_result = total_size >= batch_size
+
+            # CRITICAL: Log when can_sample returns False
+            if not can_sample_result:
+                logger.error(f"[BUFFER CAN_SAMPLE FALSE] total_size={total_size}, batch_size={batch_size}, stats={stats}")
+            else:
+                logger.info(f"[BUFFER CAN_SAMPLE TRUE] total_size={total_size}, batch_size={batch_size}")
+
             # We need at least batch_size items total
-            return total_size >= batch_size
+            return can_sample_result
         except Exception as e:
-            logger.debug(f"Error checking buffer size: {e}")
+            logger.error(f"[BUFFER CAN_SAMPLE EXCEPTION] Error checking buffer size: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             # Conservative approach: assume we cannot sample if there's an error
             return False
 
@@ -863,6 +874,9 @@ class DistributedReplayBufferWithFaultTolerance:
             ]
             shard_stats = ray.get(stats_futures)
 
+            # DEBUG: Log detailed shard stats
+            logger.debug(f"[BUFFER DEBUG] Shard stats: {shard_stats}")
+
             # Aggregate statistics
             total_size = sum(s.get("size", 0) for s in shard_stats)
             total_capacity = sum(s.get("capacity", 0) for s in shard_stats)
@@ -870,6 +884,8 @@ class DistributedReplayBufferWithFaultTolerance:
 
             # Calculate utilization
             utilization = total_size / total_capacity if total_capacity > 0 else 0.0
+
+            logger.debug(f"[BUFFER DEBUG] total_size={total_size}, total_capacity={total_capacity}, utilization={utilization:.2%}")
 
             return {
                 "buffer_type": self.buffer_type,
@@ -886,6 +902,8 @@ class DistributedReplayBufferWithFaultTolerance:
             }
         except Exception as e:
             logger.error(f"Error getting buffer stats: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return {
                 "buffer_type": self.buffer_type,
                 "total_stored": 0,  # Default value for compatibility

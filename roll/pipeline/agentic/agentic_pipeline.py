@@ -152,29 +152,29 @@ class AgenticPipeline(BasePipeline):
             
             # Calculate batch size
             batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
-            
-            # Always use distributed replay buffer as default
-            # It works for both single and multi-machine training
-            from roll.agentic.replay_buffer.distributed_buffer_advanced import DistributedReplayBufferWithFaultTolerance
 
-            logger.info("Creating distributed replay buffer with fault tolerance")
+            # Use factory function to create appropriate replay buffer type
+            # Supports: distributed (Ray-based), tensordict (efficient), or original (numpy-based)
+            distributed = getattr(rb_cfg, "distributed", False)
+            use_tensordict = getattr(rb_cfg, "use_tensordict", False)
 
-            # Get configuration with proper attribute access
-            num_shards = getattr(rb_cfg, "num_shards", 4)
-            enable_priority = getattr(rb_cfg, "enable_priority", True)
-            enable_checkpoint = getattr(rb_cfg, "enable_checkpoint", True)
-            enable_rebalancing = getattr(rb_cfg, "enable_rebalancing", False)
+            logger.info(f"Creating replay buffer: distributed={distributed}, use_tensordict={use_tensordict}, manager_type={manager_type}")
 
-            self.replay_buffer = DistributedReplayBufferWithFaultTolerance(
+            # Create replay buffer using factory function
+            self.replay_buffer = create_replay_buffer(
+                manager_type=manager_type,
                 capacity=rb_cfg.capacity,
                 batch_size=batch_size,
-                num_shards=num_shards,
-                enable_priority=enable_priority,
-                enable_checkpoint=enable_checkpoint,
-                enable_rebalancing=enable_rebalancing
+                distributed=distributed,
+                use_tensordict=use_tensordict,
+                # Additional parameters for distributed buffer (only used when distributed=True)
+                num_shards=getattr(rb_cfg, "num_shards", 4),
+                enable_priority=getattr(rb_cfg, "enable_priority", True),
+                enable_checkpoint=getattr(rb_cfg, "enable_checkpoint", True),
+                enable_rebalancing=getattr(rb_cfg, "enable_rebalancing", False),
             )
 
-            logger.info(f"Initialized DistributedReplayBufferWithFaultTolerance for {manager_type} env_manager")
+            logger.info(f"Successfully initialized replay buffer: {type(self.replay_buffer).__name__}")
         else:
             self.replay_buffer = None
             # Keep tokenizer for logging/decoding and padding setup even when replay is disabled
