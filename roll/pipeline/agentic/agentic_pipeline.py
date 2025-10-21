@@ -377,21 +377,6 @@ class AgenticPipeline(BasePipeline):
                 metrics.update(kl_metrics)
                 metrics["time/adv"] = timer.last
 
-                # === NEW: Unified off-policy monitoring for fresh/echo batch ===
-                if (self.pipeline_config.offpolicy_monitor.enabled and
-                    self.pipeline_config.offpolicy_monitor.monitor_fresh_batch and
-                    global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0 and
-                    "behavior_log_probs" in batch.batch):
-
-                    fresh_offpolicy_metrics = compute_offpolicy_metrics(
-                        current_batch=batch,
-                        actor_train_cluster=self.actor_train,
-                        old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
-                        metric_prefix="fresh/offpolicy",
-                        pg_clip=self.pipeline_config.pg_clip
-                    )
-                    metrics.update(fresh_offpolicy_metrics)
-
                 # Main training step on the current batch (always run)
                 if self.pipeline_config.adv_estimator == "gae":
                     critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
@@ -400,6 +385,34 @@ class AgenticPipeline(BasePipeline):
                     actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
                     actor_train_metrics: DataProto = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
                     metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
+
+                    # === NEW: Monitor off-policy ratio after first training step ===
+                    # This captures the actual PPO importance sampling ratio after parameter update
+                    if (self.pipeline_config.offpolicy_monitor.enabled and
+                        self.pipeline_config.offpolicy_monitor.monitor_fresh_batch and
+                        global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0 and
+                        "old_log_probs" in batch.batch and
+                        not self.pipeline_config.replay.enabled):  # Only for fresh batch without replay
+
+                        # At this point, actor has been updated, compute current log_probs
+                        # This will show the actual importance sampling ratio used in PPO
+                        fresh_offpolicy_metrics = compute_offpolicy_metrics(
+                            current_batch=batch,
+                            actor_train_cluster=self.actor_train,
+                            old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
+                            metric_prefix="fresh/offpolicy",
+                            pg_clip=self.pipeline_config.pg_clip
+                        )
+                        metrics.update(fresh_offpolicy_metrics)
+
+                        # Log diagnostics if needed
+                        if global_step % self.pipeline_config.logging_steps == 0 and fresh_offpolicy_metrics:
+                            log_offpolicy_diagnostics(
+                                metrics=fresh_offpolicy_metrics,
+                                batch=batch,
+                                global_step=global_step,
+                                logger_func=logger.debug
+                            )
 
                 if self.pipeline_config.adv_estimator == "gae":
                     critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)

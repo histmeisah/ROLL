@@ -45,11 +45,13 @@ def compute_offpolicy_metrics(
             return metrics
 
         # Check for behavior log probs (stored when data was generated)
+        # For fresh batch, use old_log_probs (PPO's actual old policy)
+        # For replay batch, use behavior_log_probs (stored at generation time)
         behavior_field = None
-        if "behavior_log_probs" in current_batch.batch:
-            behavior_field = "behavior_log_probs"
-        elif "old_log_probs" in current_batch.batch:
-            behavior_field = "old_log_probs"
+        if "old_log_probs" in current_batch.batch:
+            behavior_field = "old_log_probs"  # Priority: PPO's old_log_probs for fresh batch
+        elif "behavior_log_probs" in current_batch.batch:
+            behavior_field = "behavior_log_probs"  # Fallback: replay buffer's stored log_probs
         else:
             logger.warning("compute_offpolicy_metrics: No behavior log probs found in batch")
             return metrics
