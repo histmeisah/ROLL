@@ -214,6 +214,13 @@ class AgenticPipeline(BasePipeline):
                 metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
                 batch.meta_info["global_step"] = global_step
 
+                # === NEW: Compute and attach behavior log probs if offpolicy monitoring enabled ===
+                if self.pipeline_config.offpolicy_monitor.enabled and self.pipeline_config.offpolicy_monitor.save_behavior_log_probs:
+                    with Timer(name="behavior_log_probs", logger=None) as behavior_timer:
+                        batch = self._compute_and_attach_behavior_log_probs(batch)
+                    metrics["time/behavior_log_probs"] = behavior_timer.last
+                    logger.debug(f"Computed behavior log probs for off-policy monitoring (scope={self.pipeline_config.offpolicy_monitor.behavior_scope})")
+
                 batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
 
                 # ✨ REPLAY BUFFER INTEGRATION: Mix replay data with fresh rollout data
@@ -240,12 +247,12 @@ class AgenticPipeline(BasePipeline):
                 # 当启用 replay 时，下方 off-policy 训练路径会对采样批次重新计算 log_probs/adv。
                 # 为避免重复计算，这里仅在 off-policy 关闭时计算。
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
-                    # Pass old_prob_mode to compute_log_probs
-                    batch.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
+                    # Use behavior scope from offpolicy_monitor config
+                    batch.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
                     ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(batch, blocking=False)
                     ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
                     ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
-                    # CRITICAL FIX: Preserve non_tensor_batch during union operation 
+                    # CRITICAL FIX: Preserve non_tensor_batch during union operation
                     # This ensures state_hash and other metadata are not lost
                     preserved_non_tensor_batch = batch.non_tensor_batch
                     batch = batch.union(ref_log_probs)
@@ -258,7 +265,7 @@ class AgenticPipeline(BasePipeline):
                 with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
                     # TODO: use engine log_probs as old_log_probs
                     batch.meta_info["is_offload_states"] = False
-                    batch.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
+                    batch.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
                     old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
                     if self.pipeline_config.adv_estimator == "gae":
                         values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
@@ -370,6 +377,21 @@ class AgenticPipeline(BasePipeline):
                 metrics.update(kl_metrics)
                 metrics["time/adv"] = timer.last
 
+                # === NEW: Unified off-policy monitoring for fresh/echo batch ===
+                if (self.pipeline_config.offpolicy_monitor.enabled and
+                    self.pipeline_config.offpolicy_monitor.monitor_fresh_batch and
+                    global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0 and
+                    "behavior_log_probs" in batch.batch):
+
+                    fresh_offpolicy_metrics = compute_offpolicy_metrics(
+                        current_batch=batch,
+                        actor_train_cluster=self.actor_train,
+                        old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
+                        metric_prefix="fresh/offpolicy",
+                        pg_clip=self.pipeline_config.pg_clip
+                    )
+                    metrics.update(fresh_offpolicy_metrics)
+
                 # Main training step on the current batch (always run)
                 if self.pipeline_config.adv_estimator == "gae":
                     critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
@@ -382,18 +404,6 @@ class AgenticPipeline(BasePipeline):
                 if self.pipeline_config.adv_estimator == "gae":
                     critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
                     metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
-
-                # Also compute off-policy metrics for fresh batch if it came from replay buffer
-                # This helps track how "off-policy" our echo/through-route batch is
-                if batch.meta_info.get("through_route", False) and "behavior_log_probs" in batch.batch:
-                    fresh_offpolicy_metrics = compute_offpolicy_metrics(
-                        current_batch=batch,
-                        actor_train_cluster=self.actor_train,
-                        old_prob_mode=getattr(self.pipeline_config, "old_prob_mode", "trajectory"),
-                        metric_prefix="fresh/offpolicy",
-                        pg_clip=self.pipeline_config.pg_clip
-                    )
-                    metrics.update(fresh_offpolicy_metrics)
 
                 # Optionally perform additional replay buffer training steps
                 if self.pipeline_config.replay.enabled:
@@ -434,7 +444,7 @@ class AgenticPipeline(BasePipeline):
                             replay_train_count += 1
 
                             # Compute ref/old log_probs and advantages for replay mb
-                            mb.meta_info["old_prob_mode"] = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
+                            mb.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
                             ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(mb, blocking=False)
                             ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
                             ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
@@ -447,24 +457,28 @@ class AgenticPipeline(BasePipeline):
                                 behavior_old = DataProto.materialize_concat(data_refs=behavior_old_refs)
                                 mb.batch["old_log_probs"] = behavior_old.batch["log_probs"]
 
-                            # Unified off-policy monitoring for replay training
-                            offpolicy_metrics = compute_offpolicy_metrics(
-                                current_batch=mb,
-                                actor_train_cluster=self.actor_train,
-                                old_prob_mode=getattr(self.pipeline_config, "old_prob_mode", "trajectory"),
-                                metric_prefix="replay/offpolicy",
-                                pg_clip=self.pipeline_config.pg_clip
-                            )
-                            metrics.update(offpolicy_metrics)
+                            # === NEW: Unified off-policy monitoring for replay batch ===
+                            if (self.pipeline_config.offpolicy_monitor.enabled and
+                                self.pipeline_config.offpolicy_monitor.monitor_replay_batch and
+                                global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0):
 
-                            # Log diagnostics for debugging
-                            if global_step % self.pipeline_config.logging_steps == 0 and offpolicy_metrics:
-                                log_offpolicy_diagnostics(
-                                    metrics=offpolicy_metrics,
-                                    batch=mb,
-                                    global_step=global_step,
-                                    logger_func=logger.debug
+                                replay_offpolicy_metrics = compute_offpolicy_metrics(
+                                    current_batch=mb,
+                                    actor_train_cluster=self.actor_train,
+                                    old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
+                                    metric_prefix="replay/offpolicy",
+                                    pg_clip=self.pipeline_config.pg_clip
                                 )
+                                metrics.update(replay_offpolicy_metrics)
+
+                                # Log diagnostics for debugging
+                                if global_step % self.pipeline_config.logging_steps == 0 and replay_offpolicy_metrics:
+                                    log_offpolicy_diagnostics(
+                                        metrics=replay_offpolicy_metrics,
+                                        batch=mb,
+                                        global_step=global_step,
+                                        logger_func=logger.debug
+                                    )
 
                             mb = compute_discounted_returns(mb, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
                             mb = compute_response_level_rewards(batch=mb, pipeline_config=self.pipeline_config)
@@ -757,14 +771,122 @@ class AgenticPipeline(BasePipeline):
             logger.debug("Falling back to fresh data only")
             return fresh_batch
 
-    def store_fresh_data_to_replay_buffer(self, fresh_batch: DataProto, global_step: int):
-        """Store fresh rollout data to replay buffer for future training."""
+    def _compute_and_attach_behavior_log_probs(self, batch: DataProto) -> DataProto:
+        """
+        Compute and attach behavior policy log probs to batch.
+        This is independent of replay buffer and used for off-policy monitoring.
+
+        Args:
+            batch: DataProto batch from rollout
+
+        Returns:
+            batch with behavior_log_probs attached
+        """
+        cfg = self.pipeline_config.offpolicy_monitor
+
         try:
-            # Decide old prob compute path and scope
-            old_prob_compute = getattr(self.pipeline_config, "old_prob_compute", "trainer")
-            old_prob_mode = getattr(self.pipeline_config, "old_prob_mode", "trajectory")
-            fresh_batch.meta_info["old_prob_compute"] = old_prob_compute
-            fresh_batch.meta_info["old_prob_mode"] = old_prob_mode
+            if cfg.behavior_compute == "engine" and batch.batch is not None and "generation_log_probs" in batch.batch:
+                # Use engine-provided log probs
+                logger.debug(f"Using engine mode for behavior log probs with generation_log_probs shape {batch.batch['generation_log_probs'].shape}")
+
+                engine_log_probs = batch.batch["generation_log_probs"]
+
+                # Apply turn mask if needed
+                if cfg.behavior_scope == "turn" and "prompt_mask" in batch.batch:
+                    from roll.utils.turn_mode_utils import create_turn_mode_response_mask
+
+                    response_mask = batch.batch.get("response_mask")
+                    prompt_mask = batch.batch.get("prompt_mask")
+                    messages_list = batch.non_tensor_batch.get("messages_list", None) if hasattr(batch, 'non_tensor_batch') else None
+
+                    if response_mask is not None:
+                        # Create turn-specific mask
+                        turn_mask, _ = create_turn_mode_response_mask(
+                            response_mask=response_mask,
+                            prompt_mask=prompt_mask,
+                            messages_list=messages_list
+                        )
+
+                        # Handle shape mismatch
+                        if engine_log_probs.shape != turn_mask.shape:
+                            logger.warning(f"Shape mismatch: engine_log_probs {engine_log_probs.shape} vs turn_mask {turn_mask.shape}")
+                            min_len = min(engine_log_probs.shape[1], turn_mask.shape[1])
+                            engine_log_probs = engine_log_probs[:, :min_len]
+                            turn_mask = turn_mask[:, :min_len]
+
+                        batch.batch["behavior_log_probs"] = engine_log_probs * turn_mask.float()
+                    else:
+                        batch.batch["behavior_log_probs"] = engine_log_probs
+                else:
+                    # Trajectory mode: use engine log probs directly
+                    batch.batch["behavior_log_probs"] = engine_log_probs
+
+            else:
+                # Trainer mode (default): recompute using actor_train
+                batch.meta_info["old_prob_mode"] = cfg.behavior_scope
+                behavior_refs = self.actor_train.compute_log_probs(batch, blocking=False)
+                behavior = DataProto.materialize_concat(data_refs=behavior_refs)
+
+                if behavior.batch is not None and "log_probs" in behavior.batch:
+                    batch.batch["behavior_log_probs"] = behavior.batch["log_probs"]
+                    logger.debug(f"Computed behavior log probs using trainer mode (scope={cfg.behavior_scope})")
+
+        except Exception as e:
+            logger.warning(f"Failed to compute behavior log probs: {e}")
+            logger.debug(f"Error details: {str(e)}", exc_info=True)
+
+        return batch
+
+    def _apply_turn_mask(self, batch: DataProto, log_probs: torch.Tensor) -> torch.Tensor:
+        """
+        Apply turn-specific mask to log probs (helper for turn mode).
+
+        Args:
+            batch: DataProto batch containing masks
+            log_probs: Log probabilities tensor
+
+        Returns:
+            Masked log probabilities
+        """
+        try:
+            from roll.utils.turn_mode_utils import create_turn_mode_response_mask
+
+            response_mask = batch.batch.get("response_mask")
+            prompt_mask = batch.batch.get("prompt_mask")
+            messages_list = batch.non_tensor_batch.get("messages_list", None) if hasattr(batch, 'non_tensor_batch') else None
+
+            if response_mask is not None:
+                turn_mask, _ = create_turn_mode_response_mask(
+                    response_mask=response_mask,
+                    prompt_mask=prompt_mask,
+                    messages_list=messages_list
+                )
+
+                # Handle shape mismatch
+                if log_probs.shape != turn_mask.shape:
+                    min_len = min(log_probs.shape[1], turn_mask.shape[1])
+                    log_probs = log_probs[:, :min_len]
+                    turn_mask = turn_mask[:, :min_len]
+
+                return log_probs * turn_mask.float()
+            else:
+                return log_probs
+
+        except Exception as e:
+            logger.warning(f"Failed to apply turn mask: {e}")
+            return log_probs
+
+    def store_fresh_data_to_replay_buffer(self, fresh_batch: DataProto, global_step: int):
+        """
+        Store fresh rollout data to replay buffer for future training.
+
+        Note: behavior_log_probs should already be attached if offpolicy_monitor is enabled.
+        This method only handles the storage logic.
+        """
+        try:
+            # Store metadata about behavior policy configuration
+            fresh_batch.meta_info["behavior_compute"] = self.pipeline_config.offpolicy_monitor.behavior_compute
+            fresh_batch.meta_info["behavior_scope"] = self.pipeline_config.offpolicy_monitor.behavior_scope
 
             # Compute prompt_length if available (useful for step mode in some envs)
             try:
@@ -773,69 +895,21 @@ class AgenticPipeline(BasePipeline):
             except Exception:
                 pass
 
-            # Compute behavior policy log_probs according to config
-            try:
-                if old_prob_compute == "engine" and fresh_batch.batch is not None and "generation_log_probs" in fresh_batch.batch:
-                    logger.debug(f"Using engine mode for old_prob_compute with generation_log_probs shape {fresh_batch.batch['generation_log_probs'].shape}")
-                    # Use engine-provided log probs
-                    if old_prob_mode == "turn" and "prompt_mask" in fresh_batch.batch:
-                        # Apply turn mask to engine log probs
-                        from roll.utils.turn_mode_utils import create_turn_mode_response_mask
-                        
-                        # Get the original response mask
-                        response_mask = fresh_batch.batch.get("response_mask")
-                        prompt_mask = fresh_batch.batch.get("prompt_mask")
-                        messages_list = fresh_batch.non_tensor_batch.get("messages_list", None) if hasattr(fresh_batch, 'non_tensor_batch') else None
-                        
-                        if response_mask is not None:
-                            # Create turn-specific mask
-                            turn_mask, _ = create_turn_mode_response_mask(
-                                response_mask=response_mask,
-                                prompt_mask=prompt_mask,
-                                messages_list=messages_list
-                            )
-                            
-                            # Apply mask to engine log probs
-                            engine_log_probs = fresh_batch.batch["generation_log_probs"]
-                            
-                            # Ensure shapes match
-                            if engine_log_probs.shape != turn_mask.shape:
-                                logger.warning(f"Shape mismatch: engine_log_probs {engine_log_probs.shape} vs turn_mask {turn_mask.shape}")
-                                # If shapes don't match, try to broadcast or truncate
-                                if engine_log_probs.shape[1] > turn_mask.shape[1]:
-                                    # Truncate log probs to match mask
-                                    engine_log_probs = engine_log_probs[:, :turn_mask.shape[1]]
-                                elif engine_log_probs.shape[1] < turn_mask.shape[1]:
-                                    # Truncate mask to match log probs
-                                    turn_mask = turn_mask[:, :engine_log_probs.shape[1]]
-                            
-                            masked_log_probs = engine_log_probs * turn_mask.float()
-                            fresh_batch.batch["behavior_log_probs"] = masked_log_probs
-                        else:
-                            # Fallback if no response mask
-                            fresh_batch.batch["behavior_log_probs"] = fresh_batch.batch["generation_log_probs"]
-                    else:
-                        # Trajectory mode: use engine log probs directly
-                        fresh_batch.batch["behavior_log_probs"] = fresh_batch.batch["generation_log_probs"]
-                else:
-                    # Fallback or preferred path: trainer-side recomputation
-                    # For step mode, env/data flow ensures response_mask already marks current generation span
-                    behavior_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(fresh_batch, blocking=False)
-                    behavior = DataProto.materialize_concat(data_refs=behavior_refs)
-                    if behavior.batch is not None and "log_probs" in behavior.batch:
-                        fresh_batch.batch["behavior_log_probs"] = behavior.batch["log_probs"]
-            except Exception as e:
-                logger.warning(f"Failed to compute behavior log_probs for replay storage (mode={old_prob_mode}, compute={old_prob_compute}): {e}")
+            # Fallback: if behavior_log_probs not computed yet (e.g., offpolicy_monitor disabled),
+            # but replay buffer is enabled, we still need to compute it for replay training
+            if "behavior_log_probs" not in fresh_batch.batch:
+                logger.warning("behavior_log_probs not found in batch. Computing now for replay buffer storage.")
+                fresh_batch = self._compute_and_attach_behavior_log_probs(fresh_batch)
 
-            # Push once per fresh batch (new interface doesn't need tokenizer)
+            # Push to replay buffer
             self.replay_buffer.push_from_dataproto(fresh_batch, global_step)
 
             # IMPORTANT: Do NOT delete behavior_log_probs here!
             # The replay buffer needs this field for off-policy monitoring.
             # The field will be properly managed by the replay buffer itself.
-            
+
             logger.debug(f"Stored fresh batch to replay buffer (buffer_type={self.replay_buffer.buffer_type})")
-            
+
         except Exception as e:
             logger.error(f"Failed to store fresh data to replay buffer: {e}")
             logger.debug(f"Error details: {str(e)}", exc_info=True)
