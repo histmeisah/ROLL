@@ -448,3 +448,245 @@ ROLL框架中的off-policy ratio机制设计精妙：
    - 灵活支持不同的训练算法需求
 
 这种设计使得ROLL能够充分利用专门的推理和训练技术栈，在保证算法正确性的同时最大化系统效率。
+
+## 8. Off-Policy监控指标体系
+
+ROLL框架提供了完整的off-policy监控指标，用于实时评估训练的off-policy程度并诊断潜在问题。这些指标通过`offpolicy_monitor.py`模块实现。
+
+### 8.1 核心监控指标
+
+#### 8.1.1 Importance Sampling Ratio指标
+
+**Log Ratio（对数比率）**：
+- `{prefix}/log_ratio/mean` - log(π_new/π_old)的平均值，反映策略变化的方向和程度
+- `{prefix}/log_ratio/std` - 标准差，衡量策略变化的一致性
+- `{prefix}/log_ratio/max` - 最大值，识别极端的策略偏离
+- `{prefix}/log_ratio/min` - 最小值，识别反向的策略偏离
+
+**Ratio（比率）**：
+- `{prefix}/ratio/mean` - exp(log_ratio)的平均值，即π_new/π_old的实际比率
+- `{prefix}/ratio/std` - 标准差，衡量比率的分散程度
+- `{prefix}/ratio/max` - 最大值，识别被严重高估的动作
+- `{prefix}/ratio/min` - 最小值，识别被严重低估的动作
+- `{prefix}/ratio/median` - 中位数，提供稳健的中心趋势估计
+
+**分位数统计**：
+- `{prefix}/ratio/p95` - 95分位数，上界估计
+- `{prefix}/ratio/p05` - 5分位数，下界估计
+- `{prefix}/ratio/p99` - 99分位数，极端上界
+
+#### 8.1.2 PPO Clipping分析
+
+- `{prefix}/ratio/clip_frac` - 被PPO clip机制截断的token比例
+  - < 0.1：策略更新过于保守，可增大学习率
+  - 0.1-0.3：正常范围
+  - > 0.3：策略更新过于激进，需减小学习率或pg_clip
+- `{prefix}/ratio/clip_threshold` - 当前的PPO clip阈值（pg_clip配置值）
+
+#### 8.1.3 Effective Sample Size (ESS)
+
+ESS衡量在importance sampling下的有效样本数量：
+
+- `{prefix}/ess` - 有效样本大小：ESS = (Σw)²/Σw²，其中w=ratio
+- `{prefix}/ess_ratio` - 归一化ESS：ESS/batch_size
+  - 接近1.0：样本有效性高，importance weights分布均匀
+  - < 0.5：大量样本被重要性权重削弱，训练效率低
+  - < 0.3：严重的分布不匹配，需要调整
+
+#### 8.1.4 KL散度
+
+- `{prefix}/kl_divergence` - KL散度近似值：E[log(π_new/π_old)]
+  - < 0.01：策略几乎没有变化，接近on-policy
+  - 0.01-0.05：适度的策略变化，正常范围
+  - 0.05-0.1：较大的策略变化，需要关注
+  - > 0.1：策略差异过大，可能影响训练稳定性
+
+#### 8.1.5 极端比率监控
+
+- `{prefix}/ratio/extreme_low_frac` - ratio < 0.5的token比例
+  - 表示多少动作在新策略下概率降低了50%以上
+- `{prefix}/ratio/extreme_high_frac` - ratio > 2.0的token比例
+  - 表示多少动作在新策略下概率提高了100%以上
+
+正常情况下，这两个值都应该< 0.2。
+
+#### 8.1.6 Token统计
+
+- `{prefix}/valid_tokens` - 实际参与计算的有效token数
+- `{prefix}/total_tokens` - 批次中的总token数
+- `{prefix}/mask_rate` - 有效token占比（valid_tokens/total_tokens）
+
+### 8.2 监控配置
+
+通过`OffPolicyMonitorConfig`配置监控行为：
+
+```python
+@dataclass
+class OffPolicyMonitorConfig:
+    # 基础开关
+    enabled: bool = True  # 是否启用off-policy监控
+
+    # 行为策略log_probs的计算配置
+    behavior_compute: Literal["trainer", "engine"] = "trainer"
+    # - "trainer": 使用actor_train重新计算（更准确）
+    # - "engine": 使用推理引擎返回的log_probs（更高效）
+
+    behavior_scope: Literal["trajectory", "turn"] = "trajectory"
+    # - "trajectory": 计算整个轨迹的log_probs
+    # - "turn": 仅计算最后一轮assistant回复
+
+    save_behavior_log_probs: bool = True  # 是否保存behavior_log_probs
+
+    # 监控频率和范围
+    monitor_fresh_batch: bool = True  # 监控新收集的数据
+    monitor_replay_batch: bool = True  # 监控replay buffer采样的数据
+    monitor_interval: int = 1  # 每N个训练步骤监控一次
+```
+
+### 8.3 指标前缀体系
+
+根据数据来源，指标使用不同的前缀便于区分：
+
+- **`fresh/offpolicy/`** - 新收集数据的off-policy指标
+  - 反映on-policy训练中，一次参数更新后的策略变化
+  - 理论上应该在PPO clip范围内
+
+- **`replay/offpolicy/`** - replay buffer数据的off-policy指标
+  - 反映历史数据与当前策略的差异
+  - 随着时间推移，这些指标会逐渐偏离1.0
+
+### 8.4 监控最佳实践
+
+#### 8.4.1 健康指标范围
+
+一个健康的off-policy训练应该满足：
+
+| 指标 | 健康范围 | 说明 |
+|------|----------|------|
+| ESS Ratio | > 0.5 | 有效样本占比 |
+| Clip Fraction | < 0.3 | PPO截断比例 |
+| KL Divergence | < 0.1 | 策略差异程度 |
+| Extreme Low Frac | < 0.2 | 严重低估比例 |
+| Extreme High Frac | < 0.2 | 严重高估比例 |
+| Ratio Mean | 0.5-2.0 | 平均重要性权重 |
+
+#### 8.4.2 异常诊断与调整
+
+**问题1：ESS Ratio过低（< 0.3）**
+- 原因：replay数据过于陈旧，与当前策略差异太大
+- 解决方案：
+  - 减少replay buffer容量
+  - 使用LIFO采样策略（优先采样新数据）
+  - 减少train_steps_per_env_step
+  - 增加fresh数据比例
+
+**问题2：Clip Fraction过高（> 0.3）**
+- 原因：策略更新太激进
+- 解决方案：
+  - 减小学习率
+  - 减小pg_clip值
+  - 减少训练epoch数
+
+**问题3：KL Divergence过大（> 0.1）**
+- 原因：新旧策略差异过大
+- 解决方案：
+  - 更频繁地收集新数据
+  - 减少replay buffer的使用比例
+  - 使用KL penalty调节策略更新
+
+**问题4：Extreme Ratios过高（> 0.3）**
+- 原因：部分动作的概率发生剧烈变化
+- 解决方案：
+  - 检查是否有分布漂移
+  - 调整exploration策略
+  - 考虑使用importance sampling权重截断
+
+### 8.5 实现示例
+
+#### 8.5.1 计算off-policy指标
+
+```python
+from roll.pipeline.agentic.offpolicy_monitor import compute_offpolicy_metrics
+
+# 监控fresh batch
+if self.pipeline_config.offpolicy_monitor.enabled:
+    fresh_metrics = compute_offpolicy_metrics(
+        current_batch=batch,
+        actor_train_cluster=self.actor_train,
+        old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
+        metric_prefix="fresh/offpolicy",
+        pg_clip=self.pipeline_config.pg_clip
+    )
+    metrics.update(fresh_metrics)
+```
+
+#### 8.5.2 验证replay batch
+
+```python
+from roll.pipeline.agentic.offpolicy_monitor import validate_replay_batch_fields
+
+# 验证replay数据完整性
+validation = validate_replay_batch_fields(replay_batch)
+if not validation["is_valid"]:
+    logger.warning(f"Invalid replay batch: {validation}")
+```
+
+#### 8.5.3 详细诊断日志
+
+```python
+from roll.pipeline.agentic.offpolicy_monitor import log_offpolicy_diagnostics
+
+# 输出详细的off-policy诊断信息
+log_offpolicy_diagnostics(
+    metrics=offpolicy_metrics,
+    batch=current_batch,
+    global_step=global_step,
+    logger_func=logger.info
+)
+```
+
+### 8.6 监控数据流
+
+完整的off-policy监控数据流：
+
+```
+1. 数据收集（EnvManager）
+   ↓
+2. 计算behavior_log_probs（Actor-Train）
+   ↓
+3. 存储到Replay Buffer（如果启用）
+   ↓
+4. 采样训练数据
+   ↓
+5. 计算current_log_probs（Actor-Train）
+   ↓
+6. 调用compute_offpolicy_metrics计算指标
+   ↓
+7. 记录到metrics并输出到日志/TensorBoard
+```
+
+### 8.7 与其他组件的集成
+
+Off-policy监控与ROLL框架的其他组件紧密集成：
+
+1. **与Replay Buffer集成**：
+   - 自动为replay数据计算off-policy指标
+   - 支持不同采样策略的效果评估
+
+2. **与Old Prob机制集成**：
+   - 支持trajectory和turn两种计算范围
+   - 支持trainer和engine两种计算方式
+
+3. **与PPO算法集成**：
+   - 监控PPO clip机制的效果
+   - 提供importance sampling ratio的实时反馈
+
+4. **与训练流程集成**：
+   - 在关键节点自动触发监控
+   - 异常时自动记录诊断信息
+
+通过这套完整的off-policy监控体系，ROLL能够为用户提供：
+- 训练稳定性的实时评估
+- 问题的早期发现和诊断
+- 超参数调优的量化依据
+- Off-policy训练的质量保证

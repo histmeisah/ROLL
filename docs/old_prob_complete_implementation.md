@@ -4,6 +4,8 @@
 
 Old Prob（旧策略概率）是ROLL框架中用于计算off-policy ratio的关键组件。本文档详细说明了old prob的完整实现，包括两个维度的配置选项。
 
+关于off-policy ratio的完整数据流和监控指标，请参阅[off_policy_ratio_dataflow_analysis.md](./off_policy_ratio_dataflow_analysis.md)。
+
 ## 配置选项
 
 ### 1. old_prob_mode（计算范围）
@@ -444,3 +446,8 @@ metrics = {
 4. **文档和测试**：
    - 添加单元测试覆盖所有模式组合
    - 提供性能基准测试结果
+
+## 相关文档
+
+- [off_policy_ratio_dataflow_analysis.md](./off_policy_ratio_dataflow_analysis.md) - Off-Policy Ratio完整数据流分析和监控指标体系
+- [replay_buffer.md](./replay_buffer.md) - Replay Buffer实现详解
