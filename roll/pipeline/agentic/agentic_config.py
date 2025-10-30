@@ -151,6 +151,75 @@ class ReplayConfig:
         metadata={"help": "If true, skip main on-policy update and train only from replay minibatches."}
     )
 
+    # N-Step Returns Configuration
+    enable_nstep: bool = field(
+        default=False,
+        metadata={"help": "Enable n-step returns computation for replay buffer."}
+    )
+    n_step: int = field(
+        default=5,
+        metadata={
+            "help": "Number of steps for n-step returns (step-level, not token-level). "
+                    "This refers to environment interaction steps."
+        }
+    )
+    nstep_gamma: float = field(
+        default=0.99,
+        metadata={
+            "help": "Discount factor for step-level n-step returns (γ_step). "
+                    "This is used for outer-layer (step-level) discounting, "
+                    "separate from token-level gamma."
+        }
+    )
+    use_nstep_in_advantage: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use n-step returns as outer-layer reward in advantage computation. "
+                    "If True, n-step returns replace single-step response_level_rewards when "
+                    "expanding to token-level, but inner-layer token-level computation remains unchanged."
+        }
+    )
+    use_bootstrap: bool = field(
+        default=False,
+        metadata={"help": "Whether to use critic values for bootstrapping in n-step returns."}
+    )
+
+    # GAE Configuration (Advanced)
+    enable_gae: bool = field(
+        default=False,
+        metadata={"help": "Enable Generalized Advantage Estimation (GAE) for replay buffer."}
+    )
+    gae_lambda: float = field(
+        default=0.95,
+        metadata={"help": "GAE lambda parameter for exponential smoothing of TD errors."}
+    )
+    gae_horizon: int = field(
+        default=20,
+        metadata={"help": "Truncation horizon for GAE computation (limits lookback)."}
+    )
+
+    # Age-based Priority Configuration
+    age_decay: float = field(
+        default=1000.0,
+        metadata={
+            "help": "Age decay constant for freshness weighting in priority replay. "
+                    "Effective priority = intrinsic_priority * exp(-age / age_decay). "
+                    "Larger values (e.g., 10000) decay slower (older samples stay relevant longer). "
+                    "Smaller values (e.g., 100) decay faster (strong preference for fresh samples)."
+        }
+    )
+
+    # Advantage-based Priority Configuration
+    use_advantage_priority: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to update replay buffer priorities using advantages after training. "
+                    "If True, priorities are updated with |advantage| after compute_advantage(). "
+                    "Initial priorities (at push) still use the configured priority function (e.g., reward). "
+                    "This implements the two-stage priority strategy: reward → advantage."
+        }
+    )
+
 
 @dataclass
 class EnvManagerConfig(WorkerConfig):

@@ -17,7 +17,6 @@ def compute_offpolicy_metrics(
     current_batch: DataProto,
     actor_train_cluster: Any,
     old_prob_mode: str = "trajectory",
-    metric_prefix: str = "offpolicy",
     pg_clip: Optional[float] = None,
 ) -> Dict[str, float]:
     """
@@ -26,15 +25,16 @@ def compute_offpolicy_metrics(
     This function provides a unified way to calculate off-policy metrics for any
     batch sampled from replay buffer, handling both trajectory and turn modes.
 
+    所有指标统一使用 'offpolicy/' 前缀，便于对比不同模式下的结果。
+
     Args:
         current_batch: DataProto batch containing data from replay buffer
         actor_train_cluster: Actor cluster for computing current policy log probs
         old_prob_mode: Mode for old probability calculation ("trajectory" or "turn")
-        metric_prefix: Prefix for metric keys (e.g., "offpolicy", "replay")
         pg_clip: Clipping threshold for PPO-style ratio clipping analysis
 
     Returns:
-        Dictionary of off-policy metrics
+        Dictionary of off-policy metrics (all with 'offpolicy/' prefix)
     """
     metrics = {}
 
@@ -104,22 +104,22 @@ def compute_offpolicy_metrics(
         ratio = log_ratio.exp()
 
         # Basic statistics
-        metrics[f"{metric_prefix}/log_ratio/mean"] = log_ratio.mean().detach().item()
-        metrics[f"{metric_prefix}/log_ratio/std"] = log_ratio.std().detach().item()
-        metrics[f"{metric_prefix}/log_ratio/max"] = log_ratio.max().detach().item()
-        metrics[f"{metric_prefix}/log_ratio/min"] = log_ratio.min().detach().item()
+        metrics["offpolicy/log_ratio/mean"] = log_ratio.mean().detach().item()
+        metrics["offpolicy/log_ratio/std"] = log_ratio.std().detach().item()
+        metrics["offpolicy/log_ratio/max"] = log_ratio.max().detach().item()
+        metrics["offpolicy/log_ratio/min"] = log_ratio.min().detach().item()
 
-        metrics[f"{metric_prefix}/ratio/mean"] = ratio.mean().detach().item()
-        metrics[f"{metric_prefix}/ratio/std"] = ratio.std().detach().item()
-        metrics[f"{metric_prefix}/ratio/max"] = ratio.max().detach().item()
-        metrics[f"{metric_prefix}/ratio/min"] = ratio.min().detach().item()
-        metrics[f"{metric_prefix}/ratio/median"] = ratio.median().detach().item()
+        metrics["offpolicy/ratio/mean"] = ratio.mean().detach().item()
+        metrics["offpolicy/ratio/std"] = ratio.std().detach().item()
+        metrics["offpolicy/ratio/max"] = ratio.max().detach().item()
+        metrics["offpolicy/ratio/min"] = ratio.min().detach().item()
+        metrics["offpolicy/ratio/median"] = ratio.median().detach().item()
 
         # Percentile statistics for distribution analysis
         if ratio.numel() > 0:
-            metrics[f"{metric_prefix}/ratio/p95"] = torch.quantile(ratio, 0.95).detach().item()
-            metrics[f"{metric_prefix}/ratio/p05"] = torch.quantile(ratio, 0.05).detach().item()
-            metrics[f"{metric_prefix}/ratio/p99"] = torch.quantile(ratio, 0.99).detach().item()
+            metrics["offpolicy/ratio/p95"] = torch.quantile(ratio, 0.95).detach().item()
+            metrics["offpolicy/ratio/p05"] = torch.quantile(ratio, 0.05).detach().item()
+            metrics["offpolicy/ratio/p99"] = torch.quantile(ratio, 0.99).detach().item()
 
         # PPO clipping analysis
         if pg_clip is not None and pg_clip > 0:
@@ -127,34 +127,34 @@ def compute_offpolicy_metrics(
             clip_high = 1 + pg_clip
             clipped = (ratio < clip_low) | (ratio > clip_high)
             clip_frac = clipped.float().mean().detach().item()
-            metrics[f"{metric_prefix}/ratio/clip_frac"] = clip_frac
-            metrics[f"{metric_prefix}/ratio/clip_threshold"] = pg_clip
+            metrics["offpolicy/ratio/clip_frac"] = clip_frac
+            metrics["offpolicy/ratio/clip_threshold"] = pg_clip
 
         # Effective sample size (ESS) - important for importance sampling
         # ESS = (sum(w))^2 / sum(w^2) where w = ratio
         ess = (ratio.sum() ** 2) / (ratio ** 2).sum()
         ess_ratio = ess / ratio.numel()  # Normalized by batch size
-        metrics[f"{metric_prefix}/ess"] = ess.detach().item()
-        metrics[f"{metric_prefix}/ess_ratio"] = ess_ratio.detach().item()
+        metrics["offpolicy/ess"] = ess.detach().item()
+        metrics["offpolicy/ess_ratio"] = ess_ratio.detach().item()
 
         # KL divergence approximation: E[log(p/q)] = E[log(ratio)]
         kl_approx = log_ratio.mean().detach().item()
-        metrics[f"{metric_prefix}/kl_divergence"] = kl_approx
+        metrics["offpolicy/kl_divergence"] = kl_approx
 
         # Count of extreme ratios (potential instability indicators)
         extreme_low = (ratio < 0.5).float().mean().detach().item()
         extreme_high = (ratio > 2.0).float().mean().detach().item()
-        metrics[f"{metric_prefix}/ratio/extreme_low_frac"] = extreme_low
-        metrics[f"{metric_prefix}/ratio/extreme_high_frac"] = extreme_high
+        metrics["offpolicy/ratio/extreme_low_frac"] = extreme_low
+        metrics["offpolicy/ratio/extreme_high_frac"] = extreme_high
 
         # Token count for context
-        metrics[f"{metric_prefix}/valid_tokens"] = valid_current.numel()
-        metrics[f"{metric_prefix}/total_tokens"] = response_mask.numel()
-        metrics[f"{metric_prefix}/mask_rate"] = valid_current.numel() / max(response_mask.numel(), 1)
+        metrics["offpolicy/valid_tokens"] = valid_current.numel()
+        metrics["offpolicy/total_tokens"] = response_mask.numel()
+        metrics["offpolicy/mask_rate"] = valid_current.numel() / max(response_mask.numel(), 1)
 
         logger.debug(
             f"Off-policy metrics computed successfully: "
-            f"ratio_mean={metrics[f'{metric_prefix}/ratio/mean']:.3f}, "
+            f"ratio_mean={metrics['offpolicy/ratio/mean']:.3f}, "
             f"kl={kl_approx:.3f}, "
             f"ess_ratio={ess_ratio:.3f}"
         )
@@ -164,8 +164,8 @@ def compute_offpolicy_metrics(
         logger.debug(f"Error details: {str(e)}", exc_info=True)
 
         # Return partial metrics with error indicator
-        metrics[f"{metric_prefix}/error"] = 1.0
-        metrics[f"{metric_prefix}/error_message"] = str(e)[:100]  # Truncate error message
+        metrics["offpolicy/error"] = 1.0
+        metrics["offpolicy/error_message"] = str(e)[:100]  # Truncate error message
 
     return metrics
 

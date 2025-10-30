@@ -153,25 +153,39 @@ class AgenticPipeline(BasePipeline):
             # Calculate batch size
             batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
 
-            # Use factory function to create appropriate replay buffer type
-            # Supports: distributed (Ray-based), tensordict (efficient), or original (numpy-based)
-            distributed = getattr(rb_cfg, "distributed", False)
-            use_tensordict = getattr(rb_cfg, "use_tensordict", False)
+            # Create NumPy-based replay buffer with priority support (memory-efficient, proven stable)
+            # Default to 'lifo' for Echo mode compatibility (train_steps_per_env_step=1)
+            # Support both old flat config and new nested priority config
+            if hasattr(rb_cfg, 'priority') and rb_cfg.priority is not None:
+                # New nested config structure
+                priority_function = getattr(rb_cfg.priority, 'function', 'lifo')
+                priority_exponent = getattr(rb_cfg.priority, 'alpha', 0.6)
+                priority_kwargs = getattr(rb_cfg.priority, 'kwargs', {})
+            else:
+                # Old flat config structure (backward compatibility)
+                priority_function = getattr(rb_cfg, 'priority_function', 'lifo')
+                priority_exponent = getattr(rb_cfg, 'priority_exponent', 0.6)
+                priority_kwargs = getattr(rb_cfg, 'priority_kwargs', {})
 
-            logger.info(f"Creating replay buffer: distributed={distributed}, use_tensordict={use_tensordict}, manager_type={manager_type}")
+            logger.info(
+                f"Creating replay buffer: manager_type={manager_type}, capacity={rb_cfg.capacity}, "
+                f"priority_fn={priority_function}, priority_exponent={priority_exponent}"
+            )
 
             # Create replay buffer using factory function
             self.replay_buffer = create_replay_buffer(
                 manager_type=manager_type,
                 capacity=rb_cfg.capacity,
                 batch_size=batch_size,
-                distributed=distributed,
-                use_tensordict=use_tensordict,
-                # Additional parameters for distributed buffer (only used when distributed=True)
-                num_shards=getattr(rb_cfg, "num_shards", 4),
-                enable_priority=getattr(rb_cfg, "enable_priority", True),
-                enable_checkpoint=getattr(rb_cfg, "enable_checkpoint", True),
-                enable_rebalancing=getattr(rb_cfg, "enable_rebalancing", False),
+                seed=self.pipeline_config.seed,
+                priority_function=priority_function,
+                priority_exponent=priority_exponent,
+                priority_kwargs=priority_kwargs,
+                enable_nstep=getattr(rb_cfg, 'enable_nstep', False),
+                n_step=getattr(rb_cfg, 'n_step', 5),
+                gamma=getattr(rb_cfg, 'nstep_gamma', 0.99),
+                age_decay=getattr(rb_cfg, 'age_decay', 1000.0),
+                use_advantage_priority=getattr(rb_cfg, 'use_advantage_priority', False),
             )
 
             logger.info(f"Successfully initialized replay buffer: {type(self.replay_buffer).__name__}")
@@ -263,21 +277,41 @@ class AgenticPipeline(BasePipeline):
                 metrics["time/ref_log_probs_values_reward"] = cal_timer.last
 
                 with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
-                    # TODO: use engine log_probs as old_log_probs
+                    # CRITICAL FIX: Check if batch comes from replay buffer
+                    # If so, preserve the stored behavior_log_probs instead of recomputing
+                    from_replay_buffer = batch.meta_info.get("from_replay_buffer", False)
+
                     batch.meta_info["is_offload_states"] = False
                     batch.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
-                    old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
+
+                    # Only recompute old_log_probs for fresh batches (not from replay buffer)
+                    if not from_replay_buffer or "old_log_probs" not in batch.batch:
+                        # Fresh batch or replay batch without stored old_log_probs
+                        # Standard PPO: compute old_log_probs with current policy
+                        old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
+                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                        batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
+                        logger.debug("Computed old_log_probs for fresh batch with current policy")
+                    else:
+                        # Replay buffer batch with stored behavior_log_probs
+                        # PRESERVE the stored old_log_probs (don't recompute!)
+                        logger.debug(f"Preserving stored behavior_log_probs from replay buffer (from_replay_buffer={from_replay_buffer})")
+                        # Create a dummy old_log_probs DataProto for entropy computation
+                        # We still need to compute entropy for monitoring, but we won't use the log_probs
+                        old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
+                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                        # Don't overwrite old_log_probs! Just use it for entropy
+
+                    # Compute values for GAE (independent of log_probs)
                     if self.pipeline_config.adv_estimator == "gae":
                         values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
-                    old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
-                    if self.pipeline_config.adv_estimator == "gae":
                         values = DataProto.materialize_concat(data_refs=values_refs)
                         # CRITICAL FIX: Preserve non_tensor_batch during values union operation
                         preserved_non_tensor_batch = batch.non_tensor_batch
                         batch = batch.union(values)
                         batch.non_tensor_batch = preserved_non_tensor_batch
                         metrics.update(reduce_metrics(values.meta_info.pop("metrics", {})))
-                    batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
+
                     avg_old_log_prob = masked_mean(batch.batch["old_log_probs"], batch.batch["response_mask"][:, 1:])
                     metrics.update({"critic/old_log_prob/mean": avg_old_log_prob.item()})
 
@@ -335,8 +369,24 @@ class AgenticPipeline(BasePipeline):
                             batch.batch["ref_log_probs"] = batch.batch["ref_log_probs"][:, :t]
                     except Exception:
                         pass
+
+                    # Check if we should use n-step returns (outer-layer reward)
+                    use_nstep = (
+                        self.pipeline_config.replay.enabled and
+                        hasattr(self.pipeline_config.replay, 'enable_nstep') and
+                        self.pipeline_config.replay.enable_nstep and
+                        hasattr(self.pipeline_config.replay, 'use_nstep_in_advantage') and
+                        self.pipeline_config.replay.use_nstep_in_advantage and
+                        "nstep_returns" in batch.batch
+                    )
+
                     # Expand compute_response_level_rewards and add kl_penalty.
-                    batch, kl_metrics = apply_kl_penalty(data=batch, kl_ctrl=self.kl_ctrl, kl_penalty=self.pipeline_config.kl_penalty)
+                    batch, kl_metrics = apply_kl_penalty(
+                        data=batch,
+                        kl_ctrl=self.kl_ctrl,
+                        kl_penalty=self.pipeline_config.kl_penalty,
+                        use_nstep_returns=use_nstep
+                    )
                     # KL debug
                     try:
                         metrics.update({
@@ -400,7 +450,6 @@ class AgenticPipeline(BasePipeline):
                             current_batch=batch,
                             actor_train_cluster=self.actor_train,
                             old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
-                            metric_prefix="fresh/offpolicy",
                             pg_clip=self.pipeline_config.pg_clip
                         )
                         metrics.update(fresh_offpolicy_metrics)
@@ -431,10 +480,14 @@ class AgenticPipeline(BasePipeline):
 
                         all_actor_refs: List[ray.ObjectRef] = []
                         all_critic_refs: List[ray.ObjectRef] = []
+                        all_sampled_indices: List[List[int]] = []  # Track indices for PER priority update
+                        all_batches: List[DataProto] = []  # Track batches for priority computation
 
                         replay_train_count = 0  # Track successful training steps from replay
                         for step_idx in range(rb_cfg.train_steps_per_env_step):
-                            mb = self.replay_buffer.sample_for_training(
+                            # Sample from replay buffer with PER support
+                            # Returns (DataProto, sampled_indices) for priority update
+                            sample_result = self.replay_buffer.sample_for_training(
                                 batch_size=training_batch_size,
                                 device='cpu',
                                 tokenizer=self.tokenizer,
@@ -444,7 +497,22 @@ class AgenticPipeline(BasePipeline):
                                 sample_method=getattr(rb_cfg, 'sample_method', 'uniform'),
                                 candidates_per_group=getattr(rb_cfg, 'candidates_per_group', 1),
                                 group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
+                                compute_importance_weights=getattr(rb_cfg.priority, 'use_importance_weights', False) if hasattr(rb_cfg, 'priority') else False,
+                                importance_weight_beta=getattr(rb_cfg.priority, 'importance_beta', 0.4) if hasattr(rb_cfg, 'priority') else 0.4,
                             )
+
+                            # Unpack result: (DataProto, indices) or None
+                            if sample_result is None or (isinstance(sample_result, tuple) and sample_result[0] is None):
+                                logger.warning(f"Replay buffer failed to sample batch at step {step_idx} (global_step={global_step})")
+                                break
+
+                            # Handle both old return format (DataProto) and new format (DataProto, indices)
+                            if isinstance(sample_result, tuple):
+                                mb, sampled_indices = sample_result
+                            else:
+                                mb = sample_result
+                                sampled_indices = []
+
                             if mb is None:
                                 logger.warning(f"Replay buffer failed to sample batch at step {step_idx} (global_step={global_step})")
                                 break
@@ -455,6 +523,11 @@ class AgenticPipeline(BasePipeline):
                                 logger.warning(f"Invalid replay batch at step {step_idx}: {validation}")
 
                             replay_train_count += 1
+
+                            # Store sampled indices for PER priority update
+                            if sampled_indices:
+                                all_sampled_indices.append(sampled_indices)
+                                all_batches.append(mb)
 
                             # Compute ref/old log_probs and advantages for replay mb
                             mb.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
@@ -479,7 +552,6 @@ class AgenticPipeline(BasePipeline):
                                     current_batch=mb,
                                     actor_train_cluster=self.actor_train,
                                     old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
-                                    metric_prefix="replay/offpolicy",
                                     pg_clip=self.pipeline_config.pg_clip
                                 )
                                 metrics.update(replay_offpolicy_metrics)
@@ -503,7 +575,22 @@ class AgenticPipeline(BasePipeline):
                                     mb.batch["ref_log_probs"] = mb.batch["ref_log_probs"][:, :t]
                             except Exception:
                                 pass
-                            mb, _ = apply_kl_penalty(data=mb, kl_ctrl=self.kl_ctrl, kl_penalty=self.pipeline_config.kl_penalty)
+
+                            # Check if we should use n-step returns for replay batch
+                            use_nstep_replay = (
+                                hasattr(self.pipeline_config.replay, 'enable_nstep') and
+                                self.pipeline_config.replay.enable_nstep and
+                                hasattr(self.pipeline_config.replay, 'use_nstep_in_advantage') and
+                                self.pipeline_config.replay.use_nstep_in_advantage and
+                                "nstep_returns" in mb.batch
+                            )
+
+                            mb, _ = apply_kl_penalty(
+                                data=mb,
+                                kl_ctrl=self.kl_ctrl,
+                                kl_penalty=self.pipeline_config.kl_penalty,
+                                use_nstep_returns=use_nstep_replay
+                            )
                             mb = compute_advantage(
                                 data=mb,
                                 gamma=self.pipeline_config.gamma,
@@ -529,6 +616,29 @@ class AgenticPipeline(BasePipeline):
                         if all_actor_refs:
                             actor_metrics = DataProto.materialize_concat(data_refs=all_actor_refs)
                             metrics.update(reduce_metrics(actor_metrics.meta_info.pop("metrics", {})))
+
+                            # PER: Update priorities based on training loss or advantages
+                            update_enabled = (getattr(rb_cfg.priority, 'update_after_train', False)
+                                            if hasattr(rb_cfg, 'priority') else False)
+
+                            # Auto-enable if use_advantage_priority is set
+                            if getattr(rb_cfg, 'use_advantage_priority', False):
+                                update_enabled = True
+
+                            if all_sampled_indices and update_enabled:
+                                # If use_advantage_priority=True, override metric to 'advantage'
+                                if getattr(rb_cfg, 'use_advantage_priority', False):
+                                    priority_metric = 'advantage'
+                                else:
+                                    priority_metric = (getattr(rb_cfg.priority, 'update_metric', 'loss')
+                                                     if hasattr(rb_cfg, 'priority') else 'loss')
+
+                                self._update_replay_priorities(
+                                    actor_metrics=actor_metrics,
+                                    sampled_indices_list=all_sampled_indices,
+                                    batches=all_batches,
+                                    priority_metric=priority_metric
+                                )
 
                         if all_critic_refs and self.pipeline_config.adv_estimator == "gae":
                             critic_metrics = DataProto.materialize_concat(data_refs=all_critic_refs)
@@ -746,7 +856,7 @@ class AgenticPipeline(BasePipeline):
             # Ensure device is not None - fall back to 'cpu' if needed
             target_device = fresh_batch.batch.device if fresh_batch.batch.device is not None else 'cpu'
             with Timer(name="replay_buffer_sample", logger=None) as timer:
-                replay_batch = self.replay_buffer.sample_for_training(
+                sample_result = self.replay_buffer.sample_for_training(
                     batch_size=fresh_batch_size,
                     device=target_device,
                     tokenizer=self.tokenizer,
@@ -754,11 +864,29 @@ class AgenticPipeline(BasePipeline):
                     sampling_mode=self.pipeline_config.replay.sampling_mode,
                     steps_per_episode=self.pipeline_config.replay.steps_per_episode,
                     sample_method=getattr(self.pipeline_config.replay, 'sample_method', 'lifo'),
+                    compute_importance_weights=getattr(self.pipeline_config.replay.priority, 'use_importance_weights', False) if hasattr(self.pipeline_config.replay, 'priority') else False,
+                    importance_weight_beta=getattr(self.pipeline_config.replay.priority, 'importance_beta', 0.4) if hasattr(self.pipeline_config.replay, 'priority') else 0.4,
                 )
+
+            # Handle return value (backward compatible)
+            if sample_result is None or (isinstance(sample_result, tuple) and sample_result[0] is None):
+                logger.debug("Replay buffer returned None, using fresh batch for training")
+                return fresh_batch
+
+            # Unpack result
+            if isinstance(sample_result, tuple):
+                replay_batch, sampled_indices = sample_result
+            else:
+                replay_batch = sample_result
+                sampled_indices = []
 
             if replay_batch is None:
                 logger.debug("Replay buffer returned None, using fresh batch for training")
                 return fresh_batch
+
+            # Store sampled_indices in meta_info for potential priority update later
+            if sampled_indices:
+                replay_batch.meta_info["sampled_indices"] = sampled_indices
 
             # 3) Validate replay batch consistency
             self._validate_batch_consistency(replay_batch, "replay_batch")
@@ -926,6 +1054,113 @@ class AgenticPipeline(BasePipeline):
         except Exception as e:
             logger.error(f"Failed to store fresh data to replay buffer: {e}")
             logger.debug(f"Error details: {str(e)}", exc_info=True)
+
+    def _update_replay_priorities(
+        self,
+        actor_metrics: DataProto,
+        sampled_indices_list: List[List[int]],
+        batches: List[DataProto],
+        priority_metric: str = 'loss'
+    ):
+        """
+        Update replay buffer priorities based on training metrics.
+
+        This implements the priority update step in Prioritized Experience Replay (PER).
+        After training, we update the priorities of sampled trajectories/steps based on
+        a priority metric (loss, advantage, KL divergence, etc.).
+
+        Args:
+            actor_metrics: Metrics from actor training (contains per-sample losses)
+            sampled_indices_list: List of sampled indices for each training batch
+            batches: List of sampled batches (for extracting advantages if needed)
+            priority_metric: Metric to use for priority ('loss', 'advantage', 'kl', 'reward')
+        """
+        try:
+            # Extract priority values based on chosen metric
+            if priority_metric == 'loss':
+                # Use per-sample loss as priority
+                # actor_metrics.meta_info["metrics"] should contain "train/loss"
+                metrics_dict = actor_metrics.meta_info.get("metrics", {})
+
+                # Try to get per-sample loss
+                if "train/loss" in metrics_dict:
+                    loss_value = metrics_dict["train/loss"]
+
+                    # If loss is a scalar (averaged), we can't update per-sample priorities
+                    if isinstance(loss_value, (int, float)):
+                        logger.warning("Loss is a scalar, cannot update per-sample priorities. Skipping priority update.")
+                        return
+
+                    # If loss is a tensor with per-sample values
+                    import torch
+                    if isinstance(loss_value, torch.Tensor):
+                        priorities = loss_value.detach().cpu().numpy()
+                    else:
+                        logger.warning(f"Loss has unexpected type {type(loss_value)}, skipping priority update")
+                        return
+                else:
+                    logger.warning("train/loss not found in metrics, skipping priority update")
+                    return
+
+            elif priority_metric == 'advantage':
+                # Use absolute advantage as priority
+                # Concatenate advantages from all batches
+                import torch
+                advantages = torch.cat([batch.batch["advantages"] for batch in batches], dim=0)
+                priorities = torch.abs(advantages).mean(dim=1).detach().cpu().numpy()
+
+            elif priority_metric == 'kl':
+                # Use KL divergence as priority (measures policy change)
+                import torch
+                kl_values = []
+                for batch in batches:
+                    if "old_log_probs" in batch.batch and "log_probs" in batch.batch:
+                        kl = (batch.batch["old_log_probs"] - batch.batch["log_probs"]).mean(dim=1)
+                        kl_values.append(kl)
+
+                if kl_values:
+                    priorities = torch.cat(kl_values, dim=0).detach().cpu().numpy()
+                else:
+                    logger.warning("KL divergence cannot be computed, skipping priority update")
+                    return
+
+            elif priority_metric == 'reward':
+                # Use absolute reward as priority
+                import torch
+                rewards = torch.cat([batch.batch["scores"].sum(dim=1) for batch in batches], dim=0)
+                priorities = torch.abs(rewards).detach().cpu().numpy()
+            else:
+                logger.warning(f"Unknown priority_metric '{priority_metric}', skipping priority update")
+                return
+
+            # Flatten sampled_indices_list
+            import numpy as np
+            all_indices = np.concatenate(sampled_indices_list)
+
+            # Ensure priorities match indices length
+            if len(priorities) != len(all_indices):
+                logger.warning(
+                    f"Priority length mismatch: {len(priorities)} priorities vs {len(all_indices)} indices. "
+                    f"Skipping priority update."
+                )
+                return
+
+            # Update priorities in replay buffer with age-aware weighting
+            # Pass current_global_step for age decay calculation
+            self.replay_buffer.update_priorities(
+                indices=all_indices.tolist(),
+                priorities=priorities,
+                current_global_step=self.global_step
+            )
+
+            logger.debug(
+                f"Updated {len(all_indices)} priorities using metric '{priority_metric}'. "
+                f"Mean priority: {priorities.mean():.4f}, Max: {priorities.max():.4f}"
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to update replay priorities: {e}")
+            logger.debug(f"Priority update error details: {str(e)}", exc_info=True)
 
     def apply_sequence_padding(self, batch: DataProto) -> DataProto:
         """

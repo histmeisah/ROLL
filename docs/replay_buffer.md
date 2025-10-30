@@ -601,13 +601,158 @@ for step_idx in range(rb_cfg.train_steps_per_env_step):
 2. 增大batch_size
 3. 使用更快的采样策略（如LIFO）
 
-## 9. 总结
+## 9. Priority-Based Sampling System（优先级采样系统）
+
+### 9.1 设计理念
+
+遵循经典RL库（OpenAI Baselines、RLlib）的设计模式，我们实现了统一的priority-based sampling系统。
+
+**核心理念**：
+- **统一配置参数**：`priority_function` 决定所有采样行为
+- **确定性 vs 概率性**：支持确定性采样（lifo/fifo/uniform）和概率性采样（weighted strategies）
+- **可插拔设计**：易于扩展新的priority函数
+
+### 9.2 Priority函数分类
+
+#### 9.2.1 确定性采样策略（Deterministic Sampling）
+
+不使用权重概率，直接选择样本：
+
+| 函数 | 描述 | 使用场景 |
+|:-----|:-----|:---------|
+| `uniform` | 随机均匀采样 | 标准DQN风格，每个样本等概率 |
+| `lifo` | 最新数据优先（Last-In-First-Out） | Echo模式推荐，接近on-policy训练 |
+| `fifo` | 最旧数据优先（First-In-First-Out） | 确保所有数据被使用 |
+
+#### 9.2.2 加权采样策略（Weighted Sampling）
+
+基于计算的priority进行概率采样：
+
+| 函数 | Priority计算 | 使用场景 |
+|:-----|:------------|:---------|
+| `reward` | `|reward| + ε` | 关注高影响经验 |
+| `td_error` | `|TD-error| + ε` | 标准PER（Schaul et al., 2016） |
+| `recency` | `exp(-α * age)` | 新鲜度衰减，类似LIFO但概率化 |
+| `combined` | `w1*reward + w2*recency` | 组合策略 |
+| `advantage` | `|advantage| + ε` | 基于优势函数（需额外计算） |
+| `length` | `length + ε` or `1/length` | 基于轨迹长度 |
+
+### 9.3 配置参数详解
+
+```yaml
+replay:
+  # 核心参数（必选）
+  priority_function: lifo  # 选择priority函数（默认：lifo）
+
+  # Priority Alpha（仅加权采样时使用）
+  priority_alpha: 0.6  # 控制priority分布的尖锐程度
+                       # 0.0 = uniform（忽略priority）
+                       # 0.6 = 中等强度（PER常用值）
+                       # 1.0 = 完全按priority采样
+
+  # 函数特定参数
+  priority_kwargs:
+    # recency函数专用
+    decay_rate: 0.001  # 指数衰减率（越大衰减越快）
+
+    # combined函数专用
+    reward_weight: 0.7     # reward部分权重
+    recency_weight: 0.3    # recency部分权重
+    decay_rate: 0.001      # recency衰减率
+```
+
+### 9.4 使用示例
+
+#### 示例1：Echo模式（默认，推荐）
+```yaml
+replay:
+  enabled: true
+  train_steps_per_env_step: 1  # Echo模式
+  priority_function: lifo  # 自动使用最新数据
+```
+
+#### 示例2：标准Uniform采样
+```yaml
+replay:
+  priority_function: uniform
+  train_steps_per_env_step: 3
+```
+
+#### 示例3：Reward-based PER
+```yaml
+replay:
+  priority_function: reward
+  priority_alpha: 0.6  # 中等优先级强度
+  train_steps_per_env_step: 3
+```
+
+#### 示例4：Recency-based采样
+```yaml
+replay:
+  priority_function: recency
+  priority_alpha: 0.6
+  priority_kwargs:
+    decay_rate: 0.001  # 每1000步priority降至原来的37%
+```
+
+#### 示例5：组合策略
+```yaml
+replay:
+  priority_function: combined
+  priority_alpha: 0.6
+  priority_kwargs:
+    reward_weight: 0.7      # 70%权重给reward
+    recency_weight: 0.3     # 30%权重给recency
+    decay_rate: 0.001
+```
+
+### 9.5 技术细节
+
+#### 9.5.1 Priority存储与计算
+
+```python
+# 存储时计算priority（trajectory_buffer.py）
+priority = self.priority_fn(trajectory, global_step, **self.priority_kwargs)
+trajectory.priority = float(priority)
+self.priorities[current_idx] = trajectory.priority
+```
+
+#### 9.5.2 采样逻辑
+
+```python
+# 确定性采样（lifo/fifo/uniform）
+if priority_fn_name == "lifo_priority":
+    sampled = buffer_list[-sample_size:]  # 直接取最新的
+
+# 加权采样（reward/td_error等）
+else:
+    probs = np.power(priorities, self.priority_exponent)  # 应用alpha
+    probs = probs / probs.sum()  # 归一化
+    indices = random.choices(range(len(buffer)), weights=probs, k=sample_size)
+```
+
+### 9.6 与经典RL库的对应关系
+
+| ROLL | OpenAI Baselines | RLlib |
+|:-----|:----------------|:------|
+| `priority_function` | Buffer类型选择 | `replay_buffer_config["type"]` |
+| `priority_alpha` | `alpha` (初始化参数) | `prioritized_replay_alpha` |
+| 确定性采样 | `ReplayBuffer` | `ReplayBuffer` |
+| 加权采样 | `PrioritizedReplayBuffer` | `PrioritizedReplayBuffer` |
+
+**参考文献**：
+- Schaul et al. (2016): Prioritized Experience Replay
+- OpenAI Baselines: https://github.com/openai/baselines
+- RLlib Docs: https://docs.ray.io/en/latest/rllib/rllib-replay-buffers.html
+
+## 10. 总结
 
 Replay Buffer的实现不仅仅是添加了一个数据存储组件，而是对整个训练流程的系统性优化：
 
 1. **架构优化**：通过padding策略的统一，提升了系统的可维护性
 2. **性能提升**：通过Echo模式和多次训练机制，提高了样本效率
-3. **灵活配置**：丰富的参数选项满足不同场景需求
-4. **监控完善**：详细的指标帮助调试和优化
+3. **Priority系统**：遵循经典RL库设计，提供灵活的采样策略
+4. **灵活配置**：丰富的参数选项满足不同场景需求
+5. **监控完善**：详细的指标帮助调试和优化
 
 这些改进使得ROLL框架能够更高效地训练大语言模型智能体，为未来的扩展奠定了坚实基础。

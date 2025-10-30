@@ -6,12 +6,13 @@ based on environment manager type and configuration.
 """
 
 import logging
-from typing import Union, Dict, Any
+from typing import Union, Dict, Any, Optional
+from functools import partial
 
 from .base_buffer import BaseReplayBuffer
 from .trajectory_buffer import TrajectoryReplayBuffer
 from .step_buffer import StepReplayBuffer
-from .tensordict_buffer import TensorDictTrajectoryBuffer, TensorDictStepBuffer
+from .priority_functions import PRIORITY_FUNCTIONS, get_priority_function
 
 logger = logging.getLogger(__name__)
 
@@ -21,100 +22,127 @@ def create_replay_buffer(
     capacity: int = 100000,
     batch_size: int = 128,
     seed: int = 42,
-    use_tensordict: bool = True,  # Default to new efficient implementation
-    distributed: bool = False,  # Whether to use distributed Ray-based implementation
+    priority_function: str = "uniform",
+    priority_exponent: float = 1.0,
+    priority_kwargs: Optional[Dict[str, Any]] = None,
+    enable_nstep: bool = False,
+    n_step: int = 5,
+    gamma: float = 0.99,
+    age_decay: float = 1000.0,
+    use_advantage_priority: bool = False,
     **kwargs
 ) -> BaseReplayBuffer:
     """
-    Factory function to create the appropriate replay buffer type.
+    Factory function to create the appropriate replay buffer type with priority support.
 
     Args:
         manager_type: Type of environment manager ("trajectory" or "step")
         capacity: Buffer capacity (trajectories for trajectory buffer, steps for step buffer)
         batch_size: Default sampling batch size
         seed: Random seed for reproducibility
-        use_tensordict: Whether to use TensorDict-based implementation (recommended)
-        distributed: Whether to use distributed Ray-based implementation
-        **kwargs: Additional arguments specific to buffer types
-            - num_shards: Number of shards for distributed buffer (default: 4)
-            - enable_priority: Enable priority sampling (distributed only)
-            - enable_checkpoint: Enable checkpointing (distributed only)
+        priority_function: Name of priority function ("uniform", "reward", "recency", "combined", etc.)
+        priority_exponent: Priority exponent for weighted sampling (alpha in PER)
+        priority_kwargs: Additional kwargs for priority function (e.g., alpha for recency)
+        **kwargs: Additional arguments (ignored, for compatibility)
 
     Returns:
-        Appropriate replay buffer instance
+        Appropriate replay buffer instance (NumPy-based with priority support)
 
     Raises:
         ValueError: If manager_type is not supported
+
+    Examples:
+        # Default uniform priority
+        buffer = create_replay_buffer("trajectory", capacity=10000)
+
+        # Reward-based priority
+        buffer = create_replay_buffer(
+            "trajectory",
+            capacity=10000,
+            priority_function="reward",
+            priority_exponent=0.6
+        )
+
+        # Recency-based priority with custom decay
+        buffer = create_replay_buffer(
+            "trajectory",
+            capacity=10000,
+            priority_function="recency",
+            priority_kwargs={"alpha": 0.001}
+        )
+
+        # Combined priority
+        buffer = create_replay_buffer(
+            "trajectory",
+            capacity=10000,
+            priority_function="combined",
+            priority_kwargs={"reward_weight": 0.7, "recency_weight": 0.3}
+        )
     """
     manager_type = manager_type.lower()
 
-    if distributed:
-        # Use distributed Ray-based implementation for multi-machine training
-        from .distributed_buffer import DistributedReplayBuffer
+    # Get priority function
+    try:
+        priority_fn = get_priority_function(priority_function)
+    except ValueError as e:
+        logger.warning(f"{e}. Falling back to uniform priority.")
+        priority_fn = get_priority_function("uniform")
 
-        num_shards = kwargs.pop("num_shards", 4)
-        logger.info(f"Creating DistributedReplayBuffer with {num_shards} shards, capacity={capacity}")
+    # Create partial function if kwargs provided
+    if priority_kwargs:
+        priority_fn = partial(priority_fn, **priority_kwargs)
 
-        return DistributedReplayBuffer(
+    # Use NumPy-based implementation (memory-efficient, proven stable)
+    if manager_type == "trajectory":
+        logger.info(
+            f"Creating TrajectoryReplayBuffer: capacity={capacity}, "
+            f"priority_fn={priority_function}, priority_exponent={priority_exponent}, "
+            f"age_decay={age_decay}, use_advantage_priority={use_advantage_priority}"
+        )
+        return TrajectoryReplayBuffer(
             capacity=capacity,
             batch_size=batch_size,
-            num_shards=num_shards,
-            **kwargs
+            seed=seed,
+            priority_fn=priority_fn,
+            priority_exponent=priority_exponent,
+            priority_kwargs=priority_kwargs or {},
+            age_decay=age_decay,
+            use_advantage_priority=use_advantage_priority
         )
-
-    elif use_tensordict:
-        # Use new efficient TensorDict-based implementation
-        if manager_type == "trajectory":
-            logger.info(f"Creating TensorDictTrajectoryBuffer with capacity={capacity}")
-            return TensorDictTrajectoryBuffer(
-                capacity=capacity,
-                batch_size=batch_size,
-                seed=seed,
-                **kwargs
-            )
-        elif manager_type == "step":
-            logger.info(f"Creating TensorDictStepBuffer with capacity={capacity}")
-            return TensorDictStepBuffer(
-                capacity=capacity,
-                batch_size=batch_size,
-                seed=seed,
-                **kwargs
-            )
-        else:
-            raise ValueError(
-                f"Unsupported manager_type: {manager_type}. "
-                f"Supported types: 'trajectory', 'step'"
-            )
+    elif manager_type == "step":
+        logger.info(
+            f"Creating StepReplayBuffer: capacity={capacity}, "
+            f"priority_fn={priority_function}, priority_exponent={priority_exponent}, "
+            f"enable_nstep={enable_nstep}, n_step={n_step}, gamma={gamma}, "
+            f"age_decay={age_decay}, use_advantage_priority={use_advantage_priority}"
+        )
+        return StepReplayBuffer(
+            capacity=capacity,
+            batch_size=batch_size,
+            seed=seed,
+            priority_fn=priority_fn,
+            priority_exponent=priority_exponent,
+            priority_kwargs=priority_kwargs or {},
+            enable_nstep=enable_nstep,
+            n_step=n_step,
+            gamma=gamma,
+            age_decay=age_decay,
+            use_advantage_priority=use_advantage_priority
+        )
     else:
-        # Use original implementation (for compatibility)
-        if manager_type == "trajectory":
-            logger.info(f"Creating TrajectoryReplayBuffer with capacity={capacity}")
-            return TrajectoryReplayBuffer(
-                capacity=capacity,
-                batch_size=batch_size,
-                seed=seed
-            )
-        elif manager_type == "step":
-            logger.info(f"Creating StepReplayBuffer with capacity={capacity}")
-            return StepReplayBuffer(
-                capacity=capacity,
-                batch_size=batch_size,
-                seed=seed
-            )
-        else:
-            raise ValueError(
-                f"Unsupported manager_type: {manager_type}. "
-                f"Supported types: 'trajectory', 'step'"
-            )
+        raise ValueError(
+            f"Unsupported manager_type: {manager_type}. "
+            f"Supported types: 'trajectory', 'step'"
+        )
 
 
 def detect_manager_type_from_config(pipeline_config) -> str:
     """
     Detect environment manager type from pipeline configuration.
-    
+
     Args:
         pipeline_config: Pipeline configuration object
-        
+
     Returns:
         Manager type ("trajectory" or "step")
     """
@@ -156,11 +184,11 @@ def detect_manager_type_from_config(pipeline_config) -> str:
 def get_recommended_capacity(manager_type: str, target_memory_gb: float = 4.0) -> int:
     """
     Get recommended buffer capacity based on manager type and memory constraints.
-    
+
     Args:
         manager_type: Type of environment manager ("trajectory" or "step")
         target_memory_gb: Target memory usage in GB
-        
+
     Returns:
         Recommended capacity
     """
@@ -171,7 +199,7 @@ def get_recommended_capacity(manager_type: str, target_memory_gb: float = 4.0) -
         capacity = int((target_memory_gb * 1024) / avg_trajectory_size_mb)
         return min(capacity, 100000)  # Cap at 100K trajectories
     else:  # step
-        # Steps are smaller (individual turns), typically 0.5-2KB each  
+        # Steps are smaller (individual turns), typically 0.5-2KB each
         avg_step_size_mb = 0.001  # 1KB average
         capacity = int((target_memory_gb * 1024) / avg_step_size_mb)
         return min(capacity, 1000000)  # Cap at 1M steps

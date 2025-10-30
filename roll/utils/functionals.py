@@ -432,8 +432,27 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
-def expand_to_token_level(data: "DataProto"):
-    response_level_rewards = data.batch["response_level_rewards"].clone().detach()
+def expand_to_token_level(data: "DataProto", use_nstep_returns: bool = False):
+    """
+    Expand response-level rewards to token-level by placing reward at EOS position.
+
+    Args:
+        data: DataProto containing rewards
+        use_nstep_returns: If True and "nstep_returns" exists, use n-step returns
+                          instead of single-step response_level_rewards. This allows
+                          using multi-step outer-layer rewards while keeping inner-layer
+                          token-level computation unchanged.
+
+    Returns:
+        token_level_rewards: [batch_size, seq_len-1] tensor with rewards at EOS positions
+    """
+    # Select reward source (outer-layer decision)
+    if use_nstep_returns and "nstep_returns" in data.batch:
+        response_level_rewards = data.batch["nstep_returns"].clone().detach()
+        logger.debug(f"Using n-step returns as outer-layer reward: mean={response_level_rewards.mean():.4f}")
+    else:
+        response_level_rewards = data.batch["response_level_rewards"].clone().detach()
+
     batch_size = data.batch.batch_size[0]
     # expand as token_level_rewards
     attention_mask = data.batch["attention_mask"]
@@ -642,10 +661,26 @@ def get_sample_level_mask(data: "DataProto", pipeline_config: RLVRConfig):
 
 
 @torch.no_grad()
-def apply_kl_penalty(data: "DataProto", kl_ctrl: AdaptiveKLController, kl_penalty="kl"):
+def apply_kl_penalty(data: "DataProto", kl_ctrl: AdaptiveKLController, kl_penalty="kl", use_nstep_returns: bool = False):
+    """
+    Apply KL penalty to rewards and generate token-level rewards.
+
+    Args:
+        data: DataProto with batch data
+        kl_ctrl: Adaptive KL controller
+        kl_penalty: Type of KL penalty ("kl", "abs", "mse", etc.)
+        use_nstep_returns: If True, use n-step returns from outer layer as reward source.
+                          This only affects which reward is used (single-step vs n-step),
+                          but inner-layer token-level computation remains unchanged.
+
+    Returns:
+        data: Updated DataProto with "token_level_rewards"
+        metrics: Dictionary of metrics
+    """
     response_mask = data.batch["response_mask"][:, 1:]
 
-    token_level_rewards = expand_to_token_level(data)
+    # Generate token-level rewards (may use n-step returns from outer layer)
+    token_level_rewards = expand_to_token_level(data, use_nstep_returns=use_nstep_returns)
     if "token_level_rewards" in data.batch.keys():
         data.rename(old_keys="token_level_rewards", new_keys="token_level_scores")
 
@@ -672,6 +707,17 @@ def apply_kl_penalty(data: "DataProto", kl_ctrl: AdaptiveKLController, kl_penalt
     data.batch["token_level_rewards"] = token_level_rewards
 
     metrics = {"critic/kl": current_kl, "critic/kl_coef": beta}
+
+    # Add n-step metrics if used
+    if use_nstep_returns and "nstep_returns" in data.batch:
+        metrics.update({
+            "nstep/enabled": 1.0,
+            "nstep/returns_mean": data.batch["nstep_returns"].mean().item(),
+            "nstep/returns_std": data.batch["nstep_returns"].std().item(),
+        })
+        if "nstep_completeness" in data.batch:
+            completeness = data.batch["nstep_completeness"]
+            metrics["nstep/completeness_ratio"] = completeness.float().mean().item()
 
     return data, metrics
 

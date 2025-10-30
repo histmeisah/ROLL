@@ -18,6 +18,7 @@ from tensordict import TensorDict
 from roll.distributed.scheduler.protocol import DataProto
 from roll.utils.functionals import pad_to_length
 from .base_buffer import BaseReplayBuffer
+from .segment_tree import SumSegmentTree, MinSegmentTree, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,11 @@ class TrajectoryEntry:
     stored_at_step: int
     episode_length: int
 
+    # Priority-related metadata
+    priority: float = 1.0       # Current priority value (intrinsic value)
+    sample_count: int = 0       # Number of times sampled (for statistics)
+    global_step: int = 0        # Global training step when stored (for age calculation)
+
 
 class TrajectoryReplayBuffer(BaseReplayBuffer):
     """
@@ -66,15 +72,40 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
     """
     
     def __init__(
-        self, 
+        self,
         capacity: int = 100000,  # Number of complete trajectories
         batch_size: int = 128,   # Should match rollout batch size
-        seed: int = 42
+        seed: int = 42,
+        priority_fn: callable = None,  # Priority calculation function
+        priority_exponent: float = 1.0,  # Priority exponent (alpha in PER)
+        priority_kwargs: dict = None,  # Additional kwargs for priority function
+        age_decay: float = 1000.0,  # Age decay constant for freshness weighting
+        use_advantage_priority: bool = False  # Whether to update priority with advantages after training
     ):
         super().__init__(capacity, batch_size, seed)
         self.trajectories = deque(maxlen=capacity)
         self.rng = random.Random(seed)
-        logger.info(f"Initialized TrajectoryReplayBuffer with capacity={capacity}")
+
+        # Priority-related attributes
+        from .priority_functions import uniform_priority
+        self.priority_fn = priority_fn or uniform_priority
+        self.priority_exponent = priority_exponent
+        self.priority_kwargs = priority_kwargs or {}
+
+        # Segment Tree for efficient O(log n) prioritized sampling (PER)
+        # Capacity must be power of 2 for segment tree
+        self._tree_capacity = next_power_of_2(capacity)
+        self._it_sum = SumSegmentTree(self._tree_capacity)
+        self._it_min = MinSegmentTree(self._tree_capacity)
+        self._max_priority = 1.0  # Track maximum priority for new samples
+
+        # Age-based priority configuration
+        self.age_decay = age_decay
+        self.use_advantage_priority = use_advantage_priority
+        self.current_global_step = 0  # Track current global step for age calculation
+
+        logger.info(f"Initialized TrajectoryReplayBuffer with capacity={capacity}, tree_capacity={self._tree_capacity}, "
+                   f"priority_fn={self.priority_fn.__name__}, age_decay={age_decay}, use_advantage_priority={use_advantage_priority}")
     
     @property
     def buffer_type(self) -> str:
@@ -83,11 +114,14 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
     def push_from_dataproto(self, batch: DataProto, global_step: int) -> None:
         """
         Store trajectory data from TrajEnvManager.
-        
+
         Args:
             batch: DataProto from TrajEnvManager containing complete episodes
             global_step: Current training step
         """
+        # Update current global step for age calculation
+        self.current_global_step = global_step
+
         batch_size = batch.batch["input_ids"].shape[0]
         
         for i in range(batch_size):
@@ -142,9 +176,30 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
                 traj_group_id=traj_group_id,
                 traj_id=traj_id,
                 stored_at_step=global_step,
-                episode_length=episode_length
+                episode_length=episode_length,
+                global_step=global_step  # Store global step for age calculation
             )
-            
+
+            # Calculate priority for this trajectory
+            try:
+                priority = self.priority_fn(trajectory, global_step, **self.priority_kwargs)
+                trajectory.priority = float(priority)
+            except Exception as e:
+                logger.warning(f"Failed to calculate priority, using default 1.0: {e}")
+                trajectory.priority = 1.0
+
+            # IMPORTANT: Use total_stored for consistent indexing across buffer wrap-around
+            # deque automatically handles capacity, but segment tree needs explicit index
+            current_idx = self.total_stored % self.capacity
+
+            # Update segment trees with priority^alpha (PER convention)
+            # New samples get max priority to ensure they're sampled at least once
+            priority_alpha = max(trajectory.priority, self._max_priority) ** self.priority_exponent
+            self._it_sum[current_idx] = priority_alpha
+            self._it_min[current_idx] = priority_alpha
+            self._max_priority = max(self._max_priority, trajectory.priority)
+
+            # Append to deque (auto-evicts oldest when full)
             self.trajectories.append(trajectory)
             self.total_stored += 1
 
@@ -161,14 +216,23 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         required_size = batch_size or self.batch_size
         return len(self.trajectories) >= required_size
     
-    def sample_for_training(self, batch_size: Optional[int] = None, device: str = 'cpu',
-                            tokenizer: Optional[PreTrainedTokenizer] = None, sequence_length: int = 4096,
-                            sampling_mode: str = "trajectory", steps_per_episode: int = 1,
-                            sample_method: str = "uniform", candidates_per_group: int = 1,
-                            group_sampling: str = "uniform") -> Optional[DataProto]:
+    def sample_for_training(
+        self,
+        batch_size: Optional[int] = None,
+        device: str = 'cpu',
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        sequence_length: int = 4096,
+        sampling_mode: str = "trajectory",
+        steps_per_episode: int = 1,
+        sample_method: str = "uniform",
+        candidates_per_group: int = 1,
+        group_sampling: str = "uniform",
+        compute_importance_weights: bool = False,
+        importance_weight_beta: float = 0.4
+    ) -> Optional[Tuple[DataProto, List[int]]]:
         """
         Sample trajectories and reconstruct DataProto format.
-        
+
         Args:
             batch_size: Number of trajectories to sample
             device: Target device for tensors ('cpu' or 'cuda')
@@ -179,18 +243,62 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             sample_method: Sampling method ("uniform", "weighted", etc.)
             candidates_per_group: Number of candidates per group
             group_sampling: Group sampling strategy ("uniform", etc.)
-            
+            compute_importance_weights: Whether to compute importance weights for PER
+            importance_weight_beta: Beta parameter for importance weight (0.4 -> 1.0 annealing)
+
         Returns:
-            DataProto batch matching TrajEnvManager output format
+            Tuple of (DataProto batch, sampled_indices)
+            - DataProto contains training batch with optional importance_weights
+            - sampled_indices: list of buffer indices for priority update after training
         """
         sample_size = batch_size or self.batch_size
-        
+
         if not self.can_sample(sample_size):
             logger.debug(f"Insufficient trajectories for sampling: {len(self.trajectories)} < {sample_size}")
-            return None
-        
-        # Sample trajectories
-        sampled_trajectories = self.rng.sample(list(self.trajectories), sample_size)
+            return None, []
+
+        # Sample trajectories based on priority function
+        # Deterministic strategies: uniform, lifo, fifo
+        # Weighted strategies: reward, td_error, recency, combined, etc.
+        buffer_list = list(self.trajectories)
+        buffer_size = len(buffer_list)
+        priority_fn_name = self.priority_fn.__name__
+
+        # Track sampled indices for priority updates and importance weights
+        sampled_indices = []
+
+        if priority_fn_name == "lifo_priority":
+            # LIFO (Last-In-First-Out): Deterministic sampling of newest N trajectories
+            # Recommended for Echo mode (train_steps_per_env_step=1) for near-on-policy training
+            start_idx = max(0, buffer_size - sample_size)
+            sampled_indices = list(range(start_idx, buffer_size))
+            sampled_trajectories = buffer_list[start_idx:]
+            logger.debug(f"LIFO sampling: selected last {len(sampled_trajectories)} trajectories (indices {start_idx} to {buffer_size})")
+
+        elif priority_fn_name == "fifo_priority":
+            # FIFO (First-In-First-Out): Deterministic sampling of oldest N trajectories
+            # Ensures all data is used before eviction
+            sampled_indices = list(range(sample_size))
+            sampled_trajectories = buffer_list[:sample_size]
+            logger.debug(f"FIFO sampling: selected first {len(sampled_trajectories)} trajectories")
+
+        elif priority_fn_name == "uniform_priority":
+            # Uniform random sampling: Standard replay buffer behavior
+            sampled_indices = self.rng.sample(range(buffer_size), sample_size)
+            sampled_trajectories = [buffer_list[i] for i in sampled_indices]
+            logger.debug(f"Uniform sampling: randomly selected {len(sampled_trajectories)} trajectories")
+
+        else:
+            # Weighted priority-based sampling using Segment Tree (O(log n) per sample)
+            # This is the core of Prioritized Experience Replay (PER)
+            sampled_indices = self._sample_proportional(sample_size, buffer_size)
+            sampled_trajectories = [buffer_list[i] for i in sampled_indices]
+
+            # Update sample counts for statistics
+            for idx in sampled_indices:
+                buffer_list[idx].sample_count += 1
+
+            logger.debug(f"PER sampling ({priority_fn_name}): sampled {len(sampled_trajectories)} trajectories with priority_alpha={self.priority_exponent}")
         
         # Use pipeline's sequence_length for consistent padding (like RolloutScheduler)
         # This ensures compatibility with original ROLL behavior and prevents length mismatch
@@ -291,8 +399,250 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             "from_replay_buffer": True,
             "buffer_type": "trajectory",
             "sample_size": sample_size,
-            "buffer_utilization": len(self.trajectories) / self.capacity
+            "buffer_utilization": len(self.trajectories) / self.capacity,
+            "sampled_indices": sampled_indices  # For priority update after training
         }
-        
-        logger.debug(f"Sampled {sample_size} trajectories for training")
-        return dataproto
+
+        # Compute importance weights for PER (off-policy correction)
+        if compute_importance_weights and priority_fn_name not in ["lifo_priority", "fifo_priority", "uniform_priority"]:
+            importance_weights = self.compute_importance_weights(sampled_indices, beta=importance_weight_beta)
+            dataproto.batch["importance_weights"] = torch.from_numpy(importance_weights).to(target_device)
+            logger.debug(f"Computed importance weights with beta={importance_weight_beta:.2f}, mean={importance_weights.mean():.4f}")
+
+        logger.debug(f"Sampled {sample_size} trajectories for training (indices: {len(sampled_indices)})")
+        return dataproto, sampled_indices
+
+    def _sample_proportional(self, batch_size: int, buffer_size: int) -> List[int]:
+        """
+        Sample indices based on priorities using Segment Tree.
+
+        This implements stratified sampling from Prioritized Experience Replay:
+        - Divide total priority into batch_size equal ranges
+        - Sample uniformly within each range
+        - Use SumSegmentTree.find_prefixsum_idx for O(log n) lookup
+
+        Time complexity: O(batch_size * log n)
+
+        Args:
+            batch_size: Number of samples to draw
+            buffer_size: Current buffer size
+
+        Returns:
+            List of sampled indices
+        """
+        indices = []
+        p_total = self._it_sum.sum(0, buffer_size)
+
+        if p_total <= 0:
+            # Fallback to uniform if no valid priorities
+            logger.warning("Total priority is 0, falling back to uniform sampling")
+            return self.rng.sample(range(buffer_size), batch_size)
+
+        # Stratified sampling: divide into batch_size segments
+        every_range_len = p_total / batch_size
+
+        for i in range(batch_size):
+            # Sample uniformly within this segment
+            mass = self.rng.random() * every_range_len + i * every_range_len
+            # Find the index corresponding to this priority mass
+            idx = self._it_sum.find_prefixsum_idx(mass)
+            # Ensure index is within buffer bounds
+            idx = min(idx, buffer_size - 1)
+            indices.append(idx)
+
+        return indices
+
+    def update_priorities(self, indices: List[int], priorities: np.ndarray, current_global_step: Optional[int] = None) -> None:
+        """
+        Update priorities for sampled trajectories after training, with age-aware weighting.
+
+        This implements a two-factor priority system:
+        1. Intrinsic value (advantage-based): How surprising/valuable the sample is
+        2. Freshness weight (age-based): How recent the sample is
+
+        Final effective priority = intrinsic_value * freshness_weight
+        where freshness_weight = exp(-age / age_decay)
+
+        Time complexity: O(k * log n) where k = len(indices)
+
+        Args:
+            indices: Buffer indices of sampled trajectories
+            priorities: New intrinsic priority values (e.g., |advantage|, |TD-error|, |loss|)
+            current_global_step: Current training step for age calculation (optional, uses self.current_global_step if None)
+
+        Example:
+            >>> # After training and computing advantages
+            >>> advantages = batch["advantages"]  # [batch_size, seq_len]
+            >>> response_mask = batch["response_mask"]  # [batch_size, seq_len]
+            >>> priorities = TrajectoryReplayBuffer.compute_advantage_priorities(batch)
+            >>> buffer.update_priorities(sampled_indices, priorities, current_global_step)
+        """
+        assert len(indices) == len(priorities), \
+            f"Indices and priorities length mismatch: {len(indices)} vs {len(priorities)}"
+
+        buffer_list = list(self.trajectories)
+        global_step = current_global_step if current_global_step is not None else self.current_global_step
+
+        for idx, intrinsic_priority in zip(indices, priorities):
+            if not (0 <= idx < len(buffer_list)):
+                logger.warning(f"Invalid index {idx} for buffer size {len(buffer_list)}, skipping")
+                continue
+
+            # Ensure intrinsic priority is positive (add small epsilon)
+            intrinsic_priority = max(float(intrinsic_priority), 1e-6)
+
+            # Compute age-based freshness weight
+            sample_age = global_step - buffer_list[idx].global_step
+            freshness_weight = np.exp(-sample_age / self.age_decay)
+
+            # Compute effective priority: intrinsic value × freshness
+            effective_priority = intrinsic_priority * freshness_weight
+
+            # Update segment trees with effective_priority^alpha
+            priority_alpha = effective_priority ** self.priority_exponent
+            self._it_sum[idx] = priority_alpha
+            self._it_min[idx] = priority_alpha
+
+            # Update trajectory entry intrinsic priority (store raw value for debugging)
+            buffer_list[idx].priority = intrinsic_priority
+
+            # Track maximum priority
+            self._max_priority = max(self._max_priority, effective_priority)
+
+        logger.debug(f"Updated priorities for {len(indices)} trajectories with age decay. "
+                    f"Max effective priority: {self._max_priority:.4f}")
+
+    def get_effective_priority(self, idx: int, current_global_step: Optional[int] = None) -> float:
+        """
+        Compute effective priority for a given buffer index.
+
+        effective_priority = intrinsic_priority * exp(-age / age_decay)
+
+        Args:
+            idx: Buffer index
+            current_global_step: Current training step (optional)
+
+        Returns:
+            Effective priority value
+        """
+        buffer_list = list(self.trajectories)
+        if not (0 <= idx < len(buffer_list)):
+            return 0.0
+
+        global_step = current_global_step if current_global_step is not None else self.current_global_step
+        sample_age = global_step - buffer_list[idx].global_step
+        freshness_weight = np.exp(-sample_age / self.age_decay)
+
+        return buffer_list[idx].priority * freshness_weight
+
+    @staticmethod
+    def compute_advantage_priorities(batch: DataProto) -> np.ndarray:
+        """
+        Compute advantage-based priorities from a DataProto batch.
+
+        This extracts advantages from the batch and computes mean absolute advantage
+        per trajectory, masked by response tokens.
+
+        Args:
+            batch: DataProto containing "advantages" and "response_mask"
+
+        Returns:
+            priorities: [batch_size] array of advantage-based priorities
+
+        Example:
+            >>> # After compute_advantage() in pipeline
+            >>> priorities = TrajectoryReplayBuffer.compute_advantage_priorities(batch)
+            >>> replay_buffer.update_priorities(sampled_indices, priorities, global_step)
+        """
+        if "advantages" not in batch.batch or "response_mask" not in batch.batch:
+            raise ValueError("Batch must contain 'advantages' and 'response_mask' for advantage-based priorities")
+
+        advantages = batch.batch["advantages"]  # [batch_size, seq_len]
+        response_mask = batch.batch["response_mask"]  # [batch_size, seq_len]
+
+        # Compute masked mean absolute advantage per sample
+        abs_advantages = torch.abs(advantages)
+        masked_advantages = abs_advantages * response_mask.float()
+
+        # Sum over tokens and divide by number of response tokens
+        sum_advantages = masked_advantages.sum(dim=1)  # [batch_size]
+        num_tokens = response_mask.sum(dim=1).float().clamp(min=1.0)  # [batch_size], avoid division by zero
+
+        priorities = (sum_advantages / num_tokens).cpu().numpy()
+
+        return priorities
+
+    def compute_importance_weights(
+        self,
+        indices: List[int],
+        beta: float = 0.4
+    ) -> np.ndarray:
+        """
+        Compute importance sampling weights for off-policy correction.
+
+        Importance weights correct for the bias introduced by prioritized sampling.
+        Formula: w_i = (N * P(i))^(-beta) / max_w
+
+        Beta annealing schedule (common in PER):
+        - Start: beta = 0.4 (partial correction)
+        - End: beta = 1.0 (full correction)
+        - Anneal linearly over training
+
+        Args:
+            indices: Buffer indices of sampled trajectories
+            beta: Importance weight exponent (0 = no correction, 1 = full correction)
+
+        Returns:
+            Importance weights normalized by max weight, shape [batch_size]
+
+        Example:
+            >>> indices, weights = buffer.sample_with_weights(batch_size=128, beta=0.6)
+            >>> loss = compute_loss(batch) * torch.from_numpy(weights)
+        """
+        buffer_size = len(self.trajectories)
+
+        # Get minimum priority for normalization
+        p_min = self._it_min.min(0, buffer_size)
+        p_total = self._it_sum.sum(0, buffer_size)
+
+        if p_total <= 0:
+            # Fallback: uniform weights
+            return np.ones(len(indices), dtype=np.float32)
+
+        # Compute max weight for normalization
+        # max_weight occurs at minimum priority
+        max_weight = (p_min / p_total * buffer_size) ** (-beta)
+
+        weights = []
+        for idx in indices:
+            # Get priority for this sample
+            p_sample = self._it_sum[idx]
+            # Compute probability
+            prob = p_sample / p_total
+            # Compute importance weight
+            weight = (prob * buffer_size) ** (-beta)
+            # Normalize by max weight
+            weights.append(weight / max_weight)
+
+        return np.array(weights, dtype=np.float32)
+
+    def get_stats(self) -> dict:
+        """Get buffer statistics including priority information."""
+        base_stats = super().get_stats()
+
+        # Add priority statistics from segment tree
+        current_size = len(self.trajectories)
+        if current_size > 0:
+            # Extract priorities from segment tree
+            priorities = np.array([self._it_sum[i] for i in range(current_size)])
+            base_stats.update({
+                "priority/mean": float(priorities.mean()),
+                "priority/std": float(priorities.std()),
+                "priority/max": float(priorities.max()),
+                "priority/min": float(priorities.min()),
+                "priority_fn": self.priority_fn.__name__,
+                "priority_exponent": self.priority_exponent,
+                "max_priority": self._max_priority,
+            })
+
+        return base_stats
