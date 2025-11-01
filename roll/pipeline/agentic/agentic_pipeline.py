@@ -591,6 +591,16 @@ class AgenticPipeline(BasePipeline):
                                 kl_penalty=self.pipeline_config.kl_penalty,
                                 use_nstep_returns=use_nstep_replay
                             )
+
+                            # CRITICAL FIX: Compute values for GAE mode on replay batch
+                            if self.pipeline_config.adv_estimator == "gae":
+                                values_refs: List[ray.ObjectRef] = self.critic.compute_values(mb, blocking=False)
+                                values = DataProto.materialize_concat(data_refs=values_refs)
+                                preserved_non_tensor_batch = mb.non_tensor_batch
+                                mb = mb.union(values)
+                                mb.non_tensor_batch = preserved_non_tensor_batch
+                                metrics.update(reduce_metrics(values.meta_info.pop("metrics", {})))
+
                             mb = compute_advantage(
                                 data=mb,
                                 gamma=self.pipeline_config.gamma,

@@ -67,6 +67,10 @@ def traverse_obj(value, visitor, path=()):
 def union_two_dict(dict1: Dict, dict2: Dict):
     """Union two dict. Will throw an error if there is an item not the same object with the same key.
 
+    Special handling for 'metrics' key: merge the dictionaries instead of asserting equality.
+    This is needed because different worker computations (e.g., compute_log_probs and compute_values)
+    may both produce metrics dictionaries that need to be combined.
+
     Args:
         dict1:
         dict2:
@@ -76,6 +80,10 @@ def union_two_dict(dict1: Dict, dict2: Dict):
     """
     for key, val in dict2.items():
         if key in dict1:
+            # Special handling for metrics: merge instead of asserting equality
+            if key == "metrics" and isinstance(dict1[key], dict) and isinstance(val, dict):
+                dict1[key].update(val)
+                continue
             assert dict2[key] == dict1[key], f"{key} in meta_dict1 and meta_dict2 are not the same object"
         dict1[key] = val
 
