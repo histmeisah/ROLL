@@ -9,6 +9,7 @@ import torch
 from codetiming import Timer
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.util.timer import _Timer
+from tensordict import TensorDict
 
 from roll.agentic.rollout.rollout_scheduler import RolloutScheduler
 from roll.distributed.executor.cluster import Cluster
@@ -485,10 +486,21 @@ class AgenticPipeline(BasePipeline):
 
                         replay_train_count = 0  # Track successful training steps from replay
                         for step_idx in range(rb_cfg.train_steps_per_env_step):
-                            # Sample from replay buffer with PER support
+                            # Sample from replay buffer with PER support (with oversampling if filter enabled)
                             # Returns (DataProto, sampled_indices) for priority update
+                            enable_filter = (hasattr(rb_cfg, 'enable_offpolicy_filter') and
+                                           rb_cfg.enable_offpolicy_filter and
+                                           hasattr(rb_cfg, 'ratio_clip_max') and
+                                           rb_cfg.ratio_clip_max is not None)
+
+                            if enable_filter:
+                                oversample_ratio = getattr(rb_cfg, 'filter_oversample_ratio', 1.5)
+                                actual_batch_size = int(training_batch_size * oversample_ratio)
+                            else:
+                                actual_batch_size = training_batch_size
+
                             sample_result = self.replay_buffer.sample_for_training(
-                                batch_size=training_batch_size,
+                                batch_size=actual_batch_size,
                                 device='cpu',
                                 tokenizer=self.tokenizer,
                                 sequence_length=self.pipeline_config.sequence_length,
@@ -521,6 +533,70 @@ class AgenticPipeline(BasePipeline):
                             validation = validate_replay_batch_fields(mb)
                             if not validation.get("is_valid", False):
                                 logger.warning(f"Invalid replay batch at step {step_idx}: {validation}")
+
+                            # === NEW: Off-policy filtering in pipeline (memory-efficient: forward twice) ===
+                            # Strategy: Forward twice to save memory (用时间换空间)
+                            # 1st forward (here): detached, oversample(192) → filter → select(128), then release
+                            # 2nd forward (training): with gradients, only on filtered 128 samples
+                            if enable_filter:
+                                # Compute current policy log_probs (detached, for filtering only)
+                                mb_cuda = mb.to("cuda")
+                                mb_cuda.meta_info["old_prob_mode"] = "trajectory"
+
+                                with Timer(name="filter_compute_log_probs", logger=None) as filter_timer:
+                                    current_lp_refs = self.actor_train.compute_log_probs(mb_cuda, blocking=False)
+                                    current_lp_data = DataProto.materialize_concat(data_refs=current_lp_refs)
+
+                                if "log_probs" in current_lp_data.batch:
+                                    current_log_probs = current_lp_data.batch["log_probs"].to("cuda")
+
+                                    # Filter samples based on ratio
+                                    from roll.pipeline.agentic.offpolicy_monitor import filter_offpolicy_samples
+                                    valid_mask, filter_stats = filter_offpolicy_samples(
+                                        current_log_probs=current_log_probs,
+                                        behavior_log_probs=mb_cuda.batch["old_log_probs"],
+                                        response_mask=mb_cuda.batch["response_mask"],
+                                        ratio_clip_max=rb_cfg.ratio_clip_max,
+                                        return_stats=True
+                                    )
+
+                                    # Select top training_batch_size valid samples
+                                    valid_indices = torch.where(valid_mask)[0]
+                                    num_valid = len(valid_indices)
+
+                                    if num_valid < training_batch_size:
+                                        logger.warning(
+                                            f"Filter returned {num_valid} valid samples, need {training_batch_size}. "
+                                            f"Using all valid samples."
+                                        )
+                                        final_indices = valid_indices
+                                    else:
+                                        final_indices = valid_indices[:training_batch_size]
+
+                                    # Slice batch to filtered samples
+                                    mb_cuda = self._slice_dataproto(mb_cuda, final_indices)
+                                    mb = mb_cuda.to("cpu")
+
+                                    # Update sampled_indices to match filtered samples
+                                    if sampled_indices:
+                                        sampled_indices = [sampled_indices[i.item()] for i in final_indices]
+
+                                    # Log filter statistics
+                                    metrics.update(filter_stats)
+                                    metrics["time/filter_compute_log_probs"] = filter_timer.last
+
+                                    logger.debug(
+                                        f"Filtered replay batch: {filter_stats.get('filter/filtered_samples', 0)}/{actual_batch_size} "
+                                        f"filtered, {len(final_indices)} samples used for training"
+                                    )
+
+                                    # Clean up GPU memory (important!)
+                                    del current_log_probs, current_lp_data, mb_cuda
+                                    torch.cuda.empty_cache()
+                                else:
+                                    # log_probs computation failed, proceed without filtering
+                                    logger.warning("Failed to compute log_probs for filtering, using unfiltered batch")
+                                    mb = mb_cuda.to("cpu")
 
                             replay_train_count += 1
 
@@ -1243,7 +1319,7 @@ class AgenticPipeline(BasePipeline):
     def _validate_batch_consistency(self, batch: DataProto, batch_source: str = "unknown"):
         """
         Validate batch data consistency for debugging.
-        
+
         Args:
             batch: DataProto to validate
             batch_source: Source description for logging
@@ -1254,9 +1330,46 @@ class AgenticPipeline(BasePipeline):
                 penalty_mean = batch.batch["penalty"].mean().item()
                 if abs(penalty_mean) > 5.0:  # Based on -0.7 normal value
                     logger.warning(f"Unusual penalty values in {batch_source}: mean={penalty_mean:.3f}")
-                    
+
         except Exception as e:
             logger.debug(f"Batch validation failed for {batch_source}: {e}")
+
+    def _slice_dataproto(self, data: DataProto, indices: torch.Tensor) -> DataProto:
+        """
+        Slice a DataProto by selecting specific samples using indices.
+
+        Args:
+            data: DataProto to slice
+            indices: Tensor of indices to select (1D tensor)
+
+        Returns:
+            Sliced DataProto containing only selected samples
+        """
+        # Slice tensor batch
+        sliced_batch = {}
+        for key, value in data.batch.items():
+            if isinstance(value, torch.Tensor):
+                sliced_batch[key] = value[indices]
+            else:
+                sliced_batch[key] = value
+
+        # Slice non_tensor_batch
+        sliced_non_tensor_batch = {}
+        if data.non_tensor_batch:
+            for key, value in data.non_tensor_batch.items():
+                if isinstance(value, list):
+                    sliced_non_tensor_batch[key] = [value[i.item()] for i in indices]
+                else:
+                    sliced_non_tensor_batch[key] = value
+
+        # Create new DataProto with sliced data
+        sliced_data = DataProto(
+            batch=TensorDict(sliced_batch, batch_size=len(indices)),
+            meta_info=data.meta_info.copy(),
+            non_tensor_batch=sliced_non_tensor_batch
+        )
+
+        return sliced_data
 
 def get_episode_scores(batch: DataProto) -> torch.Tensor:
     batch_group_by_traj: Dict[str, DataProto] = batch.group_by(keys="traj_id")
