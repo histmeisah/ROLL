@@ -15,9 +15,10 @@ logger = get_logger()
 
 def compute_offpolicy_metrics(
     current_batch: DataProto,
-    actor_train_cluster: Any,
+    actor_train_cluster: Any = None,
     old_prob_mode: str = "trajectory",
     pg_clip: Optional[float] = None,
+    training_metrics: Optional[DataProto] = None,
 ) -> Dict[str, float]:
     """
     Compute off-policy metrics by comparing current policy with behavior policy.
@@ -27,11 +28,15 @@ def compute_offpolicy_metrics(
 
     所有指标统一使用 'offpolicy/' 前缀，便于对比不同模式下的结果。
 
+    OPTIMIZATION: If training_metrics is provided, it will reuse the log_probs computed
+    during training, avoiding redundant forward pass. This is the recommended usage.
+
     Args:
         current_batch: DataProto batch containing data from replay buffer
-        actor_train_cluster: Actor cluster for computing current policy log probs
+        actor_train_cluster: Actor cluster for computing current policy log probs (optional if training_metrics provided)
         old_prob_mode: Mode for old probability calculation ("trajectory" or "turn")
         pg_clip: Clipping threshold for PPO-style ratio clipping analysis
+        training_metrics: Optional DataProto from train_step containing pre-computed log_probs
 
     Returns:
         Dictionary of off-policy metrics (all with 'offpolicy/' prefix)
@@ -61,20 +66,38 @@ def compute_offpolicy_metrics(
             logger.warning("compute_offpolicy_metrics: No response_mask in batch")
             return metrics
 
-        # Set old_prob_mode in meta_info for compute_log_probs
-        current_batch.meta_info["old_prob_mode"] = old_prob_mode
+        # ✨ OPTIMIZATION: Try to reuse log_probs from training_metrics
+        current_log_probs = None
+        if training_metrics is not None and training_metrics.batch is not None:
+            if "log_probs" in training_metrics.batch:
+                current_log_probs = training_metrics.batch["log_probs"]
+                logger.debug("compute_offpolicy_metrics: Reusing log_probs from training_metrics (no extra forward)")
+            elif "policy_chosen_logps" in training_metrics.batch:
+                # Alternative field name (some implementations use this)
+                current_log_probs = training_metrics.batch["policy_chosen_logps"]
+                logger.debug("compute_offpolicy_metrics: Reusing policy_chosen_logps from training_metrics")
 
-        # Compute current policy log probs
-        import ray
-        current_lp_refs = actor_train_cluster.compute_log_probs(current_batch, blocking=False)
-        current_lp_data = DataProto.materialize_concat(data_refs=current_lp_refs)
+        # Fallback: compute current policy log probs if not provided
+        if current_log_probs is None:
+            if actor_train_cluster is None:
+                logger.warning("compute_offpolicy_metrics: No training_metrics and no actor_train_cluster provided")
+                return metrics
 
-        if "log_probs" not in current_lp_data.batch:
-            logger.warning("compute_offpolicy_metrics: Failed to compute current log_probs")
-            return metrics
+            logger.debug("compute_offpolicy_metrics: Computing current log_probs via forward pass (fallback)")
+            # Set old_prob_mode in meta_info for compute_log_probs
+            current_batch.meta_info["old_prob_mode"] = old_prob_mode
 
-        # Extract log probs and masks
-        current_log_probs = current_lp_data.batch["log_probs"]
+            import ray
+            current_lp_refs = actor_train_cluster.compute_log_probs(current_batch, blocking=False)
+            current_lp_data = DataProto.materialize_concat(data_refs=current_lp_refs)
+
+            if "log_probs" not in current_lp_data.batch:
+                logger.warning("compute_offpolicy_metrics: Failed to compute current log_probs")
+                return metrics
+
+            current_log_probs = current_lp_data.batch["log_probs"]
+
+        # Extract behavior log probs
         behavior_log_probs = current_batch.batch[behavior_field]
 
         # Handle next-token prediction alignment (response_mask is shifted by 1)
@@ -152,11 +175,15 @@ def compute_offpolicy_metrics(
         metrics["offpolicy/total_tokens"] = response_mask.numel()
         metrics["offpolicy/mask_rate"] = valid_current.numel() / max(response_mask.numel(), 1)
 
+        # Add flag indicating whether log_probs were reused
+        metrics["offpolicy/reused_log_probs"] = 1.0 if training_metrics is not None else 0.0
+
         logger.debug(
             f"Off-policy metrics computed successfully: "
             f"ratio_mean={metrics['offpolicy/ratio/mean']:.3f}, "
             f"kl={kl_approx:.3f}, "
-            f"ess_ratio={ess_ratio:.3f}"
+            f"ess_ratio={ess_ratio:.3f}, "
+            f"reused_log_probs={metrics['offpolicy/reused_log_probs']}"
         )
 
     except Exception as e:

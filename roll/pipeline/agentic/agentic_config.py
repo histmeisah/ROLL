@@ -47,16 +47,11 @@ class OffPolicyMonitorConfig:
         default=True,
         metadata={"help": "Whether to compute and save behavior policy log probs after rollout."}
     )
-    behavior_compute: Literal["trainer", "engine"] = field(
-        default="trainer",
-        metadata={
-            "help": "Where to compute behavior log probs: 'trainer' (Actor-Train recompute, accurate) or 'engine' (inference engine returns, faster but may be less accurate)."
-        }
-    )
     behavior_scope: Literal["trajectory", "turn"] = field(
         default="trajectory",
         metadata={
-            "help": "Scope of behavior log prob computation: 'trajectory' (full response) or 'turn' (only last assistant turn)."
+            "help": "Scope of log prob computation: 'trajectory' (full response) or 'turn' (only last assistant turn). "
+                   "Always uses actor_train for accuracy."
         }
     )
 
@@ -217,6 +212,52 @@ class ReplayConfig:
                     "If True, priorities are updated with |advantage| after compute_advantage(). "
                     "Initial priorities (at push) still use the configured priority function (e.g., reward). "
                     "This implements the two-stage priority strategy: reward → advantage."
+        }
+    )
+
+    # Off-policy Filtering Configuration
+    enable_offpolicy_filter: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable off-policy filtering based on importance sampling ratio. "
+                    "Filters out samples where the policy has diverged too far from behavior policy."
+        }
+    )
+    ratio_clip_max: Optional[float] = field(
+        default=3.0,
+        metadata={
+            "help": "Maximum allowed importance sampling ratio for filtering. "
+                    "Samples with ratio > ratio_clip_max are filtered out."
+        }
+    )
+    filter_mini_batch_size: int = field(
+        default=32,
+        metadata={
+            "help": "Mini-batch size for filtering forward passes. "
+                    "Smaller values reduce GPU memory usage but may increase total computation time."
+        }
+    )
+    filter_max_attempts: int = field(
+        default=20,
+        metadata={
+            "help": "Maximum number of mini-batches to sample during filtering. "
+                    "Prevents infinite loops when filter rate is very high."
+        }
+    )
+    filter_oversample_ratio: float = field(
+        default=1.5,
+        metadata={
+            "help": "[DEPRECATED - using mini-batch instead] "
+                    "Oversample ratio for filtering (e.g., 1.5 = sample 192 to get 128)."
+        }
+    )
+    filter_min_acceptable_batch: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Minimum acceptable batch size after filtering before supplementing with unfiltered samples. "
+                    "If collected valid samples < this threshold, supplement with unfiltered samples to reach target_batch_size. "
+                    "If None, defaults to target_batch_size // 2. "
+                    "Set to 0 to always supplement when below target_batch_size."
         }
     )
 

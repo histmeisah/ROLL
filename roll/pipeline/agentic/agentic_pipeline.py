@@ -238,8 +238,8 @@ class AgenticPipeline(BasePipeline):
 
                 batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
 
-                # ✨ REPLAY BUFFER INTEGRATION: Mix replay data with fresh rollout data
-                batch = self.integrate_replay_buffer_data(batch, global_step)
+                # Note: Replay buffer storage moved to AFTER training (Line ~478)
+                # This ensures we store the log_probs computed during training, not pre-training behavior_log_probs
 
                 # ✅ PADDING HANDLED: Training data padding already applied in rollout_scheduler using pipeline's strategy
 
@@ -278,30 +278,37 @@ class AgenticPipeline(BasePipeline):
                 metrics["time/ref_log_probs_values_reward"] = cal_timer.last
 
                 with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
-                    # CRITICAL FIX: Check if batch comes from replay buffer
-                    # If so, preserve the stored behavior_log_probs instead of recomputing
+                    # ✨ OPTIMIZATION: For fresh batches, reuse behavior_log_probs as old_log_probs
+                    # They represent the same policy (before parameter update)
                     from_replay_buffer = batch.meta_info.get("from_replay_buffer", False)
 
                     batch.meta_info["is_offload_states"] = False
                     batch.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
 
-                    # Only recompute old_log_probs for fresh batches (not from replay buffer)
-                    if not from_replay_buffer or "old_log_probs" not in batch.batch:
-                        # Fresh batch or replay batch without stored old_log_probs
+                    # Check if we can reuse behavior_log_probs as old_log_probs
+                    if not from_replay_buffer and "behavior_log_probs" in batch.batch:
+                        # ✨ Fresh batch with behavior_log_probs already computed
+                        # Reuse it as old_log_probs (no extra forward needed!)
+                        batch.batch["old_log_probs"] = batch.batch["behavior_log_probs"]
+                        logger.debug("Reusing behavior_log_probs as old_log_probs for fresh batch (no extra forward)")
+                        # Still need to compute entropy for monitoring
+                        old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
+                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                    elif not from_replay_buffer:
+                        # Fresh batch without behavior_log_probs (fallback)
                         # Standard PPO: compute old_log_probs with current policy
                         old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
                         old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
                         batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
-                        logger.debug("Computed old_log_probs for fresh batch with current policy")
+                        logger.debug("Computed old_log_probs for fresh batch with current policy (fallback)")
                     else:
-                        # Replay buffer batch with stored behavior_log_probs
+                        # Replay buffer batch with stored old_log_probs
                         # PRESERVE the stored old_log_probs (don't recompute!)
-                        logger.debug(f"Preserving stored behavior_log_probs from replay buffer (from_replay_buffer={from_replay_buffer})")
-                        # Create a dummy old_log_probs DataProto for entropy computation
-                        # We still need to compute entropy for monitoring, but we won't use the log_probs
+                        logger.debug(f"Preserving stored old_log_probs from replay buffer (from_replay_buffer={from_replay_buffer})")
+                        # Still need to compute entropy for monitoring
                         old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
                         old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
-                        # Don't overwrite old_log_probs! Just use it for entropy
+                        # Don't overwrite old_log_probs!
 
                     # Compute values for GAE (independent of log_probs)
                     if self.pipeline_config.adv_estimator == "gae":
@@ -445,13 +452,14 @@ class AgenticPipeline(BasePipeline):
                         "old_log_probs" in batch.batch and
                         not self.pipeline_config.replay.enabled):  # Only for fresh batch without replay
 
-                        # At this point, actor has been updated, compute current log_probs
-                        # This will show the actual importance sampling ratio used in PPO
+                        # ✨ OPTIMIZATION: Reuse log_probs from training_metrics (no extra forward!)
+                        # actor_train_metrics already contains the log_probs computed during training
                         fresh_offpolicy_metrics = compute_offpolicy_metrics(
                             current_batch=batch,
-                            actor_train_cluster=self.actor_train,
+                            actor_train_cluster=None,  # ✨ Not needed - reusing training_metrics
                             old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
-                            pg_clip=self.pipeline_config.pg_clip
+                            pg_clip=self.pipeline_config.pg_clip,
+                            training_metrics=actor_train_metrics  # ✨ Reuse log_probs from training!
                         )
                         metrics.update(fresh_offpolicy_metrics)
 
@@ -467,6 +475,17 @@ class AgenticPipeline(BasePipeline):
                 if self.pipeline_config.adv_estimator == "gae":
                     critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
                     metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
+
+                # ✨ CRITICAL FIX: Store fresh batch to replay buffer AFTER training
+                # This ensures we store the log_probs computed during training
+                if self.pipeline_config.replay.enabled and self.pipeline_config.critic_warmup <= global_step:
+                    # Attach training log_probs to batch before storing
+                    if actor_train_metrics.batch is not None and "log_probs" in actor_train_metrics.batch:
+                        batch.batch["behavior_log_probs"] = actor_train_metrics.batch["log_probs"]
+                        logger.debug("Attached training log_probs as behavior_log_probs for replay buffer storage")
+
+                    # Store to replay buffer
+                    self.store_fresh_data_to_replay_buffer(batch, global_step)
 
                 # Optionally perform additional replay buffer training steps
                 if self.pipeline_config.replay.enabled:
@@ -486,117 +505,99 @@ class AgenticPipeline(BasePipeline):
 
                         replay_train_count = 0  # Track successful training steps from replay
                         for step_idx in range(rb_cfg.train_steps_per_env_step):
-                            # Sample from replay buffer with PER support (with oversampling if filter enabled)
-                            # Returns (DataProto, sampled_indices) for priority update
+                            # Check if we should enable filtering
                             enable_filter = (hasattr(rb_cfg, 'enable_offpolicy_filter') and
                                            rb_cfg.enable_offpolicy_filter and
                                            hasattr(rb_cfg, 'ratio_clip_max') and
                                            rb_cfg.ratio_clip_max is not None)
 
                             if enable_filter:
-                                oversample_ratio = getattr(rb_cfg, 'filter_oversample_ratio', 1.5)
-                                actual_batch_size = int(training_batch_size * oversample_ratio)
+                                # === NEW: Mini-batch filtering with early stopping ===
+                                # Memory-efficient: forward small batches (32) instead of large oversample (192)
+                                # Early stop: stop sampling once we have enough valid samples
+                                from roll.pipeline.agentic.filter_utils import filter_replay_batch_with_mini_batches
+
+                                with Timer(name="filter_mini_batch", logger=None) as filter_timer:
+                                    filter_result = filter_replay_batch_with_mini_batches(
+                                        replay_buffer=self.replay_buffer,
+                                        actor_train=self.actor_train,
+                                        tokenizer=self.tokenizer,
+                                        pipeline_config=self.pipeline_config,
+                                        target_batch_size=training_batch_size,
+                                        mini_batch_size=getattr(rb_cfg, 'filter_mini_batch_size', 32),
+                                        ratio_clip_max=rb_cfg.ratio_clip_max,
+                                        max_attempts=getattr(rb_cfg, 'filter_max_attempts', 20),
+                                        global_step=global_step,
+                                        adaptive_mini_batch=getattr(rb_cfg, 'filter_adaptive_mini_batch', False),
+                                    )
+
+                                if filter_result is None:
+                                    logger.error(f"Mini-batch filtering failed at step {step_idx}")
+                                    break
+
+                                # Unpack result
+                                if isinstance(filter_result, tuple):
+                                    filter_data, filter_stats = filter_result
+                                    if isinstance(filter_data, tuple):
+                                        mb, sampled_indices = filter_data
+                                    else:
+                                        mb = filter_data
+                                        sampled_indices = []
+                                else:
+                                    logger.error("Unexpected filter result format")
+                                    break
+
+                                # Log filter statistics
+                                metrics.update(filter_stats)
+                                metrics["time/filter_mini_batch"] = filter_timer.last
+
+                                logger.info(
+                                    f"Mini-batch filter: sampled={filter_stats.get('filter/total_sampled', 0)}, "
+                                    f"valid={filter_stats.get('filter/total_valid', 0)}, "
+                                    f"rate={filter_stats.get('filter/filter_rate', 0):.1%}, "
+                                    f"attempts={filter_stats.get('filter/attempts', 0)}, "
+                                    f"early_stop={filter_stats.get('filter/early_stop', False)}, "
+                                    f"ratio_avg={filter_stats.get('filter/avg_ratio', 0):.3f}, "
+                                    f"ratio_max={filter_stats.get('filter/max_ratio', 0):.3f}, "
+                                    f"ratio_p95={filter_stats.get('filter/ratio_p95', 0):.3f}"
+                                )
+
                             else:
-                                actual_batch_size = training_batch_size
+                                # No filtering: sample normally
+                                sample_result = self.replay_buffer.sample_for_training(
+                                    batch_size=training_batch_size,
+                                    device='cpu',
+                                    tokenizer=self.tokenizer,
+                                    sequence_length=self.pipeline_config.sequence_length,
+                                    sampling_mode=rb_cfg.sampling_mode,
+                                    steps_per_episode=rb_cfg.steps_per_episode,
+                                    sample_method=getattr(rb_cfg, 'sample_method', 'uniform'),
+                                    candidates_per_group=getattr(rb_cfg, 'candidates_per_group', 1),
+                                    group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
+                                    compute_importance_weights=getattr(rb_cfg.priority, 'use_importance_weights', False) if hasattr(rb_cfg, 'priority') else False,
+                                    importance_weight_beta=getattr(rb_cfg.priority, 'importance_beta', 0.4) if hasattr(rb_cfg, 'priority') else 0.4,
+                                )
 
-                            sample_result = self.replay_buffer.sample_for_training(
-                                batch_size=actual_batch_size,
-                                device='cpu',
-                                tokenizer=self.tokenizer,
-                                sequence_length=self.pipeline_config.sequence_length,
-                                sampling_mode=rb_cfg.sampling_mode,
-                                steps_per_episode=rb_cfg.steps_per_episode,
-                                sample_method=getattr(rb_cfg, 'sample_method', 'uniform'),
-                                candidates_per_group=getattr(rb_cfg, 'candidates_per_group', 1),
-                                group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
-                                compute_importance_weights=getattr(rb_cfg.priority, 'use_importance_weights', False) if hasattr(rb_cfg, 'priority') else False,
-                                importance_weight_beta=getattr(rb_cfg.priority, 'importance_beta', 0.4) if hasattr(rb_cfg, 'priority') else 0.4,
-                            )
+                                # Unpack result: (DataProto, indices) or None
+                                if sample_result is None or (isinstance(sample_result, tuple) and sample_result[0] is None):
+                                    logger.warning(f"Replay buffer failed to sample batch at step {step_idx} (global_step={global_step})")
+                                    break
 
-                            # Unpack result: (DataProto, indices) or None
-                            if sample_result is None or (isinstance(sample_result, tuple) and sample_result[0] is None):
-                                logger.warning(f"Replay buffer failed to sample batch at step {step_idx} (global_step={global_step})")
-                                break
+                                # Handle both old return format (DataProto) and new format (DataProto, indices)
+                                if isinstance(sample_result, tuple):
+                                    mb, sampled_indices = sample_result
+                                else:
+                                    mb = sample_result
+                                    sampled_indices = []
 
-                            # Handle both old return format (DataProto) and new format (DataProto, indices)
-                            if isinstance(sample_result, tuple):
-                                mb, sampled_indices = sample_result
-                            else:
-                                mb = sample_result
-                                sampled_indices = []
-
-                            if mb is None:
-                                logger.warning(f"Replay buffer failed to sample batch at step {step_idx} (global_step={global_step})")
-                                break
+                                if mb is None:
+                                    logger.warning(f"Replay buffer failed to sample batch at step {step_idx} (global_step={global_step})")
+                                    break
 
                             # Validate the sampled batch
                             validation = validate_replay_batch_fields(mb)
                             if not validation.get("is_valid", False):
                                 logger.warning(f"Invalid replay batch at step {step_idx}: {validation}")
-
-                            # === NEW: Off-policy filtering in pipeline (memory-efficient: forward twice) ===
-                            # Strategy: Forward twice to save memory (用时间换空间)
-                            # 1st forward (here): detached, oversample(192) → filter → select(128), then release
-                            # 2nd forward (training): with gradients, only on filtered 128 samples
-                            if enable_filter:
-                                # Compute current policy log_probs (detached, for filtering only)
-                                mb_cuda = mb.to("cuda")
-                                mb_cuda.meta_info["old_prob_mode"] = "trajectory"
-
-                                with Timer(name="filter_compute_log_probs", logger=None) as filter_timer:
-                                    current_lp_refs = self.actor_train.compute_log_probs(mb_cuda, blocking=False)
-                                    current_lp_data = DataProto.materialize_concat(data_refs=current_lp_refs)
-
-                                if "log_probs" in current_lp_data.batch:
-                                    current_log_probs = current_lp_data.batch["log_probs"].to("cuda")
-
-                                    # Filter samples based on ratio
-                                    from roll.pipeline.agentic.offpolicy_monitor import filter_offpolicy_samples
-                                    valid_mask, filter_stats = filter_offpolicy_samples(
-                                        current_log_probs=current_log_probs,
-                                        behavior_log_probs=mb_cuda.batch["old_log_probs"],
-                                        response_mask=mb_cuda.batch["response_mask"],
-                                        ratio_clip_max=rb_cfg.ratio_clip_max,
-                                        return_stats=True
-                                    )
-
-                                    # Select top training_batch_size valid samples
-                                    valid_indices = torch.where(valid_mask)[0]
-                                    num_valid = len(valid_indices)
-
-                                    if num_valid < training_batch_size:
-                                        logger.warning(
-                                            f"Filter returned {num_valid} valid samples, need {training_batch_size}. "
-                                            f"Using all valid samples."
-                                        )
-                                        final_indices = valid_indices
-                                    else:
-                                        final_indices = valid_indices[:training_batch_size]
-
-                                    # Slice batch to filtered samples
-                                    mb_cuda = self._slice_dataproto(mb_cuda, final_indices)
-                                    mb = mb_cuda.to("cpu")
-
-                                    # Update sampled_indices to match filtered samples
-                                    if sampled_indices:
-                                        sampled_indices = [sampled_indices[i.item()] for i in final_indices]
-
-                                    # Log filter statistics
-                                    metrics.update(filter_stats)
-                                    metrics["time/filter_compute_log_probs"] = filter_timer.last
-
-                                    logger.debug(
-                                        f"Filtered replay batch: {filter_stats.get('filter/filtered_samples', 0)}/{actual_batch_size} "
-                                        f"filtered, {len(final_indices)} samples used for training"
-                                    )
-
-                                    # Clean up GPU memory (important!)
-                                    del current_log_probs, current_lp_data, mb_cuda
-                                    torch.cuda.empty_cache()
-                                else:
-                                    # log_probs computation failed, proceed without filtering
-                                    logger.warning("Failed to compute log_probs for filtering, using unfiltered batch")
-                                    mb = mb_cuda.to("cpu")
 
                             replay_train_count += 1
 
@@ -619,27 +620,8 @@ class AgenticPipeline(BasePipeline):
                                 behavior_old = DataProto.materialize_concat(data_refs=behavior_old_refs)
                                 mb.batch["old_log_probs"] = behavior_old.batch["log_probs"]
 
-                            # === NEW: Unified off-policy monitoring for replay batch ===
-                            if (self.pipeline_config.offpolicy_monitor.enabled and
-                                self.pipeline_config.offpolicy_monitor.monitor_replay_batch and
-                                global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0):
-
-                                replay_offpolicy_metrics = compute_offpolicy_metrics(
-                                    current_batch=mb,
-                                    actor_train_cluster=self.actor_train,
-                                    old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
-                                    pg_clip=self.pipeline_config.pg_clip
-                                )
-                                metrics.update(replay_offpolicy_metrics)
-
-                                # Log diagnostics for debugging
-                                if global_step % self.pipeline_config.logging_steps == 0 and replay_offpolicy_metrics:
-                                    log_offpolicy_diagnostics(
-                                        metrics=replay_offpolicy_metrics,
-                                        batch=mb,
-                                        global_step=global_step,
-                                        logger_func=logger.debug
-                                    )
+                            # Note: Off-policy monitoring moved to AFTER training (Line 703-732)
+                            # This reuses log_probs from training, avoiding redundant forward pass
 
                             mb = compute_discounted_returns(mb, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
                             mb = compute_response_level_rewards(batch=mb, pipeline_config=self.pipeline_config)
@@ -692,12 +674,48 @@ class AgenticPipeline(BasePipeline):
                             mb = self.adjust_batch(mb, mode=self.pipeline_config.batch_adjust_mode)
                             metrics.update(reduce_metrics(mb.meta_info.pop("metrics", {})))
 
+                            # Training step
                             if self.pipeline_config.adv_estimator == "gae":
                                 critic_refs = self.critic.train_step(mb, blocking=False)
                                 all_critic_refs.extend(critic_refs)
                             if self.pipeline_config.critic_warmup <= global_step:
                                 actor_refs = self.actor_train.train_step(mb, blocking=False)
-                                all_actor_refs.extend(actor_refs)
+
+                                # ✨ OPTIMIZATION: Immediately materialize to get training_metrics for monitor
+                                # This enables reusing log_probs computed during training
+                                monitor_enabled = (self.pipeline_config.offpolicy_monitor.enabled and
+                                                 self.pipeline_config.offpolicy_monitor.monitor_replay_batch and
+                                                 global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0)
+
+                                if monitor_enabled:
+                                    # Materialize training metrics immediately (only for this step)
+                                    actor_train_metrics = DataProto.materialize_concat(data_refs=actor_refs)
+
+                                    # Compute monitor metrics using training_metrics (no extra forward!)
+                                    replay_offpolicy_metrics = compute_offpolicy_metrics(
+                                        current_batch=mb,
+                                        actor_train_cluster=None,  # Not needed when training_metrics provided
+                                        old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
+                                        pg_clip=self.pipeline_config.pg_clip,
+                                        training_metrics=actor_train_metrics  # ✨ Reuse log_probs!
+                                    )
+                                    metrics.update(replay_offpolicy_metrics)
+
+                                    # Log diagnostics
+                                    if global_step % self.pipeline_config.logging_steps == 0 and replay_offpolicy_metrics:
+                                        log_offpolicy_diagnostics(
+                                            metrics=replay_offpolicy_metrics,
+                                            batch=mb,
+                                            global_step=global_step,
+                                            logger_func=logger.debug
+                                        )
+
+                                    # Update training metrics (already materialized, no need to add to all_actor_refs)
+                                    metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
+                                    # Note: Don't add actor_refs to all_actor_refs since we already processed it
+                                else:
+                                    # No monitor: collect refs for later batch materialization
+                                    all_actor_refs.extend(actor_refs)
 
                         if all_actor_refs:
                             actor_metrics = DataProto.materialize_concat(data_refs=all_actor_refs)
@@ -1000,8 +1018,14 @@ class AgenticPipeline(BasePipeline):
 
     def _compute_and_attach_behavior_log_probs(self, batch: DataProto) -> DataProto:
         """
-        Compute and attach behavior policy log probs to batch.
-        This is independent of replay buffer and used for off-policy monitoring.
+        Compute and attach behavior policy log probs using actor_train.
+
+        This represents the policy that generated the data and is used for:
+        1. Replay buffer storage (for off-policy training)
+        2. Initial old_log_probs (for PPO on fresh batch)
+
+        Always uses actor_train (trainer mode) for accuracy and consistency.
+        The engine mode has been removed as it was unreliable.
 
         Args:
             batch: DataProto batch from rollout
@@ -1012,96 +1036,24 @@ class AgenticPipeline(BasePipeline):
         cfg = self.pipeline_config.offpolicy_monitor
 
         try:
-            if cfg.behavior_compute == "engine" and batch.batch is not None and "generation_log_probs" in batch.batch:
-                # Use engine-provided log probs
-                logger.debug(f"Using engine mode for behavior log probs with generation_log_probs shape {batch.batch['generation_log_probs'].shape}")
+            # Set behavior scope (trajectory or turn)
+            batch.meta_info["old_prob_mode"] = cfg.behavior_scope
 
-                engine_log_probs = batch.batch["generation_log_probs"]
+            # Compute log probs using actor_train (most accurate and reliable)
+            behavior_refs = self.actor_train.compute_log_probs(batch, blocking=False)
+            behavior = DataProto.materialize_concat(data_refs=behavior_refs)
 
-                # Apply turn mask if needed
-                if cfg.behavior_scope == "turn" and "prompt_mask" in batch.batch:
-                    from roll.utils.turn_mode_utils import create_turn_mode_response_mask
-
-                    response_mask = batch.batch.get("response_mask")
-                    prompt_mask = batch.batch.get("prompt_mask")
-                    messages_list = batch.non_tensor_batch.get("messages_list", None) if hasattr(batch, 'non_tensor_batch') else None
-
-                    if response_mask is not None:
-                        # Create turn-specific mask
-                        turn_mask, _ = create_turn_mode_response_mask(
-                            response_mask=response_mask,
-                            prompt_mask=prompt_mask,
-                            messages_list=messages_list
-                        )
-
-                        # Handle shape mismatch
-                        if engine_log_probs.shape != turn_mask.shape:
-                            logger.warning(f"Shape mismatch: engine_log_probs {engine_log_probs.shape} vs turn_mask {turn_mask.shape}")
-                            min_len = min(engine_log_probs.shape[1], turn_mask.shape[1])
-                            engine_log_probs = engine_log_probs[:, :min_len]
-                            turn_mask = turn_mask[:, :min_len]
-
-                        batch.batch["behavior_log_probs"] = engine_log_probs * turn_mask.float()
-                    else:
-                        batch.batch["behavior_log_probs"] = engine_log_probs
-                else:
-                    # Trajectory mode: use engine log probs directly
-                    batch.batch["behavior_log_probs"] = engine_log_probs
-
+            if behavior.batch is not None and "log_probs" in behavior.batch:
+                batch.batch["behavior_log_probs"] = behavior.batch["log_probs"]
+                logger.debug(f"Computed behavior_log_probs using actor_train (scope={cfg.behavior_scope})")
             else:
-                # Trainer mode (default): recompute using actor_train
-                batch.meta_info["old_prob_mode"] = cfg.behavior_scope
-                behavior_refs = self.actor_train.compute_log_probs(batch, blocking=False)
-                behavior = DataProto.materialize_concat(data_refs=behavior_refs)
-
-                if behavior.batch is not None and "log_probs" in behavior.batch:
-                    batch.batch["behavior_log_probs"] = behavior.batch["log_probs"]
-                    logger.debug(f"Computed behavior log probs using trainer mode (scope={cfg.behavior_scope})")
+                logger.warning("Failed to compute behavior_log_probs: no log_probs in result")
 
         except Exception as e:
-            logger.warning(f"Failed to compute behavior log probs: {e}")
+            logger.warning(f"Failed to compute behavior_log_probs: {e}")
             logger.debug(f"Error details: {str(e)}", exc_info=True)
 
         return batch
-
-    def _apply_turn_mask(self, batch: DataProto, log_probs: torch.Tensor) -> torch.Tensor:
-        """
-        Apply turn-specific mask to log probs (helper for turn mode).
-
-        Args:
-            batch: DataProto batch containing masks
-            log_probs: Log probabilities tensor
-
-        Returns:
-            Masked log probabilities
-        """
-        try:
-            from roll.utils.turn_mode_utils import create_turn_mode_response_mask
-
-            response_mask = batch.batch.get("response_mask")
-            prompt_mask = batch.batch.get("prompt_mask")
-            messages_list = batch.non_tensor_batch.get("messages_list", None) if hasattr(batch, 'non_tensor_batch') else None
-
-            if response_mask is not None:
-                turn_mask, _ = create_turn_mode_response_mask(
-                    response_mask=response_mask,
-                    prompt_mask=prompt_mask,
-                    messages_list=messages_list
-                )
-
-                # Handle shape mismatch
-                if log_probs.shape != turn_mask.shape:
-                    min_len = min(log_probs.shape[1], turn_mask.shape[1])
-                    log_probs = log_probs[:, :min_len]
-                    turn_mask = turn_mask[:, :min_len]
-
-                return log_probs * turn_mask.float()
-            else:
-                return log_probs
-
-        except Exception as e:
-            logger.warning(f"Failed to apply turn mask: {e}")
-            return log_probs
 
     def store_fresh_data_to_replay_buffer(self, fresh_batch: DataProto, global_step: int):
         """
@@ -1112,7 +1064,7 @@ class AgenticPipeline(BasePipeline):
         """
         try:
             # Store metadata about behavior policy configuration
-            fresh_batch.meta_info["behavior_compute"] = self.pipeline_config.offpolicy_monitor.behavior_compute
+            # Note: behavior_compute removed - always using trainer mode (actor_train) for accuracy
             fresh_batch.meta_info["behavior_scope"] = self.pipeline_config.offpolicy_monitor.behavior_scope
 
             # Compute prompt_length if available (useful for step mode in some envs)
