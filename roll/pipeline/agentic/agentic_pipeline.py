@@ -741,7 +741,8 @@ class AgenticPipeline(BasePipeline):
                                     actor_metrics=actor_metrics,
                                     sampled_indices_list=all_sampled_indices,
                                     batches=all_batches,
-                                    priority_metric=priority_metric
+                                    priority_metric=priority_metric,
+                                    global_step=global_step
                                 )
 
                         if all_critic_refs and self.pipeline_config.adv_estimator == "gae":
@@ -1098,7 +1099,8 @@ class AgenticPipeline(BasePipeline):
         actor_metrics: DataProto,
         sampled_indices_list: List[List[int]],
         batches: List[DataProto],
-        priority_metric: str = 'loss'
+        priority_metric: str = 'loss',
+        global_step: int = 0
     ):
         """
         Update replay buffer priorities based on training metrics.
@@ -1112,6 +1114,7 @@ class AgenticPipeline(BasePipeline):
             sampled_indices_list: List of sampled indices for each training batch
             batches: List of sampled batches (for extracting advantages if needed)
             priority_metric: Metric to use for priority ('loss', 'advantage', 'kl', 'reward')
+            global_step: Current training step (used for age-based priority decay)
         """
         try:
             # Extract priority values based on chosen metric
@@ -1188,7 +1191,7 @@ class AgenticPipeline(BasePipeline):
             self.replay_buffer.update_priorities(
                 indices=all_indices.tolist(),
                 priorities=priorities,
-                current_global_step=self.global_step
+                current_global_step=global_step
             )
 
             logger.debug(
