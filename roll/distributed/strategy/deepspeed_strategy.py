@@ -409,7 +409,9 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         need_collect_log_probs = batch.meta_info.get("need_collect_log_probs", False)
         # Store log_probs in worker instance instead of returning via metrics (to avoid Ray serialization issues)
         if need_collect_log_probs:
-            self.worker._train_step_collected_log_probs = []
+            # ✅ FIX: Only initialize if not exists, to support multiple train_step calls (e.g., when dataloader loops multiple times)
+            if not hasattr(self.worker, '_train_step_collected_log_probs'):
+                self.worker._train_step_collected_log_probs = []
 
         for step in range(mini_steps):
             data: DataProto = next(data_iter)
