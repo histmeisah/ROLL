@@ -155,11 +155,32 @@ def collect_dp_mp_compute(cluster, output):
     只需要搜集tp=0, pipeline_last_stage的结果
     输入输出都是list, 是batch维度的
     """
+    # ✨ DEBUG: Log collection process
+    logger.debug(
+        f"[DEBUG] collect_dp_mp_compute called: "
+        f"world_size={cluster.world_size}, dp_size={cluster.dp_size}, "
+        f"output_len={len(output) if isinstance(output, list) else 'N/A'}"
+    )
+
     output_in_dp = []
+    collected_ranks = []
     for global_rank in range(cluster.world_size):
         local_rank_info = cluster.get_rank_info(rank=global_rank)
-        if local_rank_info.tp_rank == 0 and local_rank_info.is_pipeline_last_stage and local_rank_info.cp_rank == 0:
+        should_collect = (local_rank_info.tp_rank == 0 and
+                         local_rank_info.is_pipeline_last_stage and
+                         local_rank_info.cp_rank == 0)
+
+        if should_collect:
             output_in_dp.append(output[global_rank])
+            collected_ranks.append(global_rank)
+            logger.debug(
+                f"[DEBUG] Collecting from rank {global_rank}: "
+                f"dp_rank={local_rank_info.dp_rank}, tp_rank={local_rank_info.tp_rank}, "
+                f"pp_rank={local_rank_info.pp_rank}, is_last_stage={local_rank_info.is_pipeline_last_stage}"
+            )
+
+    logger.info(f"[DEBUG] collect_dp_mp_compute collected from ranks: {collected_ranks} (total: {len(collected_ranks)})")
+
     if isinstance(output[0], list):
         return list(chain.from_iterable(output_in_dp))
     elif isinstance(output[0], DataProto):

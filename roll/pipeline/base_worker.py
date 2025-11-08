@@ -118,8 +118,20 @@ class ActorWorker(Worker):
         if need_collect_log_probs and hasattr(self, '_train_step_collected_log_probs'):
             import torch
             if self._train_step_collected_log_probs:
+                # ✨ DEBUG: Log collection details
+                num_chunks = len(self._train_step_collected_log_probs)
+                shapes = [lp.shape for lp in self._train_step_collected_log_probs]
+                self.logger.info(
+                    f"[DEBUG] Worker {self.worker_name} collected log_probs: "
+                    f"num_chunks={num_chunks}, shapes={shapes}"
+                )
+
                 # Concatenate all collected log_probs
                 collected_log_probs = torch.cat(self._train_step_collected_log_probs, dim=0)
+                self.logger.info(
+                    f"[DEBUG] Worker {self.worker_name} concatenated log_probs shape: {collected_log_probs.shape}"
+                )
+
                 # Clean up
                 delattr(self, '_train_step_collected_log_probs')
 
@@ -129,8 +141,12 @@ class ActorWorker(Worker):
                 tensors={"log_probs": collected_log_probs}
             )
             output.meta_info = {"metrics": metrics}
+            # ✨ DEBUG: Log return value
+            self.logger.debug(f"[DEBUG] Worker {self.worker_name} returning log_probs with shape {collected_log_probs.shape}")
         else:
             output = DataProto(meta_info={"metrics": metrics})
+            if need_collect_log_probs:
+                self.logger.warning(f"[DEBUG] Worker {self.worker_name} was asked to collect log_probs but none were collected!")
 
         return output
 

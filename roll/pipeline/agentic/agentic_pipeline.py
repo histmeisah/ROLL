@@ -440,6 +440,17 @@ class AgenticPipeline(BasePipeline):
                     critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
                 if self.pipeline_config.critic_warmup <= global_step:
+                    # ✨ DEBUG: Log cluster info to diagnose dp_size issue
+                    if global_step % 10 == 0:  # Log every 10 steps to avoid spam
+                        logger.info(
+                            f"[DEBUG] Actor Train Cluster Info: "
+                            f"world_size={self.actor_train.world_size}, "
+                            f"dp_size={self.actor_train.dp_size}, "
+                            f"tp_size={self.actor_train.tp_size}, "
+                            f"pp_size={self.actor_train.pp_size}, "
+                            f"batch_size={batch.batch['input_ids'].shape[0] if batch.batch is not None else 'None'}"
+                        )
+
                     # ✨ Check if we need to collect log_probs for off-policy monitoring (fresh batch)
                     fresh_monitor_enabled = (self.pipeline_config.offpolicy_monitor.enabled and
                         self.pipeline_config.offpolicy_monitor.monitor_fresh_batch and
@@ -450,9 +461,26 @@ class AgenticPipeline(BasePipeline):
                     # Set flag to enable log_probs collection in train_step
                     if fresh_monitor_enabled:
                         batch.meta_info["need_collect_log_probs"] = True
+                        logger.debug(f"[DEBUG] Enabled log_probs collection for fresh batch at step {global_step}")
 
                     actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
+
+                    # ✨ DEBUG: Log ObjectRef details before materialize
+                    logger.debug(
+                        f"[DEBUG] actor_train_metrics_refs: "
+                        f"type={type(actor_train_metrics_refs)}, "
+                        f"len={len(actor_train_metrics_refs) if isinstance(actor_train_metrics_refs, list) else 'N/A'}"
+                    )
+
                     actor_train_metrics: DataProto = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
+
+                    # ✨ DEBUG: Log collected log_probs shape
+                    if actor_train_metrics.batch is not None and "log_probs" in actor_train_metrics.batch:
+                        logger.info(
+                            f"[DEBUG] Collected log_probs shape: {actor_train_metrics.batch['log_probs'].shape}, "
+                            f"expected batch_size: {batch.batch['input_ids'].shape[0] if batch.batch is not None else 'None'}"
+                        )
+
                     metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
 
                     # === NEW: Monitor off-policy ratio after first training step ===
