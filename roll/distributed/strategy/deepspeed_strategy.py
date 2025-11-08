@@ -405,6 +405,12 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         mini_steps = batch.batch.batch_size[0] // self.worker_config.training_args.per_device_train_batch_size
         metrics = {}
 
+        # Check if we need to collect log_probs (for off-policy monitoring)
+        need_collect_log_probs = batch.meta_info.get("need_collect_log_probs", False)
+        # Store log_probs in worker instance instead of returning via metrics (to avoid Ray serialization issues)
+        if need_collect_log_probs:
+            self.worker._train_step_collected_log_probs = []
+
         for step in range(mini_steps):
             data: DataProto = next(data_iter)
             input_ids = data.batch["input_ids"]
@@ -439,7 +445,19 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
             output = self.model(
                 input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, **forward_args
             )
-            loss, loss_reduced = loss_func(data, output.logits)
+
+            # Handle new return format from loss_func (now returns 3 values)
+            loss_func_result = loss_func(data, output.logits)
+            if len(loss_func_result) == 3:
+                # New format: (loss, metrics, extra_tensors)
+                loss, loss_reduced, extra_tensors = loss_func_result
+                if need_collect_log_probs and "log_probs" in extra_tensors:
+                    # Collect log_probs for off-policy monitoring (move to CPU to save GPU memory)
+                    self.worker._train_step_collected_log_probs.append(extra_tensors["log_probs"].cpu())
+            else:
+                # Old format: (loss, metrics) - for backward compatibility
+                loss, loss_reduced = loss_func_result
+
             append_to_dict(metrics, loss_reduced)
             loss *= self.worker.rank_info.cp_size
             self.model.backward(loss)
@@ -454,6 +472,7 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
                 metrics.update({self.worker_config.name + "/" + "grad_norm": self.model.get_global_grad_norm().item()})
                 if is_offload_optimizer_states_in_train_step:
                     self.offload_states(include=[OffloadStateType.optimizer_states], non_blocking=True)
+
         return metrics
 
     def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", local_state_path=None, **kwargs):

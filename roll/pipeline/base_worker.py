@@ -64,10 +64,12 @@ class ActorWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def train_step(self, data: DataProto):
         """
-        return DataProto(meta_info={'metrics': metrics})
+        return DataProto(meta_info={'metrics': metrics}, batch={'log_probs': ...})
         """
         global_step = data.meta_info.get("global_step", 0)
         is_offload_states = data.meta_info.get("is_offload_states", True)
+        # Check if we need to collect log_probs for off-policy monitoring
+        need_collect_log_probs = data.meta_info.get("need_collect_log_probs", False)
         metrics = {}
         self.logger.info(f"{self.worker_name} generate global step {global_step}")
 
@@ -85,6 +87,10 @@ class ActorWorker(Worker):
                 per_device_train_batch_size * self.worker_config.training_args.gradient_accumulation_steps
             )
 
+            # Set flag in batch meta_info to enable log_probs collection in strategy
+            if need_collect_log_probs:
+                data.meta_info["need_collect_log_probs"] = True
+
             dataloader = data.make_iterator(
                 mini_batch_size=backward_batch_size,
                 epochs=self.pipeline_config.ppo_epochs,
@@ -97,13 +103,35 @@ class ActorWorker(Worker):
                 desc=f"{self.worker_name} train global step {global_step}",
                 total=data.batch.batch_size[0] * self.pipeline_config.ppo_epochs // backward_batch_size,
             ):
+                # Pass flag to each mini-batch
+                if need_collect_log_probs:
+                    data.meta_info["need_collect_log_probs"] = True
+
                 pg_metrics = self.strategy.train_step(batch=data, loss_func=self.loss_func)
                 append_to_dict(metrics, pg_metrics)
 
             metrics["actor/lr"] = self.strategy.scheduler.get_last_lr()[0]
             data.to("cpu")
 
-        output = DataProto(meta_info={"metrics": metrics})
+        # Extract collected log_probs from worker instance if available
+        collected_log_probs = None
+        if need_collect_log_probs and hasattr(self, '_train_step_collected_log_probs'):
+            import torch
+            if self._train_step_collected_log_probs:
+                # Concatenate all collected log_probs
+                collected_log_probs = torch.cat(self._train_step_collected_log_probs, dim=0)
+                # Clean up
+                delattr(self, '_train_step_collected_log_probs')
+
+        if collected_log_probs is not None:
+            # Return both metrics and log_probs (use from_dict to create TensorDict)
+            output = DataProto.from_dict(
+                tensors={"log_probs": collected_log_probs}
+            )
+            output.meta_info = {"metrics": metrics}
+        else:
+            output = DataProto(meta_info={"metrics": metrics})
+
         return output
 
     @register(dispatch_mode=Dispatch.DP_MP_COMPUTE)
@@ -345,7 +373,8 @@ class ActorWorker(Worker):
                                        loss_agg_mode=self.pipeline_config.loss_agg_mode).detach().item(),
         }
 
-        return total_loss, pg_metrics
+        # Return log_probs for off-policy monitoring (detach to avoid keeping computation graph)
+        return total_loss, pg_metrics, {"log_probs": log_probs.detach()}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def do_checkpoint(self, global_step):

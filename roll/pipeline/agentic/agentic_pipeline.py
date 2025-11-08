@@ -440,17 +440,24 @@ class AgenticPipeline(BasePipeline):
                     critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
                 if self.pipeline_config.critic_warmup <= global_step:
+                    # ✨ Check if we need to collect log_probs for off-policy monitoring (fresh batch)
+                    fresh_monitor_enabled = (self.pipeline_config.offpolicy_monitor.enabled and
+                        self.pipeline_config.offpolicy_monitor.monitor_fresh_batch and
+                        global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0 and
+                        "old_log_probs" in batch.batch and
+                        not self.pipeline_config.replay.enabled)  # Only for fresh batch without replay
+
+                    # Set flag to enable log_probs collection in train_step
+                    if fresh_monitor_enabled:
+                        batch.meta_info["need_collect_log_probs"] = True
+
                     actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
                     actor_train_metrics: DataProto = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
                     metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
 
                     # === NEW: Monitor off-policy ratio after first training step ===
                     # This captures the actual PPO importance sampling ratio after parameter update
-                    if (self.pipeline_config.offpolicy_monitor.enabled and
-                        self.pipeline_config.offpolicy_monitor.monitor_fresh_batch and
-                        global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0 and
-                        "old_log_probs" in batch.batch and
-                        not self.pipeline_config.replay.enabled):  # Only for fresh batch without replay
+                    if fresh_monitor_enabled:
 
                         # ✨ OPTIMIZATION: Reuse log_probs from training_metrics (no extra forward!)
                         # actor_train_metrics already contains the log_probs computed during training
@@ -679,13 +686,16 @@ class AgenticPipeline(BasePipeline):
                                 critic_refs = self.critic.train_step(mb, blocking=False)
                                 all_critic_refs.extend(critic_refs)
                             if self.pipeline_config.critic_warmup <= global_step:
-                                actor_refs = self.actor_train.train_step(mb, blocking=False)
-
-                                # ✨ OPTIMIZATION: Immediately materialize to get training_metrics for monitor
-                                # This enables reusing log_probs computed during training
+                                # ✨ Check if we need to collect log_probs for off-policy monitoring
                                 monitor_enabled = (self.pipeline_config.offpolicy_monitor.enabled and
                                                  self.pipeline_config.offpolicy_monitor.monitor_replay_batch and
                                                  global_step % self.pipeline_config.offpolicy_monitor.monitor_interval == 0)
+
+                                # Set flag to enable log_probs collection in train_step
+                                if monitor_enabled:
+                                    mb.meta_info["need_collect_log_probs"] = True
+
+                                actor_refs = self.actor_train.train_step(mb, blocking=False)
 
                                 if monitor_enabled:
                                     # Materialize training metrics immediately (only for this step)
