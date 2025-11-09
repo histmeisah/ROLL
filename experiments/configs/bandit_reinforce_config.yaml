@@ -1,0 +1,110 @@
+# Bandit-REINFORCE++ Configuration for Mathematical Reasoning
+
+defaults:
+  - _self_
+  - override hydra/job_logging: colorlog
+
+# Model configuration
+model:
+  name: "Qwen2.5-3B-Instruct"
+  path: "/models/Qwen2.5-3B-Instruct"  # Update with actual path
+  dtype: "float16"
+  device_map: "auto"
+
+# Bandit configuration (NeuralUCB)
+bandit:
+  n_prompts: 5  # Number of prompt templates
+  context_dim: 768  # Dimension of problem embeddings
+  hidden_dims: [256, 128]  # Neural network architecture
+  exploration_param: 1.0  # Alpha for UCB exploration
+
+  # NeuralUCB specific parameters
+  learning_rate: 0.001
+  reg_param: 1.0  # Regularization parameter
+  buffer_size: 10000  # Experience replay buffer size
+  batch_size: 32  # Batch size for neural network training
+  update_freq: 10  # Frequency of neural network updates
+
+# REINFORCE++ configuration
+reinforce:
+  num_trajectories: 8  # K: number of trajectories per problem
+  temperature: 0.8  # Sampling temperature
+  max_length: 512  # Maximum solution length
+
+  # Training parameters
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+
+# Training configuration
+training:
+  num_episodes: 10000
+  batch_size: 32
+  eval_interval: 100
+  checkpoint_interval: 500
+  log_interval: 10
+
+  # Dataset configuration
+  train_dataset: "gsm8k"  # Options: gsm8k, math, aime
+  val_split: 0.1
+  test_split: 0.1
+
+  # Reward configuration
+  reward_type: "binary"  # binary: correct/incorrect
+  reward_shaping: false
+
+# Prompt templates
+prompts:
+  templates:
+    - name: "direct"
+      template: "Solve the following problem:\n{problem}\nSolution:"
+
+    - name: "step_by_step"
+      template: "Solve step by step:\n{problem}\nLet's think step by step.\nSolution:"
+
+    - name: "detailed"
+      template: "Provide a detailed solution:\n{problem}\nDetailed solution with reasoning:"
+
+    - name: "verify"
+      template: "Solve and verify:\n{problem}\nSolution with verification:"
+
+    - name: "formal"
+      template: "Provide a formal solution:\n{problem}\nFormal mathematical solution:"
+
+# Evaluation metrics
+evaluation:
+  metrics:
+    - "accuracy"  # Pass@1 accuracy
+    - "mean_reward"  # Average reward
+    - "prompt_distribution"  # Distribution of prompt usage
+    - "ucb_convergence"  # UCB value convergence
+
+  test_datasets:
+    - "gsm8k_test"
+    - "math500"
+    - "aime2024"
+
+# Logging and outputs
+logging:
+  output_dir: "./outputs/bandit_reinforce"
+  wandb:
+    enabled: true
+    project: "bandit-reinforce-math"
+    entity: "your-entity"  # Update with your wandb entity
+
+  save_trajectories: true
+  save_prompt_stats: true
+
+# Distributed training (if needed)
+distributed:
+  enabled: false
+  world_size: 1
+  backend: "nccl"
+
+# Experiment tracking
+experiment:
+  name: "bandit_reinforce_neuralucb"
+  description: "NeuralUCB for prompt selection with REINFORCE++ for mathematical reasoning"
+  tags: ["neuralucb", "reinforce++", "math", "prompt-optimization"]
+  seed: 42
