@@ -83,8 +83,10 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         use_advantage_priority: bool = False  # Whether to update priority with advantages after training
     ):
         super().__init__(capacity, batch_size, seed)
-        self.trajectories = deque(maxlen=capacity)
+        # Use list instead of deque for smart eviction control
+        self.trajectories = []
         self.rng = random.Random(seed)
+        self.enable_smart_eviction = True  # Can be toggled for A/B testing
 
         # Priority-related attributes
         from .priority_functions import uniform_priority
@@ -199,7 +201,11 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             self._it_min[current_idx] = priority_alpha
             self._max_priority = max(self._max_priority, trajectory.priority)
 
-            # Append to deque (auto-evicts oldest when full)
+            # Smart eviction if buffer is full
+            if len(self.trajectories) >= self.capacity:
+                self._smart_evict()
+
+            # Append new trajectory
             self.trajectories.append(trajectory)
             self.total_stored += 1
 
@@ -210,7 +216,69 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             logger.info(f"Replay buffer GC triggered at {self.total_stored} trajectories stored")
 
         logger.debug(f"Stored {batch_size} trajectories. Total stored: {len(self.trajectories)}")
-    
+
+    def _smart_evict(self) -> None:
+        """
+        Intelligently evict a trajectory based on age and priority.
+
+        The eviction score combines:
+        - Age: Older trajectories are more likely to be evicted
+        - Priority: Lower priority trajectories are more likely to be evicted
+        - Sampling frequency: Over-sampled trajectories may be evicted
+
+        Formula: eviction_score = (age / age_decay) / (priority + epsilon)
+        Higher score = more likely to be evicted
+        """
+        if not self.enable_smart_eviction or len(self.trajectories) == 0:
+            # Fallback to FIFO if smart eviction is disabled
+            self.trajectories.pop(0)
+            return
+
+        # Calculate eviction scores for all trajectories
+        eviction_scores = []
+        epsilon = 1e-6  # Prevent division by zero
+
+        for i, traj in enumerate(self.trajectories):
+            # Age factor (higher age = higher score = more likely to evict)
+            age = self.current_global_step - traj.global_step
+            age_factor = age / self.age_decay if self.age_decay > 0 else age
+
+            # Priority factor from segment tree (lower priority = higher score)
+            priority = self._it_sum[i] if i < len(self.trajectories) else epsilon
+            priority_factor = 1.0 / (priority + epsilon)
+
+            # Sample count factor (over-sampled = higher score)
+            sample_factor = np.log1p(traj.sample_count) / 10.0  # Logarithmic scaling
+
+            # Combined eviction score
+            eviction_score = age_factor * priority_factor * (1.0 + sample_factor)
+            eviction_scores.append((i, eviction_score, age, priority))
+
+        # Select trajectory with highest eviction score
+        idx_to_evict, score, age, priority = max(eviction_scores, key=lambda x: x[1])
+
+        # Log eviction decision (only occasionally to avoid spam)
+        if self.total_stored % 100 == 0:
+            logger.debug(
+                f"Smart eviction: idx={idx_to_evict}, score={score:.4f}, "
+                f"age={age}, priority={priority:.4f}, sample_count={self.trajectories[idx_to_evict].sample_count}"
+            )
+
+        # Remove the selected trajectory
+        del self.trajectories[idx_to_evict]
+
+        # Update segment trees to reflect the removal
+        # Shift all entries after the evicted index
+        for i in range(idx_to_evict, len(self.trajectories)):
+            if i + 1 < self._tree_capacity:
+                self._it_sum[i] = self._it_sum[i + 1]
+                self._it_min[i] = self._it_min[i + 1]
+
+        # Clear the last entry
+        if len(self.trajectories) < self._tree_capacity:
+            self._it_sum[len(self.trajectories)] = 0.0
+            self._it_min[len(self.trajectories)] = float('inf')
+
     def can_sample(self, batch_size: Optional[int] = None) -> bool:
         """Check if buffer has enough trajectories for sampling."""
         required_size = batch_size or self.batch_size
@@ -627,7 +695,7 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         return np.array(weights, dtype=np.float32)
 
     def get_stats(self) -> dict:
-        """Get buffer statistics including priority information."""
+        """Get comprehensive buffer statistics including priority, age, and freshness information."""
         base_stats = super().get_stats()
 
         # Fix: Use actual buffer size for correct utilization calculation
@@ -635,6 +703,7 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         base_stats["current_size"] = current_size
         base_stats["utilization"] = current_size / self.capacity if self.capacity > 0 else 0.0
         base_stats["total_evicted"] = max(0, self.total_stored - current_size)  # Number of evicted samples
+        base_stats["eviction_rate"] = base_stats["total_evicted"] / max(1, self.total_stored)
 
         # Add priority statistics from segment tree
         if current_size > 0:
@@ -649,5 +718,42 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
                 "priority_exponent": self.priority_exponent,
                 "max_priority": self._max_priority,
             })
+
+            # Age distribution statistics
+            ages = np.array([self.current_global_step - traj.global_step for traj in self.trajectories])
+            base_stats.update({
+                "age/mean": float(ages.mean()),
+                "age/std": float(ages.std()),
+                "age/max": float(ages.max()),  # Age of oldest policy
+                "age/min": float(ages.min()),  # Age of newest policy
+                "age/median": float(np.median(ages)),
+                "age/p95": float(np.percentile(ages, 95)),  # 95th percentile age
+            })
+
+            # Estimate gradient step age (assuming constant replay ratio)
+            estimated_replay_ratio = getattr(self, 'train_steps_per_env_step', 2.0)
+            est_gradient_ages = ages * estimated_replay_ratio
+            base_stats.update({
+                "gradient_age/mean_est": float(est_gradient_ages.mean()),
+                "gradient_age/max_est": float(est_gradient_ages.max()),
+            })
+
+            # Freshness metrics (based on age decay)
+            freshness_weights = np.exp(-ages / self.age_decay)
+            base_stats.update({
+                "freshness/mean": float(freshness_weights.mean()),
+                "freshness/std": float(freshness_weights.std()),
+                "freshness/min": float(freshness_weights.min()),  # Least fresh (oldest)
+                "freshness_ratio": float(np.sum(freshness_weights > 0.5) / current_size),  # Fraction with >50% freshness
+            })
+
+            # Sample count statistics (how often trajectories have been sampled)
+            sample_counts = np.array([traj.sample_count for traj in self.trajectories])
+            if sample_counts.sum() > 0:
+                base_stats.update({
+                    "sample_count/mean": float(sample_counts.mean()),
+                    "sample_count/max": float(sample_counts.max()),
+                    "sample_count/never_sampled": float(np.sum(sample_counts == 0) / current_size),
+                })
 
         return base_stats

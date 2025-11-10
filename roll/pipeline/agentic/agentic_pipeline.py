@@ -794,8 +794,9 @@ class AgenticPipeline(BasePipeline):
                             "replay_buffer/capacity": buffer_stats["capacity"],
                             "replay_buffer/utilization": buffer_stats["utilization"],
                             "replay_buffer/buffer_type": buffer_stats["buffer_type"],
-                            "replay/train_steps": replay_train_count,  # Number of successful training steps
-                            "replay/train_steps_target": rb_cfg.train_steps_per_env_step,  # Target training steps
+                            "replay_buffer/train_steps": replay_train_count,  # Number of successful training steps (unified naming)
+                            "replay_buffer/train_steps_target": rb_cfg.train_steps_per_env_step,  # Target training steps
+                            "replay_buffer/replay_ratio": replay_train_count / max(1, rb_cfg.train_steps_per_env_step),  # Actual vs target ratio
                         })
 
                         # Note: Off-policy monitoring is now done inside the replay training loop
