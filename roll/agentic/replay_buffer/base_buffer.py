@@ -83,9 +83,10 @@ class BaseReplayBuffer(ABC):
     
     def get_stats(self) -> dict:
         """Get buffer statistics."""
+        # Note: Subclasses should override this to provide accurate current_size
         return {
             "buffer_type": self.buffer_type,
             "capacity": self.capacity,
             "total_stored": self.total_stored,
-            "utilization": self.total_stored / self.capacity if self.capacity > 0 else 0.0
+            "utilization": self.total_stored / self.capacity if self.capacity > 0 else 0.0  # Will be overridden by subclasses
         }

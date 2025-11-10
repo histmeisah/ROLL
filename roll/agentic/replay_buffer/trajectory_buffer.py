@@ -630,8 +630,13 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         """Get buffer statistics including priority information."""
         base_stats = super().get_stats()
 
-        # Add priority statistics from segment tree
+        # Fix: Use actual buffer size for correct utilization calculation
         current_size = len(self.trajectories)
+        base_stats["current_size"] = current_size
+        base_stats["utilization"] = current_size / self.capacity if self.capacity > 0 else 0.0
+        base_stats["total_evicted"] = max(0, self.total_stored - current_size)  # Number of evicted samples
+
+        # Add priority statistics from segment tree
         if current_size > 0:
             # Extract priorities from segment tree
             priorities = np.array([self._it_sum[i] for i in range(current_size)])
