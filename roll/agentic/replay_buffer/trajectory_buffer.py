@@ -83,8 +83,10 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         use_advantage_priority: bool = False  # Whether to update priority with advantages after training
     ):
         super().__init__(capacity, batch_size, seed)
-        # Use list instead of deque for smart eviction control
-        self.trajectories = []
+        # Fixed-size array with validity mask for perfect index alignment
+        self.trajectories = [None] * capacity  # Pre-allocated slots
+        self.valid_mask = [False] * capacity   # Track which slots are occupied
+        self.num_valid = 0  # Number of valid trajectories
         self.rng = random.Random(seed)
         self.enable_smart_eviction = True  # Can be toggled for A/B testing
 
@@ -190,23 +192,26 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
                 logger.warning(f"Failed to calculate priority, using default 1.0: {e}")
                 trajectory.priority = 1.0
 
-            # IMPORTANT: Use total_stored for consistent indexing across buffer wrap-around
-            # deque automatically handles capacity, but segment tree needs explicit index
-            current_idx = self.total_stored % self.capacity
+            # Find slot for new trajectory
+            if self.num_valid >= self.capacity:
+                # Buffer full: smart eviction to find slot
+                slot_idx = self._smart_evict_and_get_slot()
+            else:
+                # Buffer not full: find empty slot
+                slot_idx = self._find_empty_slot()
+                self.num_valid += 1
+
+            # Store trajectory in the slot
+            self.trajectories[slot_idx] = trajectory
+            self.valid_mask[slot_idx] = True
 
             # Update segment trees with priority^alpha (PER convention)
             # New samples get max priority to ensure they're sampled at least once
             priority_alpha = max(trajectory.priority, self._max_priority) ** self.priority_exponent
-            self._it_sum[current_idx] = priority_alpha
-            self._it_min[current_idx] = priority_alpha
+            self._it_sum[slot_idx] = priority_alpha
+            self._it_min[slot_idx] = priority_alpha
             self._max_priority = max(self._max_priority, trajectory.priority)
 
-            # Smart eviction if buffer is full
-            if len(self.trajectories) >= self.capacity:
-                self._smart_evict()
-
-            # Append new trajectory
-            self.trajectories.append(trajectory)
             self.total_stored += 1
 
         # Periodic garbage collection to prevent memory leaks
@@ -215,9 +220,17 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             gc.collect()
             logger.info(f"Replay buffer GC triggered at {self.total_stored} trajectories stored")
 
-        logger.debug(f"Stored {batch_size} trajectories. Total stored: {len(self.trajectories)}")
+        logger.debug(f"Stored {batch_size} trajectories. Total valid: {self.num_valid}, Total stored: {self.total_stored}")
 
-    def _smart_evict(self) -> None:
+    def _find_empty_slot(self) -> int:
+        """Find the first empty slot in the buffer."""
+        for i in range(self.capacity):
+            if not self.valid_mask[i]:
+                return i
+        # Should not reach here if called correctly
+        raise RuntimeError("No empty slot found but buffer reports not full")
+
+    def _smart_evict_and_get_slot(self) -> int:
         """
         Intelligently evict a trajectory based on age and priority.
 
@@ -228,23 +241,36 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
 
         Formula: eviction_score = (age / age_decay) / (priority + epsilon)
         Higher score = more likely to be evicted
-        """
-        if not self.enable_smart_eviction or len(self.trajectories) == 0:
-            # Fallback to FIFO if smart eviction is disabled
-            self.trajectories.pop(0)
-            return
 
-        # Calculate eviction scores for all trajectories
+        Returns:
+            The slot index that was evicted and can be reused
+        """
+        if not self.enable_smart_eviction:
+            # Fallback to FIFO: find oldest slot
+            oldest_idx = 0
+            oldest_step = float('inf')
+            for i in range(self.capacity):
+                if self.valid_mask[i] and self.trajectories[i].global_step < oldest_step:
+                    oldest_step = self.trajectories[i].global_step
+                    oldest_idx = i
+            return oldest_idx
+
+        # Calculate eviction scores for all valid trajectories
         eviction_scores = []
         epsilon = 1e-6  # Prevent division by zero
 
-        for i, traj in enumerate(self.trajectories):
+        for i in range(self.capacity):
+            if not self.valid_mask[i]:
+                continue  # Skip empty slots
+
+            traj = self.trajectories[i]
+
             # Age factor (higher age = higher score = more likely to evict)
             age = self.current_global_step - traj.global_step
             age_factor = age / self.age_decay if self.age_decay > 0 else age
 
             # Priority factor from segment tree (lower priority = higher score)
-            priority = self._it_sum[i] if i < len(self.trajectories) else epsilon
+            priority = self._it_sum[i] if i < self._tree_capacity else epsilon
             priority_factor = 1.0 / (priority + epsilon)
 
             # Sample count factor (over-sampled = higher score)
@@ -260,29 +286,20 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         # Log eviction decision (only occasionally to avoid spam)
         if self.total_stored % 100 == 0:
             logger.debug(
-                f"Smart eviction: idx={idx_to_evict}, score={score:.4f}, "
+                f"Smart eviction: slot={idx_to_evict}, score={score:.4f}, "
                 f"age={age}, priority={priority:.4f}, sample_count={self.trajectories[idx_to_evict].sample_count}"
             )
 
-        # Remove the selected trajectory
-        del self.trajectories[idx_to_evict]
+        # Clear segment tree entries for this slot (will be overwritten)
+        self._it_sum[idx_to_evict] = 0.0
+        self._it_min[idx_to_evict] = float('inf')
 
-        # Update segment trees to reflect the removal
-        # Shift all entries after the evicted index
-        for i in range(idx_to_evict, len(self.trajectories)):
-            if i + 1 < self._tree_capacity:
-                self._it_sum[i] = self._it_sum[i + 1]
-                self._it_min[i] = self._it_min[i + 1]
-
-        # Clear the last entry
-        if len(self.trajectories) < self._tree_capacity:
-            self._it_sum[len(self.trajectories)] = 0.0
-            self._it_min[len(self.trajectories)] = float('inf')
+        return idx_to_evict
 
     def can_sample(self, batch_size: Optional[int] = None) -> bool:
         """Check if buffer has enough trajectories for sampling."""
         required_size = batch_size or self.batch_size
-        return len(self.trajectories) >= required_size
+        return self.num_valid >= required_size
     
     def sample_for_training(
         self,
@@ -322,13 +339,19 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         sample_size = batch_size or self.batch_size
 
         if not self.can_sample(sample_size):
-            logger.debug(f"Insufficient trajectories for sampling: {len(self.trajectories)} < {sample_size}")
+            logger.debug(f"Insufficient trajectories for sampling: {self.num_valid} < {sample_size}")
             return None, []
 
         # Sample trajectories based on priority function
         # Deterministic strategies: uniform, lifo, fifo
         # Weighted strategies: reward, td_error, recency, combined, etc.
-        buffer_list = list(self.trajectories)
+        # Build list of valid trajectories
+        buffer_list = []
+        valid_indices = []  # Map from buffer_list index to slot index
+        for i in range(self.capacity):
+            if self.valid_mask[i]:
+                buffer_list.append(self.trajectories[i])
+                valid_indices.append(i)
         buffer_size = len(buffer_list)
         priority_fn_name = self.priority_fn.__name__
 
@@ -339,32 +362,37 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             # LIFO (Last-In-First-Out): Deterministic sampling of newest N trajectories
             # Recommended for Echo mode (train_steps_per_env_step=1) for near-on-policy training
             start_idx = max(0, buffer_size - sample_size)
-            sampled_indices = list(range(start_idx, buffer_size))
+            buffer_indices = list(range(start_idx, buffer_size))
             sampled_trajectories = buffer_list[start_idx:]
-            logger.debug(f"LIFO sampling: selected last {len(sampled_trajectories)} trajectories (indices {start_idx} to {buffer_size})")
+            sampled_indices = [valid_indices[i] for i in buffer_indices]  # Convert to slot indices
+            logger.debug(f"LIFO sampling: selected last {len(sampled_trajectories)} trajectories")
 
         elif priority_fn_name == "fifo_priority":
             # FIFO (First-In-First-Out): Deterministic sampling of oldest N trajectories
             # Ensures all data is used before eviction
-            sampled_indices = list(range(sample_size))
+            buffer_indices = list(range(sample_size))
             sampled_trajectories = buffer_list[:sample_size]
+            sampled_indices = [valid_indices[i] for i in buffer_indices]  # Convert to slot indices
             logger.debug(f"FIFO sampling: selected first {len(sampled_trajectories)} trajectories")
 
         elif priority_fn_name == "uniform_priority":
             # Uniform random sampling: Standard replay buffer behavior
-            sampled_indices = self.rng.sample(range(buffer_size), sample_size)
-            sampled_trajectories = [buffer_list[i] for i in sampled_indices]
+            buffer_indices = self.rng.sample(range(buffer_size), sample_size)
+            sampled_trajectories = [buffer_list[i] for i in buffer_indices]
+            sampled_indices = [valid_indices[i] for i in buffer_indices]  # Convert to slot indices
             logger.debug(f"Uniform sampling: randomly selected {len(sampled_trajectories)} trajectories")
 
         else:
             # Weighted priority-based sampling using Segment Tree (O(log n) per sample)
             # This is the core of Prioritized Experience Replay (PER)
-            sampled_indices = self._sample_proportional(sample_size, buffer_size)
-            sampled_trajectories = [buffer_list[i] for i in sampled_indices]
+            # Note: _sample_proportional now needs to work with valid slots only
+            slot_indices = self._sample_proportional_slots(sample_size)
+            sampled_trajectories = [self.trajectories[i] for i in slot_indices]
+            sampled_indices = slot_indices
 
             # Update sample counts for statistics
             for idx in sampled_indices:
-                buffer_list[idx].sample_count += 1
+                self.trajectories[idx].sample_count += 1
 
             logger.debug(f"PER sampling ({priority_fn_name}): sampled {len(sampled_trajectories)} trajectories with priority_alpha={self.priority_exponent}")
         
@@ -467,7 +495,7 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             "from_replay_buffer": True,
             "buffer_type": "trajectory",
             "sample_size": sample_size,
-            "buffer_utilization": len(self.trajectories) / self.capacity,
+            "buffer_utilization": self.num_valid / self.capacity,
             "sampled_indices": sampled_indices  # For priority update after training
         }
 
@@ -479,6 +507,63 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
 
         logger.debug(f"Sampled {sample_size} trajectories for training (indices: {len(sampled_indices)})")
         return dataproto, sampled_indices
+
+    def _sample_proportional_slots(self, batch_size: int) -> List[int]:
+        """
+        Sample slot indices based on priorities using Segment Tree.
+        Works directly with fixed slots and valid_mask.
+
+        Time complexity: O(batch_size * log n)
+
+        Args:
+            batch_size: Number of samples to draw
+
+        Returns:
+            List of sampled slot indices (not buffer_list indices)
+        """
+        # Calculate total priority from valid slots only
+        p_total = 0.0
+        for i in range(self.capacity):
+            if self.valid_mask[i]:
+                p_total += self._it_sum[i]
+
+        if p_total <= 0:
+            # Fallback to uniform if no valid priorities
+            logger.warning("Total priority is 0, falling back to uniform sampling")
+            valid_slots = [i for i in range(self.capacity) if self.valid_mask[i]]
+            return self.rng.sample(valid_slots, batch_size)
+
+        indices = []
+        # Stratified sampling: divide into batch_size segments
+        every_range_len = p_total / batch_size
+
+        for i in range(batch_size):
+            # Sample uniformly within this priority range
+            mass = self.rng.random() * every_range_len + i * every_range_len
+
+            # Find slot index with cumulative sum search
+            idx = self._find_slot_by_cumsum(mass)
+
+            # Ensure we have a valid slot
+            if idx is not None and self.valid_mask[idx]:
+                indices.append(idx)
+            else:
+                # Fallback to random valid slot if something goes wrong
+                valid_slots = [j for j in range(self.capacity) if self.valid_mask[j]]
+                if valid_slots:
+                    indices.append(self.rng.choice(valid_slots))
+
+        return indices
+
+    def _find_slot_by_cumsum(self, target_sum: float) -> Optional[int]:
+        """Find slot index where cumulative sum exceeds target."""
+        cumsum = 0.0
+        for i in range(self.capacity):
+            if self.valid_mask[i]:
+                cumsum += self._it_sum[i]
+                if cumsum >= target_sum:
+                    return i
+        return None
 
     def _sample_proportional(self, batch_size: int, buffer_size: int) -> List[int]:
         """
@@ -548,19 +633,21 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         assert len(indices) == len(priorities), \
             f"Indices and priorities length mismatch: {len(indices)} vs {len(priorities)}"
 
-        buffer_list = list(self.trajectories)
         global_step = current_global_step if current_global_step is not None else self.current_global_step
 
-        for idx, intrinsic_priority in zip(indices, priorities):
-            if not (0 <= idx < len(buffer_list)):
-                logger.warning(f"Invalid index {idx} for buffer size {len(buffer_list)}, skipping")
+        for slot_idx, intrinsic_priority in zip(indices, priorities):
+            if not (0 <= slot_idx < self.capacity) or not self.valid_mask[slot_idx]:
+                logger.warning(f"Invalid slot {slot_idx}, skipping priority update")
                 continue
 
             # Ensure intrinsic priority is positive (add small epsilon)
             intrinsic_priority = max(float(intrinsic_priority), 1e-6)
 
+            # Update stored priority in trajectory
+            self.trajectories[slot_idx].priority = intrinsic_priority
+
             # Compute age-based freshness weight
-            sample_age = global_step - buffer_list[idx].global_step
+            sample_age = global_step - self.trajectories[slot_idx].global_step
             freshness_weight = np.exp(-sample_age / self.age_decay)
 
             # Compute effective priority: intrinsic value × freshness
@@ -568,11 +655,8 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
 
             # Update segment trees with effective_priority^alpha
             priority_alpha = effective_priority ** self.priority_exponent
-            self._it_sum[idx] = priority_alpha
-            self._it_min[idx] = priority_alpha
-
-            # Update trajectory entry intrinsic priority (store raw value for debugging)
-            buffer_list[idx].priority = intrinsic_priority
+            self._it_sum[slot_idx] = priority_alpha
+            self._it_min[slot_idx] = priority_alpha
 
             # Track maximum priority
             self._max_priority = max(self._max_priority, effective_priority)
@@ -593,15 +677,14 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         Returns:
             Effective priority value
         """
-        buffer_list = list(self.trajectories)
-        if not (0 <= idx < len(buffer_list)):
+        if not (0 <= idx < self.capacity) or not self.valid_mask[idx]:
             return 0.0
 
         global_step = current_global_step if current_global_step is not None else self.current_global_step
-        sample_age = global_step - buffer_list[idx].global_step
+        sample_age = global_step - self.trajectories[idx].global_step
         freshness_weight = np.exp(-sample_age / self.age_decay)
 
-        return buffer_list[idx].priority * freshness_weight
+        return self.trajectories[idx].priority * freshness_weight
 
     @staticmethod
     def compute_advantage_priorities(batch: DataProto) -> np.ndarray:
@@ -667,11 +750,15 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             >>> indices, weights = buffer.sample_with_weights(batch_size=128, beta=0.6)
             >>> loss = compute_loss(batch) * torch.from_numpy(weights)
         """
-        buffer_size = len(self.trajectories)
+        buffer_size = self.num_valid
 
-        # Get minimum priority for normalization
-        p_min = self._it_min.min(0, buffer_size)
-        p_total = self._it_sum.sum(0, buffer_size)
+        # Get minimum priority for normalization (only from valid slots)
+        p_min = float('inf')
+        p_total = 0.0
+        for i in range(self.capacity):
+            if self.valid_mask[i]:
+                p_min = min(p_min, self._it_min[i])
+                p_total += self._it_sum[i]
 
         if p_total <= 0:
             # Fallback: uniform weights
@@ -698,8 +785,8 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         """Get comprehensive buffer statistics including priority, age, and freshness information."""
         base_stats = super().get_stats()
 
-        # Fix: Use actual buffer size for correct utilization calculation
-        current_size = len(self.trajectories)
+        # Fix: Use actual valid count for correct utilization calculation
+        current_size = self.num_valid
         base_stats["current_size"] = current_size
         base_stats["utilization"] = current_size / self.capacity if self.capacity > 0 else 0.0
         base_stats["total_evicted"] = max(0, self.total_stored - current_size)  # Number of evicted samples
@@ -707,8 +794,12 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
 
         # Add priority statistics from segment tree
         if current_size > 0:
-            # Extract priorities from segment tree
-            priorities = np.array([self._it_sum[i] for i in range(current_size)])
+            # Extract priorities from segment tree (only valid slots)
+            priorities = []
+            for i in range(self.capacity):
+                if self.valid_mask[i]:
+                    priorities.append(self._it_sum[i])
+            priorities = np.array(priorities)
             base_stats.update({
                 "priority/mean": float(priorities.mean()),
                 "priority/std": float(priorities.std()),
@@ -719,8 +810,12 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
                 "max_priority": self._max_priority,
             })
 
-            # Age distribution statistics
-            ages = np.array([self.current_global_step - traj.global_step for traj in self.trajectories])
+            # Age distribution statistics (only for valid slots)
+            ages = []
+            for i in range(self.capacity):
+                if self.valid_mask[i]:
+                    ages.append(self.current_global_step - self.trajectories[i].global_step)
+            ages = np.array(ages)
             base_stats.update({
                 "age/mean": float(ages.mean()),
                 "age/std": float(ages.std()),
@@ -748,7 +843,11 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             })
 
             # Sample count statistics (how often trajectories have been sampled)
-            sample_counts = np.array([traj.sample_count for traj in self.trajectories])
+            sample_counts = []
+            for i in range(self.capacity):
+                if self.valid_mask[i]:
+                    sample_counts.append(self.trajectories[i].sample_count)
+            sample_counts = np.array(sample_counts)
             if sample_counts.sum() > 0:
                 base_stats.update({
                     "sample_count/mean": float(sample_counts.mean()),
