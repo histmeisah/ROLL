@@ -649,6 +649,7 @@ class AgenticPipeline(BasePipeline):
                             mb = mb.union(ref_log_probs)
 
                             mb.meta_info["is_offload_states"] = False
+                            mb.meta_info["global_step"] = global_step  # FIX: Add global_step for replay batch training
                             # Only compute old_log_probs if not already provided (fallback to actor_train for stability)
                             if "old_log_probs" not in mb.batch:
                                 behavior_old_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(mb, blocking=False)
