@@ -12,6 +12,7 @@ from roll.configs.base_config import BaseConfig
 from roll.configs.worker_config import WorkerConfig
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
 from roll.utils.logging import get_logger
+from roll.pipeline.agentic.hierarchical_config import HierarchicalRLConfig
 
 logger = get_logger()
 
@@ -25,6 +26,29 @@ class RewardNormalizationConfig:
 class LLMProxyConfig:
     proxy_type: str = field(default="policy", metadata={"help": "llm proxy type: [policy, openai, random]."})
     proxy_config: Dict = field(default_factory=dict, metadata={"help": "llm proxy config."})
+
+
+@dataclass
+class VTraceConfig:
+    """
+    Configuration for V-trace advantage estimation.
+    V-trace is an off-policy correction algorithm that uses truncated importance
+    sampling to handle the difference between behavior and target policies.
+    """
+    rho_bar: float = field(
+        default=1.0,
+        metadata={
+            "help": "Truncation threshold for importance sampling ratio ρ (rho). "
+                   "Default 1.0 means truncate to [0, 1]. Higher values allow more off-policy correction."
+        }
+    )
+    c_bar: float = field(
+        default=1.0,
+        metadata={
+            "help": "Truncation threshold for trace coefficient c. "
+                   "Default 1.0 means truncate to [0, 1]. Controls the speed of value function propagation."
+        }
+    )
 
 
 @dataclass
@@ -46,13 +70,6 @@ class OffPolicyMonitorConfig:
     save_behavior_log_probs: bool = field(
         default=True,
         metadata={"help": "Whether to compute and save behavior policy log probs after rollout."}
-    )
-    behavior_scope: Literal["trajectory", "turn"] = field(
-        default="trajectory",
-        metadata={
-            "help": "Scope of log prob computation: 'trajectory' (full response) or 'turn' (only last assistant turn). "
-                   "Always uses actor_train for accuracy."
-        }
     )
 
     # Monitoring frequency
@@ -323,6 +340,11 @@ class AgenticConfig(BaseConfig):
         metadata={"help": "Off-policy monitoring configuration (independent of replay buffer)."}
     )
     replay: ReplayConfig = field(default_factory=ReplayConfig, metadata={"help": "Replay buffer configuration."})
+    vtrace: VTraceConfig = field(default_factory=VTraceConfig, metadata={"help": "V-trace configuration for off-policy correction."})
+    hierarchical: HierarchicalRLConfig = field(
+        default_factory=HierarchicalRLConfig,
+        metadata={"help": "Hierarchical RL configuration (only for StepEnvManager)."}
+    )
 
     # role related
     pretrain: str = field(
@@ -387,8 +409,8 @@ class AgenticConfig(BaseConfig):
     whiten_rewards: bool = field(default=False, metadata={"help": "Whiten the rewards before compute advantages."})
     whiten_advantages: bool = field(default=False, metadata={"help": "Whiten the advantage."})
     advantage_clip: float = field(default=None, metadata={"help": "advantage_clip value"})
-    adv_estimator: Literal["gae", "reinforce", "grpo", "gigpo"] = field(
-        default="gae", metadata={"help": "advantage estimator: gae (GAE)."}
+    adv_estimator: Literal["gae", "reinforce", "grpo", "gigpo", "vtrace"] = field(
+        default="gae", metadata={"help": "advantage estimator: gae (GAE), vtrace (V-trace for off-policy)."}
     )
     reward_norm: Literal["batch", "group", "running", None] = field(
         default=None,

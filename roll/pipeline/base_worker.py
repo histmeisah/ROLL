@@ -287,32 +287,15 @@ class ActorWorker(Worker):
         forward func 接口定义:
             data: DataProto, 由forward_step透传
             output_tensor: torch.Tensor, model.forward()的输出Tensor
+
+        使用response_mask计算log_probs（ROLL原始设计，trajectory模式）
         """
-        # Check if we need to use turn mode
-        old_prob_mode = data.meta_info.get("old_prob_mode", "trajectory")
         response_mask = data.batch["response_mask"]
-        
-        if old_prob_mode in ["step", "turn"] and "prompt_mask" in data.batch:
-            # Turn mode: only compute log probs for the last assistant turn
-            from roll.utils.turn_mode_utils import create_turn_mode_response_mask
-            turn_response_mask, debug_info = create_turn_mode_response_mask(
-                response_mask=response_mask,
-                prompt_mask=data.batch.get("prompt_mask", None),
-                messages_list=data.non_tensor_batch.get("messages_list", None)
-            )
-            # Log debug info if available
-            if hasattr(self, 'logger') and debug_info["num_turns"].float().mean() > 0:
-                self.logger.debug(f"Turn mode: avg turns={debug_info['num_turns'].float().mean():.1f}, "
-                                f"last turn length={debug_info['last_turn_length'].float().mean():.1f}")
-            response_mask_for_log_probs = turn_response_mask
-        else:
-            # Trajectory mode: use original response mask
-            response_mask_for_log_probs = response_mask
-        
+
         log_probs = self.strategy.op_compute_log_probs(
-            logits=output_tensor, input_ids=data.batch["input_ids"], attention_mask=response_mask_for_log_probs
+            logits=output_tensor, input_ids=data.batch["input_ids"], attention_mask=response_mask
         )
-        entropy = self.strategy.op_compute_entropy(logits=output_tensor, attention_mask=response_mask_for_log_probs)
+        entropy = self.strategy.op_compute_entropy(logits=output_tensor, attention_mask=response_mask)
         return log_probs, {"log_probs": log_probs.clone().detach(), "entropy": entropy.clone().detach()}
 
     def loss_func(self, data: DataProto, output_tensor: torch.Tensor):
@@ -327,9 +310,15 @@ class ActorWorker(Worker):
         old_log_probs = data.batch["old_log_probs"]
         advantages = data.batch["advantages"]
 
-        log_probs = self.strategy.op_compute_log_probs(
-            logits=output_tensor, input_ids=data.batch["input_ids"], attention_mask=data.batch["response_mask"]
-        )
+        # Check if log_probs were precomputed (e.g., for V-trace)
+        # This avoids redundant forward pass for advantage estimation algorithms that need log_probs
+        if data.meta_info.get("precomputed_log_probs", False) and "log_probs" in data.batch:
+            log_probs = data.batch["log_probs"]
+            self.logger.debug("Reusing precomputed log_probs in loss_func (avoiding redundant forward pass)")
+        else:
+            log_probs = self.strategy.op_compute_log_probs(
+                logits=output_tensor, input_ids=data.batch["input_ids"], attention_mask=data.batch["response_mask"]
+            )
 
         ratio = (log_probs - old_log_probs).exp()
 

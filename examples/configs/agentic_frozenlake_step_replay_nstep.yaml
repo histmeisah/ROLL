@@ -109,7 +109,6 @@ offpolicy_monitor:
   monitor_interval: 10
   monitor_fresh_batch: false
   monitor_replay_batch: true
-  behavior_scope: trajectory  # trajectory/turn
 
 # ============================================================================
 # Notes

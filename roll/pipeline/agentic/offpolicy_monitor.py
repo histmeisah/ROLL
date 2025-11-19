@@ -16,7 +16,6 @@ logger = get_logger()
 def compute_offpolicy_metrics(
     current_batch: DataProto,
     actor_train_cluster: Any = None,
-    old_prob_mode: str = "trajectory",
     pg_clip: Optional[float] = None,
     training_metrics: Optional[DataProto] = None,
 ) -> Dict[str, float]:
@@ -24,9 +23,9 @@ def compute_offpolicy_metrics(
     Compute off-policy metrics by comparing current policy with behavior policy.
 
     This function provides a unified way to calculate off-policy metrics for any
-    batch sampled from replay buffer, handling both trajectory and turn modes.
+    batch sampled from replay buffer, using trajectory mode (ROLL original design).
 
-    所有指标统一使用 'offpolicy/' 前缀，便于对比不同模式下的结果。
+    所有指标统一使用 'offpolicy/' 前缀，便于监控和调试。
 
     OPTIMIZATION: If training_metrics is provided, it will reuse the log_probs computed
     during training, avoiding redundant forward pass. This is the recommended usage.
@@ -34,7 +33,6 @@ def compute_offpolicy_metrics(
     Args:
         current_batch: DataProto batch containing data from replay buffer
         actor_train_cluster: Actor cluster for computing current policy log probs (optional if training_metrics provided)
-        old_prob_mode: Mode for old probability calculation ("trajectory" or "turn")
         pg_clip: Clipping threshold for PPO-style ratio clipping analysis
         training_metrics: Optional DataProto from train_step containing pre-computed log_probs
 
@@ -84,8 +82,6 @@ def compute_offpolicy_metrics(
                 return metrics
 
             logger.debug("compute_offpolicy_metrics: Computing current log_probs via forward pass (fallback)")
-            # Set old_prob_mode in meta_info for compute_log_probs
-            current_batch.meta_info["old_prob_mode"] = old_prob_mode
 
             import ray
             current_lp_refs = actor_train_cluster.compute_log_probs(current_batch, blocking=False)
@@ -124,63 +120,108 @@ def compute_offpolicy_metrics(
 
         # Compute off-policy statistics
         log_ratio = valid_current - valid_behavior
-        ratio = log_ratio.exp()
+        ratio = log_ratio.exp()  # This is the importance weight
 
-        # Basic statistics
-        metrics["offpolicy/log_ratio/mean"] = log_ratio.mean().detach().item()
-        metrics["offpolicy/log_ratio/std"] = log_ratio.std().detach().item()
-        metrics["offpolicy/log_ratio/max"] = log_ratio.max().detach().item()
-        metrics["offpolicy/log_ratio/min"] = log_ratio.min().detach().item()
+        # ========== Core Distribution Statistics ==========
+        # Token-level importance weight statistics (for alignment with training)
+        metrics["offpolicy/importance_weight/mean"] = ratio.mean().detach().item()
+        metrics["offpolicy/importance_weight/std"] = ratio.std().detach().item()
+        metrics["offpolicy/importance_weight/median"] = ratio.median().detach().item()
+        metrics["offpolicy/importance_weight/max"] = ratio.max().detach().item()
+        metrics["offpolicy/importance_weight/min"] = ratio.min().detach().item()
 
-        metrics["offpolicy/ratio/mean"] = ratio.mean().detach().item()
-        metrics["offpolicy/ratio/std"] = ratio.std().detach().item()
-        metrics["offpolicy/ratio/max"] = ratio.max().detach().item()
-        metrics["offpolicy/ratio/min"] = ratio.min().detach().item()
-        metrics["offpolicy/ratio/median"] = ratio.median().detach().item()
+        # Sample-level statistics (for alignment with filtering)
+        # Compute per-sample mean ratio (same as filter uses)
+        # First reshape ratio back to [batch_size, seq_len] from flattened valid tokens
+        batch_size = response_mask.shape[0]
+        seq_len = response_mask.shape[1]
 
-        # Percentile statistics for distribution analysis
+        # Create a full ratio tensor and fill in the valid positions
+        full_ratio = torch.zeros(batch_size, seq_len, device=ratio.device, dtype=ratio.dtype)
+        full_ratio[response_mask] = ratio
+
+        # Now compute per-sample mean
+        valid_tokens_per_sample = response_mask.sum(dim=1).clamp(min=1)  # [batch_size]
+        sample_ratio = (full_ratio * response_mask).sum(dim=1) / valid_tokens_per_sample
+
+        metrics["offpolicy/sample_importance_weight/mean"] = sample_ratio.mean().detach().item()
+        metrics["offpolicy/sample_importance_weight/std"] = sample_ratio.std().detach().item()
+        metrics["offpolicy/sample_importance_weight/median"] = sample_ratio.median().detach().item()
+        metrics["offpolicy/sample_importance_weight/max"] = sample_ratio.max().detach().item()
+        metrics["offpolicy/sample_importance_weight/min"] = sample_ratio.min().detach().item()
+
+        # Percentile statistics for token-level
         if ratio.numel() > 0:
-            metrics["offpolicy/ratio/p95"] = torch.quantile(ratio, 0.95).detach().item()
-            metrics["offpolicy/ratio/p05"] = torch.quantile(ratio, 0.05).detach().item()
-            metrics["offpolicy/ratio/p99"] = torch.quantile(ratio, 0.99).detach().item()
+            metrics["offpolicy/importance_weight/percentile_05"] = torch.quantile(ratio, 0.05).detach().item()
+            metrics["offpolicy/importance_weight/percentile_25"] = torch.quantile(ratio, 0.25).detach().item()
+            metrics["offpolicy/importance_weight/percentile_75"] = torch.quantile(ratio, 0.75).detach().item()
+            metrics["offpolicy/importance_weight/percentile_95"] = torch.quantile(ratio, 0.95).detach().item()
+            metrics["offpolicy/importance_weight/percentile_99"] = torch.quantile(ratio, 0.99).detach().item()
 
-        # PPO clipping analysis
+        # Percentile statistics for sample-level
+        if sample_ratio.numel() > 0:
+            metrics["offpolicy/sample_importance_weight/percentile_05"] = torch.quantile(sample_ratio, 0.05).detach().item()
+            metrics["offpolicy/sample_importance_weight/percentile_25"] = torch.quantile(sample_ratio, 0.25).detach().item()
+            metrics["offpolicy/sample_importance_weight/percentile_75"] = torch.quantile(sample_ratio, 0.75).detach().item()
+            metrics["offpolicy/sample_importance_weight/percentile_95"] = torch.quantile(sample_ratio, 0.95).detach().item()
+            metrics["offpolicy/sample_importance_weight/percentile_99"] = torch.quantile(sample_ratio, 0.99).detach().item()
+
+        # ========== Intuitive Fraction Statistics ==========
+        # Token-level fractions
+        metrics["offpolicy/fraction_near_one"] = ((ratio >= 0.9) & (ratio <= 1.1)).float().mean().detach().item()
+        metrics["offpolicy/fraction_below_half"] = (ratio < 0.5).float().mean().detach().item()
+        metrics["offpolicy/fraction_above_double"] = (ratio > 2.0).float().mean().detach().item()
+
+        # Sample-level fractions (important for filter alignment)
+        metrics["offpolicy/sample_fraction_near_one"] = ((sample_ratio >= 0.9) & (sample_ratio <= 1.1)).float().mean().detach().item()
+        metrics["offpolicy/sample_fraction_below_half"] = (sample_ratio < 0.5).float().mean().detach().item()
+        metrics["offpolicy/sample_fraction_above_double"] = (sample_ratio > 2.0).float().mean().detach().item()
+
+        # Sample-level filter prediction (if ratio_clip_max is provided)
+        if pg_clip is not None and hasattr(pg_clip, '__float__'):  # Check if pg_clip is actually ratio_clip_max
+            # Note: pg_clip is for PPO, but we might want to track filter threshold separately
+            pass
+
+        # PPO clipping analysis with clearer naming
         if pg_clip is not None and pg_clip > 0:
             clip_low = 1 - pg_clip
             clip_high = 1 + pg_clip
-            clipped = (ratio < clip_low) | (ratio > clip_high)
-            clip_frac = clipped.float().mean().detach().item()
-            metrics["offpolicy/ratio/clip_frac"] = clip_frac
-            metrics["offpolicy/ratio/clip_threshold"] = pg_clip
+            in_clip_range = (ratio >= clip_low) & (ratio <= clip_high)
+            metrics["offpolicy/fraction_in_ppo_clip_range"] = in_clip_range.float().mean().detach().item()
+            metrics["offpolicy/ppo_clip_threshold"] = pg_clip
+            # Also keep track of how many would be clipped
+            metrics["offpolicy/fraction_outside_ppo_clip_range"] = (~in_clip_range).float().mean().detach().item()
 
-        # Effective sample size (ESS) - important for importance sampling
+        # ========== ESS and KL Divergence ==========
+        # Effective sample size (with clearer naming)
         # ESS = (sum(w))^2 / sum(w^2) where w = ratio
         ess = (ratio.sum() ** 2) / (ratio ** 2).sum()
         ess_ratio = ess / ratio.numel()  # Normalized by batch size
-        metrics["offpolicy/ess"] = ess.detach().item()
-        metrics["offpolicy/ess_ratio"] = ess_ratio.detach().item()
+        metrics["offpolicy/effective_sample_size"] = ess.detach().item()
+        metrics["offpolicy/effective_sample_size_ratio"] = ess_ratio.detach().item()
 
         # KL divergence approximation: E[log(p/q)] = E[log(ratio)]
         kl_approx = log_ratio.mean().detach().item()
-        metrics["offpolicy/kl_divergence"] = kl_approx
+        metrics["offpolicy/approx_kl_divergence"] = kl_approx
 
-        # Count of extreme ratios (potential instability indicators)
-        extreme_low = (ratio < 0.5).float().mean().detach().item()
-        extreme_high = (ratio > 2.0).float().mean().detach().item()
-        metrics["offpolicy/ratio/extreme_low_frac"] = extreme_low
-        metrics["offpolicy/ratio/extreme_high_frac"] = extreme_high
+        # ========== Token Statistics ==========
+        metrics["offpolicy/valid_token_count"] = valid_current.numel()
+        metrics["offpolicy/total_token_count"] = response_mask.numel()
+        metrics["offpolicy/token_mask_rate"] = valid_current.numel() / max(response_mask.numel(), 1)
 
-        # Token count for context
-        metrics["offpolicy/valid_tokens"] = valid_current.numel()
-        metrics["offpolicy/total_tokens"] = response_mask.numel()
-        metrics["offpolicy/mask_rate"] = valid_current.numel() / max(response_mask.numel(), 1)
+        # ========== Store raw distribution for histogram ==========
+        # Store the raw tensor for wandb histogram logging
+        # This will be extracted and logged separately, not as a scalar metric
+        metrics["_raw_importance_weights"] = ratio.detach().cpu()  # Token-level
+        metrics["_raw_log_importance_weights"] = log_ratio.detach().cpu()  # Token-level
+        metrics["_raw_sample_importance_weights"] = sample_ratio.detach().cpu()  # Sample-level
 
         # Add flag indicating whether log_probs were reused
         metrics["offpolicy/reused_log_probs"] = 1.0 if training_metrics is not None else 0.0
 
         logger.debug(
             f"Off-policy metrics computed successfully: "
-            f"ratio_mean={metrics['offpolicy/ratio/mean']:.3f}, "
+            f"iw_mean={metrics['offpolicy/importance_weight/mean']:.3f}, "
             f"kl={kl_approx:.3f}, "
             f"ess_ratio={ess_ratio:.3f}, "
             f"reused_log_probs={metrics['offpolicy/reused_log_probs']}"

@@ -19,6 +19,8 @@ from roll.configs.model_args import ModelArguments
 from roll.pipeline.agentic.agentic_config import AgenticConfig
 from roll.pipeline.agentic.utils import (dump_rollout_render, compute_discounted_returns,
                                          compute_response_level_rewards)
+from roll.pipeline.agentic.hierarchical_config import validate_hierarchical_config
+from roll.pipeline.agentic.hierarchical_computer import HierarchicalAdvantageComputer
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.utils.functionals import (
     apply_kl_penalty,
@@ -68,6 +70,23 @@ class AgenticPipeline(BasePipeline):
             kl_horizon=self.pipeline_config.kl_horizon,
         )
 
+        # Validate and initialize Hierarchical RL if enabled
+        if self.pipeline_config.hierarchical.enabled:
+            validate_hierarchical_config(
+                self.pipeline_config.hierarchical,
+                self.pipeline_config
+            )
+            self.hierarchical_computer = HierarchicalAdvantageComputer(
+                self.pipeline_config.hierarchical
+            )
+            self.logger.info(
+                f"Hierarchical RL enabled: "
+                f"step_estimator={self.pipeline_config.hierarchical.step_level_estimator}, "
+                f"token_estimator={self.pipeline_config.hierarchical.token_level_estimator}"
+            )
+        else:
+            self.hierarchical_computer = None
+
         self.actor_train: Any = Cluster(
             name=self.pipeline_config.actor_train.name,
             worker_cls=self.pipeline_config.actor_train.worker_cls,
@@ -86,7 +105,8 @@ class AgenticPipeline(BasePipeline):
             resource_manager=self.resource_manager,
             worker_config=self.pipeline_config.reference,
         )
-        if self.pipeline_config.adv_estimator == "gae":
+        # Create critic for both GAE and V-trace (both need value function)
+        if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
             self.critic: Any = Cluster(
                 name=self.pipeline_config.critic.name,
                 worker_cls=self.pipeline_config.critic.worker_cls,
@@ -123,7 +143,7 @@ class AgenticPipeline(BasePipeline):
         ])
         refs: List[ray.ObjectRef] = []
         refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
-        if self.pipeline_config.adv_estimator == "gae":
+        if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
             refs.extend(self.critic.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
 
@@ -136,7 +156,7 @@ class AgenticPipeline(BasePipeline):
             frequency=self.pipeline_config.actor_train.model_update_frequency,
         )
 
-        if self.pipeline_config.adv_estimator == "gae":
+        if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
             self.set_checkpoint_clusters(self.actor_train, self.critic)
         else:
             self.set_checkpoint_clusters(self.actor_train)
@@ -206,7 +226,7 @@ class AgenticPipeline(BasePipeline):
             logger.info(f"pipeline rollout global step {global_step} start...")
             metrics = {}
             with tps_timer:
-                if self.pipeline_config.adv_estimator == "gae":
+                if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
                     self.critic.offload_states(blocking=True)
                 self.actor_train.offload_states(blocking=True)
 
@@ -234,7 +254,7 @@ class AgenticPipeline(BasePipeline):
                     with Timer(name="behavior_log_probs", logger=None) as behavior_timer:
                         batch = self._compute_and_attach_behavior_log_probs(batch)
                     metrics["time/behavior_log_probs"] = behavior_timer.last
-                    logger.debug(f"Computed behavior log probs for off-policy monitoring (scope={self.pipeline_config.offpolicy_monitor.behavior_scope})")
+                    logger.debug("Computed behavior log probs for off-policy monitoring")
 
                 batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
 
@@ -262,8 +282,6 @@ class AgenticPipeline(BasePipeline):
                 # 当启用 replay 时，下方 off-policy 训练路径会对采样批次重新计算 log_probs/adv。
                 # 为避免重复计算，这里仅在 off-policy 关闭时计算。
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
-                    # Use behavior scope from offpolicy_monitor config
-                    batch.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
                     ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(batch, blocking=False)
                     ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
                     ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
@@ -283,8 +301,6 @@ class AgenticPipeline(BasePipeline):
                     from_replay_buffer = batch.meta_info.get("from_replay_buffer", False)
 
                     batch.meta_info["is_offload_states"] = False
-                    batch.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
-
                     # Check if we can reuse behavior_log_probs as old_log_probs
                     if not from_replay_buffer and "behavior_log_probs" in batch.batch:
                         # ✨ Fresh batch with behavior_log_probs already computed
@@ -404,17 +420,98 @@ class AgenticPipeline(BasePipeline):
                     except Exception:
                         pass
 
-                    # Is the advantage calculated globally across the batch, or within each group?
-                    batch = compute_advantage(
-                        data=batch,
-                        gamma=self.pipeline_config.gamma,
-                        lambd=self.pipeline_config.lambd,
-                        adv_estimator=self.pipeline_config.adv_estimator,
-                        advantage_clip=self.pipeline_config.advantage_clip,
-                        whiten_advantages=self.pipeline_config.whiten_advantages,
-                        whiten_rewards=self.pipeline_config.whiten_rewards,
-                    )
-                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                    # V-trace: Compute current policy log_probs for advantage computation
+                    # Note: V-trace requires TWO forward passes (this is standard in all implementations):
+                    #   1. Here (no_grad): Compute log_probs for importance sampling in advantage
+                    #   2. In loss_func (with_grad): Recompute for policy gradient update
+                    # This matches IMPALA/RLlib implementation: advantages must not backprop to policy
+                    if self.pipeline_config.adv_estimator == "vtrace":
+                        with Timer(name="vtrace_current_log_probs", logger=None) as vtrace_timer:
+                            # Compute current policy log_probs (will be detached for advantage)
+                            current_lp_refs = self.actor_train.compute_log_probs(batch, blocking=False)
+                            current_lp_data = DataProto.materialize_concat(data_refs=current_lp_refs)
+
+                            if "log_probs" in current_lp_data.batch:
+                                batch.batch["log_probs"] = current_lp_data.batch["log_probs"]
+                                logger.debug("Computed current log_probs for V-trace (detached, for advantage only)")
+                            else:
+                                raise ValueError("Failed to compute current policy log_probs for V-trace")
+
+                        metrics["time/vtrace_current_log_probs"] = vtrace_timer.last
+
+                        # V-trace: Compute critic values for TD-error computation
+                        with Timer(name="vtrace_values", logger=None) as vtrace_values_timer:
+                            values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
+                            values = DataProto.materialize_concat(data_refs=values_refs)
+                            # CRITICAL FIX: Preserve non_tensor_batch during values union operation
+                            preserved_non_tensor_batch = batch.non_tensor_batch
+                            batch = batch.union(values)
+                            batch.non_tensor_batch = preserved_non_tensor_batch
+                            metrics.update(reduce_metrics(values.meta_info.pop("metrics", {})))
+                            logger.debug("Computed critic values for V-trace TD-error computation")
+
+                        metrics["time/vtrace_values"] = vtrace_values_timer.last
+
+                        # Pass V-trace parameters to meta_info
+                        if hasattr(self.pipeline_config, 'vtrace'):
+                            batch.meta_info["vtrace_rho_bar"] = self.pipeline_config.vtrace.rho_bar
+                            batch.meta_info["vtrace_c_bar"] = self.pipeline_config.vtrace.c_bar
+                            logger.debug(f"V-trace params: rho_bar={self.pipeline_config.vtrace.rho_bar}, c_bar={self.pipeline_config.vtrace.c_bar}")
+
+                    # Compute advantages using hierarchical RL or standard method
+                    if self.hierarchical_computer is not None:
+                        # Hierarchical RL: Use two-level advantage computation
+                        # Extract environment rewards (step-level)
+                        env_rewards = batch.batch.get("response_level_rewards", None)
+                        if env_rewards is None:
+                            raise ValueError("Hierarchical RL requires response_level_rewards (env rewards)")
+
+                        # Get token values from critic
+                        token_values = batch.batch.get("values", None)
+                        if token_values is None:
+                            raise ValueError("Hierarchical RL requires values from critic")
+
+                        response_mask = batch.batch["response_mask"][:, 1:]  # Exclude first token
+
+                        # Store original token rewards for mixing if needed
+                        original_token_rewards = batch.batch.get("token_level_rewards", None)
+
+                        # Compute hierarchical advantages
+                        hier_results = self.hierarchical_computer.compute(
+                            env_rewards=env_rewards,
+                            token_values=token_values,
+                            response_masks=response_mask,
+                            original_token_rewards=original_token_rewards
+                        )
+
+                        # Replace batch data with hierarchical results
+                        batch.batch["advantages"] = hier_results["token_advantages"]
+                        batch.batch["returns"] = hier_results["token_returns"]
+
+                        # Store step-level results for monitoring
+                        batch.batch["step_values"] = hier_results["step_values"]
+                        batch.batch["step_returns"] = hier_results["step_returns"]
+
+                        # Update metrics
+                        metrics.update(hier_results["metrics"])
+
+                        self.logger.debug(
+                            f"Hierarchical advantages computed: "
+                            f"token_adv_mean={hier_results['token_advantages'].mean():.4f}"
+                        )
+
+                    else:
+                        # Standard advantage computation
+                        batch = compute_advantage(
+                            data=batch,
+                            gamma=self.pipeline_config.gamma,
+                            lambd=self.pipeline_config.lambd,
+                            adv_estimator=self.pipeline_config.adv_estimator,
+                            advantage_clip=self.pipeline_config.advantage_clip,
+                            whiten_advantages=self.pipeline_config.whiten_advantages,
+                            whiten_rewards=self.pipeline_config.whiten_rewards,
+                        )
+                        metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
 
                     # Debug diagnostics to verify non-zero signals
                     try:
@@ -436,7 +533,7 @@ class AgenticPipeline(BasePipeline):
                 metrics["time/adv"] = timer.last
 
                 # Main training step on the current batch (always run)
-                if self.pipeline_config.adv_estimator == "gae":
+                if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
                     critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
                 if self.pipeline_config.critic_warmup <= global_step:
@@ -492,11 +589,26 @@ class AgenticPipeline(BasePipeline):
                         fresh_offpolicy_metrics = compute_offpolicy_metrics(
                             current_batch=batch,
                             actor_train_cluster=None,  # ✨ Not needed - reusing training_metrics
-                            old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
                             pg_clip=self.pipeline_config.pg_clip,
                             training_metrics=actor_train_metrics  # ✨ Reuse log_probs from training!
                         )
+
+                        # Extract raw distribution data for histogram logging
+                        raw_iw = fresh_offpolicy_metrics.pop("_raw_importance_weights", None)
+                        raw_log_iw = fresh_offpolicy_metrics.pop("_raw_log_importance_weights", None)
+                        raw_sample_iw = fresh_offpolicy_metrics.pop("_raw_sample_importance_weights", None)
+
+                        # Add scalar metrics
                         metrics.update(fresh_offpolicy_metrics)
+
+                        # Store histogram data for later logging (can't add to metrics due to JSON serialization)
+                        if raw_iw is not None and self.tracker.__class__.__name__ == "WandbTracker":
+                            if not hasattr(self, '_histogram_cache'):
+                                self._histogram_cache = {}
+                            self._histogram_cache['fresh_iw'] = raw_iw
+                            self._histogram_cache['fresh_log_iw'] = raw_log_iw
+                            if raw_sample_iw is not None:
+                                self._histogram_cache['fresh_sample_iw'] = raw_sample_iw
 
                         # Log diagnostics if needed
                         if global_step % self.pipeline_config.logging_steps == 0 and fresh_offpolicy_metrics:
@@ -507,13 +619,14 @@ class AgenticPipeline(BasePipeline):
                                 logger_func=logger.debug
                             )
 
-                if self.pipeline_config.adv_estimator == "gae":
+                if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
                     critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
                     metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
 
                 # ✨ CRITICAL FIX: Store fresh batch to replay buffer AFTER training
                 # This ensures we store the log_probs computed during training
                 if self.pipeline_config.replay.enabled and self.pipeline_config.critic_warmup <= global_step:
+                    logger.info(f"[REPLAY DEBUG] Adding fresh batch to replay buffer at step {global_step}")
                     # Attach training log_probs to batch before storing
                     if actor_train_metrics.batch is not None and "log_probs" in actor_train_metrics.batch:
                         batch.batch["behavior_log_probs"] = actor_train_metrics.batch["log_probs"]
@@ -524,6 +637,7 @@ class AgenticPipeline(BasePipeline):
 
                 # Optionally perform additional replay buffer training steps
                 if self.pipeline_config.replay.enabled:
+                    logger.info(f"[REPLAY DEBUG] Checking replay training at step {global_step}")
                     rb_cfg = self.pipeline_config.replay
 
                     # Only proceed when buffer ready
@@ -531,6 +645,8 @@ class AgenticPipeline(BasePipeline):
                     training_batch_size = (
                         self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
                     )
+                    buffer_size = self.replay_buffer.num_valid if hasattr(self.replay_buffer, 'num_valid') else 0
+                    logger.info(f"[REPLAY DEBUG] Buffer size: {buffer_size}, required: {training_batch_size}, can_sample: {self.replay_buffer.can_sample(batch_size=training_batch_size)}")
                     if self.replay_buffer.can_sample(batch_size=training_batch_size):
 
                         all_actor_refs: List[ray.ObjectRef] = []
@@ -545,6 +661,9 @@ class AgenticPipeline(BasePipeline):
                                            rb_cfg.enable_offpolicy_filter and
                                            hasattr(rb_cfg, 'ratio_clip_max') and
                                            rb_cfg.ratio_clip_max is not None)
+                            logger.info(f"[FILTER DEBUG] step_idx={step_idx}, enable_filter={enable_filter}, "
+                                      f"offpolicy_filter={getattr(rb_cfg, 'enable_offpolicy_filter', False)}, "
+                                      f"ratio_clip_max={getattr(rb_cfg, 'ratio_clip_max', None)}")
 
                             if enable_filter:
                                 # === NEW: Mini-batch filtering with early stopping ===
@@ -642,7 +761,6 @@ class AgenticPipeline(BasePipeline):
                                 all_batches.append(mb)
 
                             # Compute ref/old log_probs and advantages for replay mb
-                            mb.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
                             ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(mb, blocking=False)
                             ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
                             ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
@@ -686,8 +804,18 @@ class AgenticPipeline(BasePipeline):
                                 use_nstep_returns=use_nstep_replay
                             )
 
-                            # CRITICAL FIX: Compute values for GAE mode on replay batch
-                            if self.pipeline_config.adv_estimator == "gae":
+                            # V-trace: Compute current policy log_probs for replay batch
+                            if self.pipeline_config.adv_estimator == "vtrace":
+                                current_lp_refs = self.actor_train.compute_log_probs(mb, blocking=False)
+                                current_lp_data = DataProto.materialize_concat(data_refs=current_lp_refs)
+                                if "log_probs" in current_lp_data.batch:
+                                    mb.batch["log_probs"] = current_lp_data.batch["log_probs"]
+                                    logger.debug("Computed current log_probs for V-trace (replay batch)")
+                                else:
+                                    raise ValueError("Failed to compute current policy log_probs for V-trace (replay batch)")
+
+                            # CRITICAL FIX: Compute values for GAE/V-trace mode or hierarchical RL on replay batch
+                            if self.pipeline_config.adv_estimator in ["gae", "vtrace"] or self.hierarchical_computer is not None:
                                 values_refs: List[ray.ObjectRef] = self.critic.compute_values(mb, blocking=False)
                                 values = DataProto.materialize_concat(data_refs=values_refs)
                                 preserved_non_tensor_batch = mb.non_tensor_batch
@@ -695,15 +823,45 @@ class AgenticPipeline(BasePipeline):
                                 mb.non_tensor_batch = preserved_non_tensor_batch
                                 metrics.update(reduce_metrics(values.meta_info.pop("metrics", {})))
 
-                            mb = compute_advantage(
-                                data=mb,
-                                gamma=self.pipeline_config.gamma,
-                                lambd=self.pipeline_config.lambd,
-                                adv_estimator=self.pipeline_config.adv_estimator,
-                                advantage_clip=self.pipeline_config.advantage_clip,
-                                whiten_advantages=self.pipeline_config.whiten_advantages,
-                                whiten_rewards=self.pipeline_config.whiten_rewards,
-                            )
+                            # Compute advantages using hierarchical RL or standard method (replay batch)
+                            if self.hierarchical_computer is not None:
+                                # Hierarchical RL for replay batch
+                                env_rewards = mb.batch.get("response_level_rewards", None)
+                                if env_rewards is None:
+                                    raise ValueError("Hierarchical RL requires response_level_rewards (env rewards)")
+
+                                token_values = mb.batch.get("values", None)
+                                if token_values is None:
+                                    raise ValueError("Hierarchical RL requires values from critic")
+
+                                response_mask = mb.batch["response_mask"][:, 1:]
+                                original_token_rewards = mb.batch.get("token_level_rewards", None)
+
+                                hier_results = self.hierarchical_computer.compute(
+                                    env_rewards=env_rewards,
+                                    token_values=token_values,
+                                    response_masks=response_mask,
+                                    original_token_rewards=original_token_rewards
+                                )
+
+                                mb.batch["advantages"] = hier_results["token_advantages"]
+                                mb.batch["returns"] = hier_results["token_returns"]
+                                mb.batch["step_values"] = hier_results["step_values"]
+                                mb.batch["step_returns"] = hier_results["step_returns"]
+
+                                metrics.update(hier_results["metrics"])
+
+                            else:
+                                # Standard advantage computation for replay batch
+                                mb = compute_advantage(
+                                    data=mb,
+                                    gamma=self.pipeline_config.gamma,
+                                    lambd=self.pipeline_config.lambd,
+                                    adv_estimator=self.pipeline_config.adv_estimator,
+                                    advantage_clip=self.pipeline_config.advantage_clip,
+                                    whiten_advantages=self.pipeline_config.whiten_advantages,
+                                    whiten_rewards=self.pipeline_config.whiten_rewards,
+                                )
 
                             # CRITICAL FIX: Apply adjust_batch to replay samples to ensure batch size compatibility
                             # Replay buffer may return smaller batches that need to be adjusted for training
@@ -711,7 +869,7 @@ class AgenticPipeline(BasePipeline):
                             metrics.update(reduce_metrics(mb.meta_info.pop("metrics", {})))
 
                             # Training step
-                            if self.pipeline_config.adv_estimator == "gae":
+                            if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
                                 critic_refs = self.critic.train_step(mb, blocking=False)
                                 all_critic_refs.extend(critic_refs)
                             if self.pipeline_config.critic_warmup <= global_step:
@@ -734,11 +892,26 @@ class AgenticPipeline(BasePipeline):
                                     replay_offpolicy_metrics = compute_offpolicy_metrics(
                                         current_batch=mb,
                                         actor_train_cluster=None,  # Not needed when training_metrics provided
-                                        old_prob_mode=self.pipeline_config.offpolicy_monitor.behavior_scope,
                                         pg_clip=self.pipeline_config.pg_clip,
                                         training_metrics=actor_train_metrics  # ✨ Reuse log_probs!
                                     )
+
+                                    # Extract raw distribution data for histogram logging
+                                    raw_iw = replay_offpolicy_metrics.pop("_raw_importance_weights", None)
+                                    raw_log_iw = replay_offpolicy_metrics.pop("_raw_log_importance_weights", None)
+                                    raw_sample_iw = replay_offpolicy_metrics.pop("_raw_sample_importance_weights", None)
+
+                                    # Add scalar metrics
                                     metrics.update(replay_offpolicy_metrics)
+
+                                    # Store histogram data for later logging (can't add to metrics due to JSON serialization)
+                                    if raw_iw is not None and self.tracker.__class__.__name__ == "WandbTracker":
+                                        if not hasattr(self, '_histogram_cache'):
+                                            self._histogram_cache = {}
+                                        self._histogram_cache['replay_iw'] = raw_iw
+                                        self._histogram_cache['replay_log_iw'] = raw_log_iw
+                                        if raw_sample_iw is not None:
+                                            self._histogram_cache['replay_sample_iw'] = raw_sample_iw
 
                                     # Log diagnostics
                                     if global_step % self.pipeline_config.logging_steps == 0 and replay_offpolicy_metrics:
@@ -784,7 +957,7 @@ class AgenticPipeline(BasePipeline):
                                     global_step=global_step
                                 )
 
-                        if all_critic_refs and self.pipeline_config.adv_estimator == "gae":
+                        if all_critic_refs and self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
                             critic_metrics = DataProto.materialize_concat(data_refs=all_critic_refs)
                             metrics.update(reduce_metrics(critic_metrics.meta_info.pop("metrics", {})))
 
@@ -814,7 +987,76 @@ class AgenticPipeline(BasePipeline):
 
             self.do_checkpoint(global_step=global_step)
 
+            # Log scalar metrics
             self.tracker.log(values=metrics, step=global_step)
+
+            # Log histograms separately if using wandb (they can't be in metrics dict due to JSON serialization)
+            if self.tracker.__class__.__name__ == "WandbTracker" and hasattr(self, '_histogram_cache'):
+                try:
+                    import wandb
+                    histogram_metrics = {}
+
+                    # Helper function to safely convert tensor to numpy
+                    def tensor_to_numpy(tensor):
+                        """Safely convert tensor to numpy array"""
+                        if hasattr(tensor, 'cpu'):
+                            return tensor.cpu().numpy()
+                        elif hasattr(tensor, 'numpy'):
+                            return tensor.numpy()
+                        else:
+                            return np.array(tensor)
+
+                    # Fresh batch histograms
+                    if 'fresh_iw' in self._histogram_cache:
+                        data = tensor_to_numpy(self._histogram_cache['fresh_iw'])
+                        histogram_metrics["offpolicy/fresh_importance_weight_histogram"] = wandb.Histogram(data)
+                        logger.info(f"[HISTOGRAM] Created fresh_iw histogram: shape={data.shape}, "
+                                  f"min={data.min():.3f}, max={data.max():.3f}, mean={data.mean():.3f}")
+
+                    if 'fresh_log_iw' in self._histogram_cache:
+                        data = tensor_to_numpy(self._histogram_cache['fresh_log_iw'])
+                        histogram_metrics["offpolicy/fresh_log_importance_weight_histogram"] = wandb.Histogram(data)
+                        logger.info(f"[HISTOGRAM] Created fresh_log_iw histogram: shape={data.shape}")
+
+                    if 'fresh_sample_iw' in self._histogram_cache:
+                        data = tensor_to_numpy(self._histogram_cache['fresh_sample_iw'])
+                        histogram_metrics["offpolicy/fresh_sample_importance_weight_histogram"] = wandb.Histogram(data)
+                        logger.info(f"[HISTOGRAM] Created fresh_sample_iw histogram: shape={data.shape}, "
+                                  f"min={data.min():.3f}, max={data.max():.3f}, mean={data.mean():.3f}")
+
+                    # Replay batch histograms
+                    if 'replay_iw' in self._histogram_cache:
+                        data = tensor_to_numpy(self._histogram_cache['replay_iw'])
+                        histogram_metrics["offpolicy/replay_importance_weight_histogram"] = wandb.Histogram(data)
+                        logger.info(f"[HISTOGRAM] Created replay_iw histogram: shape={data.shape}, "
+                                  f"min={data.min():.3f}, max={data.max():.3f}, mean={data.mean():.3f}")
+
+                    if 'replay_log_iw' in self._histogram_cache:
+                        data = tensor_to_numpy(self._histogram_cache['replay_log_iw'])
+                        histogram_metrics["offpolicy/replay_log_importance_weight_histogram"] = wandb.Histogram(data)
+                        logger.info(f"[HISTOGRAM] Created replay_log_iw histogram: shape={data.shape}")
+
+                    if 'replay_sample_iw' in self._histogram_cache:
+                        data = tensor_to_numpy(self._histogram_cache['replay_sample_iw'])
+                        histogram_metrics["offpolicy/replay_sample_importance_weight_histogram"] = wandb.Histogram(data)
+                        logger.info(f"[HISTOGRAM] Created replay_sample_iw histogram: shape={data.shape}, "
+                                  f"min={data.min():.3f}, max={data.max():.3f}, mean={data.mean():.3f}")
+
+                    # Log histograms separately
+                    if histogram_metrics:
+                        logger.info(f"[HISTOGRAM] Logging {len(histogram_metrics)} histograms to wandb at step {global_step}")
+                        self.tracker.log(values=histogram_metrics, step=global_step)
+                        logger.info(f"[HISTOGRAM] Successfully logged histograms to wandb")
+                    else:
+                        logger.debug(f"[HISTOGRAM] No histogram data to log at step {global_step}")
+
+                    # Clear cache for next step
+                    self._histogram_cache.clear()
+
+                except ImportError as e:
+                    logger.error(f"Failed to import wandb for histogram logging: {e}")
+                except Exception as e:
+                    logger.error(f"Failed to log histograms to wandb: {e}", exc_info=True)
 
             if global_step % self.pipeline_config.logging_steps == 0:
                 if int(os.environ.get("RAY_PROFILING", "0")):
@@ -916,7 +1158,7 @@ class AgenticPipeline(BasePipeline):
         ref_infer_bsz = self.pipeline_config.reference.infer_batch_size * self.reference.dp_size
         critic_train_bsz = 1
         critic_infer_bsz = 1
-        if self.pipeline_config.adv_estimator == "gae":
+        if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
             critic_train_bsz = self.pipeline_config.critic.training_args.per_device_train_batch_size * self.pipeline_config.critic.training_args.gradient_accumulation_steps * self.critic.dp_size
             critic_infer_bsz = self.pipeline_config.critic.infer_batch_size * self.critic.dp_size
 
@@ -1074,19 +1316,15 @@ class AgenticPipeline(BasePipeline):
         Returns:
             batch with behavior_log_probs attached
         """
-        cfg = self.pipeline_config.offpolicy_monitor
-
         try:
-            # Set behavior scope (trajectory or turn)
-            batch.meta_info["old_prob_mode"] = cfg.behavior_scope
-
             # Compute log probs using actor_train (most accurate and reliable)
+            # Uses trajectory mode (ROLL original design)
             behavior_refs = self.actor_train.compute_log_probs(batch, blocking=False)
             behavior = DataProto.materialize_concat(data_refs=behavior_refs)
 
             if behavior.batch is not None and "log_probs" in behavior.batch:
                 batch.batch["behavior_log_probs"] = behavior.batch["log_probs"]
-                logger.debug(f"Computed behavior_log_probs using actor_train (scope={cfg.behavior_scope})")
+                logger.debug("Computed behavior_log_probs using actor_train")
             else:
                 logger.warning("Failed to compute behavior_log_probs: no log_probs in result")
 
@@ -1104,10 +1342,6 @@ class AgenticPipeline(BasePipeline):
         This method only handles the storage logic.
         """
         try:
-            # Store metadata about behavior policy configuration
-            # Note: behavior_compute removed - always using trainer mode (actor_train) for accuracy
-            fresh_batch.meta_info["behavior_scope"] = self.pipeline_config.offpolicy_monitor.behavior_scope
-
             # Compute prompt_length if available (useful for step mode in some envs)
             try:
                 if "prompt_mask" in fresh_batch.batch:

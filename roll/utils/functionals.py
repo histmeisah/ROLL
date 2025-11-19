@@ -440,6 +440,135 @@ def compute_gae_advantage_return(
     return advantages, returns
 
 
+@torch.no_grad()
+def compute_vtrace_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    current_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float = 0.99,
+    rho_bar: float = 1.0,
+    c_bar: float = 1.0,
+):
+    """
+    Compute V-trace advantages and returns for off-policy correction.
+
+    V-trace is an off-policy actor-critic algorithm that uses truncated importance
+    sampling to correct for the difference between the behavior policy (that generated
+    the data) and the target policy (being learned).
+
+    Reference: "IMPALA: Scalable Distributed Deep-RL with Importance Weighted
+               Actor-Learner Architectures" (Espeholt et al., 2018)
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (batch_size, seq_len) - Rewards at each token position
+        values: `(torch.Tensor)`
+            shape: (batch_size, seq_len) - Value function estimates V(x_t)
+        old_log_probs: `(torch.Tensor)`
+            shape: (batch_size, seq_len-1) - Log probs from behavior policy μ(a_t|x_t)
+        current_log_probs: `(torch.Tensor)`
+            shape: (batch_size, seq_len-1) - Log probs from target policy π(a_t|x_t)
+        response_mask: `(torch.Tensor)`
+            shape: (batch_size, seq_len-1) - Mask for valid response tokens
+        gamma: `(float)`
+            Discount factor for future rewards (default: 0.99)
+        rho_bar: `(float)`
+            Truncation threshold for importance sampling ratio ρ (default: 1.0)
+        c_bar: `(float)`
+            Truncation threshold for trace coefficient c (default: 1.0)
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (batch_size, seq_len) - V-trace advantage estimates
+        returns: `(torch.Tensor)`
+            shape: (batch_size, seq_len) - V-trace return estimates (target values)
+    """
+    batch_size, seq_len = token_level_rewards.shape
+
+    # Handle shape alignment for log_probs (they are usually seq_len-1)
+    if old_log_probs.shape[1] == seq_len - 1:
+        # Pad log_probs to match seq_len (add zero at the end)
+        old_log_probs = torch.nn.functional.pad(old_log_probs, (0, 1), value=0.0)
+        current_log_probs = torch.nn.functional.pad(current_log_probs, (0, 1), value=0.0)
+        # Also extend response_mask if needed
+        if response_mask.shape[1] == seq_len - 1:
+            response_mask = torch.nn.functional.pad(response_mask, (0, 1), value=0.0)
+
+    # Compute importance sampling ratios: ρ_t = π(a_t|x_t) / μ(a_t|x_t)
+    log_rhos = current_log_probs - old_log_probs
+    rhos = torch.exp(log_rhos)
+
+    # Apply truncation for stability
+    rho_bar_tensor = torch.tensor(rho_bar, device=rhos.device, dtype=rhos.dtype)
+    c_bar_tensor = torch.tensor(c_bar, device=rhos.device, dtype=rhos.dtype)
+
+    # Truncated importance sampling ratios
+    clipped_rhos = torch.minimum(rho_bar_tensor, rhos)
+    # Truncated trace coefficients
+    clipped_cs = torch.minimum(c_bar_tensor, rhos)
+
+    # Apply response mask to all components
+    clipped_rhos = clipped_rhos * response_mask
+    clipped_cs = clipped_cs * response_mask
+    token_level_rewards = token_level_rewards * response_mask
+    values = values * response_mask
+
+    # Initialize V-trace targets
+    vs = torch.zeros_like(values)
+
+    # Backward computation of V-trace targets
+    # v_s = V(x_s) + Σ_{t=s}^{s+n-1} γ^{t-s} (Π_{i=s}^{t-1} c_i) δ_t V
+    # where δ_t V = ρ_t (r_t + γV(x_{t+1}) - V(x_t))
+
+    # We compute this iteratively from the last timestep
+    vs_minus_v_last = torch.zeros(batch_size, device=values.device, dtype=values.dtype)
+
+    for t in reversed(range(seq_len)):
+        # Compute bootstrapped value for next step
+        if t == seq_len - 1:
+            # Last timestep: no next value
+            next_values = torch.zeros_like(values[:, t])
+            vs_t_plus_1 = next_values
+        else:
+            next_values = values[:, t + 1]
+            vs_t_plus_1 = vs[:, t + 1]
+
+        # TD error: δ_t V = ρ_t (r_t + γV(x_{t+1}) - V(x_t))
+        delta_t = clipped_rhos[:, t] * (
+            token_level_rewards[:, t] + gamma * next_values - values[:, t]
+        )
+
+        # Update V-trace target recursively
+        if t == seq_len - 1:
+            vs[:, t] = values[:, t] + delta_t
+        else:
+            # v_s = V(x_s) + δ_s + γ c_s (v_{s+1} - V(x_{s+1}))
+            vs[:, t] = values[:, t] + delta_t + gamma * clipped_cs[:, t] * (vs[:, t + 1] - values[:, t + 1])
+
+    # Compute advantages
+    # The advantage is the clipped importance weighted TD error
+    advantages = torch.zeros_like(token_level_rewards)
+
+    for t in range(seq_len):
+        if t == seq_len - 1:
+            next_values = torch.zeros_like(values[:, t])
+        else:
+            next_values = vs[:, t + 1]
+
+        # V-trace advantage: A_t = ρ_t (r_t + γ v_{t+1} - V(x_t))
+        advantages[:, t] = clipped_rhos[:, t] * (
+            token_level_rewards[:, t] + gamma * next_values - values[:, t]
+        )
+
+    # Apply final masking
+    advantages = advantages * response_mask
+    returns = vs * response_mask
+
+    return advantages, returns
+
+
 def expand_to_token_level(data: "DataProto", use_nstep_returns: bool = False):
     """
     Expand response-level rewards to token-level by placing reward at EOS position.
@@ -771,8 +900,35 @@ def compute_advantage(
         advantages, returns = compute_reinforce_return(
             token_level_rewards=token_level_rewards, gamma=gamma, lambd=lambd
         )
+    elif adv_estimator == "vtrace":
+        # V-trace requires both old and current log_probs
+        if "old_log_probs" not in data.batch:
+            raise ValueError("V-trace requires old_log_probs (behavior policy log probs) in data.batch")
+        if "log_probs" not in data.batch:
+            raise ValueError("V-trace requires log_probs (current policy log probs) in data.batch")
+
+        values = data.batch["values"].float()
+        data.batch["values"] = values * response_mask
+
+        # Get V-trace specific parameters from meta_info if available
+        vtrace_rho_bar = data.meta_info.get("vtrace_rho_bar", 1.0) if hasattr(data, "meta_info") and data.meta_info else 1.0
+        vtrace_c_bar = data.meta_info.get("vtrace_c_bar", 1.0) if hasattr(data, "meta_info") and data.meta_info else 1.0
+
+        # Log V-trace parameters for debugging
+        logger.debug(f"V-trace parameters: rho_bar={vtrace_rho_bar}, c_bar={vtrace_c_bar}, gamma={gamma}")
+
+        advantages, returns = compute_vtrace_advantage_return(
+            token_level_rewards=token_level_rewards,
+            values=values,
+            old_log_probs=data.batch["old_log_probs"],
+            current_log_probs=data.batch["log_probs"],
+            response_mask=response_mask,
+            gamma=gamma,
+            rho_bar=vtrace_rho_bar,
+            c_bar=vtrace_c_bar,
+        )
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unknown advantage estimator: {adv_estimator}")
 
     data.batch["raw_advantages"] = advantages
     if whiten_advantages:
