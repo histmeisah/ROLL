@@ -28,6 +28,10 @@ from .search.env import SearchEnv
 from .nq_search.config import NQSearchEnvConfig
 from .nq_search.env import NQSearchEnv
 
+# Math Reasoning Bandit environment
+from .math_reasoning_bandit.config import MathReasoningBanditConfig
+from .math_reasoning_bandit.env import MathReasoningBanditEnv
+
 logger = get_logger()
 
 REGISTERED_ENVS = {
@@ -46,6 +50,8 @@ REGISTERED_ENVS = {
     "search": SearchEnv,
     # NQ Search environment
     "nq_search": NQSearchEnv,
+    # Math Reasoning Bandit environment
+    "math_reasoning_bandit": MathReasoningBanditEnv,
 }
 
 REGISTERED_ENV_CONFIGS = {
@@ -64,6 +70,8 @@ REGISTERED_ENV_CONFIGS = {
     "search": SearchEnvConfig,
     # NQ Search environment
     "nq_search": NQSearchEnvConfig,
+    # Math Reasoning Bandit environment
+    "math_reasoning_bandit": MathReasoningBanditConfig,
 }
 
 # Webshop environment disabled due to missing dependencies

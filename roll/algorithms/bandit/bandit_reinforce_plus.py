@@ -14,22 +14,11 @@ from dataclasses import dataclass
 import logging
 
 from .neural_ucb import NeuralUCB
+from .prompt_loader import PromptTemplate, load_preset, PromptLoader
+from .prompt_monitor import PromptMonitor
 from roll.utils.logging import get_logger
 
 logger = get_logger()
-
-
-@dataclass
-class PromptTemplate:
-    """Represents a prompt template for mathematical reasoning."""
-
-    name: str
-    template: str
-    description: str
-
-    def format(self, problem: str) -> str:
-        """Format the prompt template with the given problem."""
-        return self.template.format(problem=problem)
 
 
 class BanditReinforcePlusPlus:
@@ -49,6 +38,8 @@ class BanditReinforcePlusPlus:
         neural_ucb_kwargs: Optional[Dict] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         seed: int = 42,
+        enable_monitoring: bool = True,
+        monitor_save_dir: Optional[str] = None,
     ):
         """
         Initialize Bandit-REINFORCE++.
@@ -61,6 +52,8 @@ class BanditReinforcePlusPlus:
             neural_ucb_kwargs: Additional kwargs for NeuralUCB
             device: Device for computation
             seed: Random seed
+            enable_monitoring: Enable prompt performance monitoring
+            monitor_save_dir: Directory to save monitoring data
         """
         self.prompt_templates = prompt_templates
         self.n_prompts = len(prompt_templates)
@@ -83,6 +76,18 @@ class BanditReinforcePlusPlus:
         self.episode_count = 0
         self.total_reward = 0.0
         self.prompt_usage_stats = {i: {"count": 0, "rewards": []} for i in range(self.n_prompts)}
+
+        # Initialize monitoring
+        self.enable_monitoring = enable_monitoring
+        if self.enable_monitoring:
+            prompt_names = [p.name for p in prompt_templates]
+            self.monitor = PromptMonitor(
+                prompt_names=prompt_names,
+                save_dir=monitor_save_dir,
+            )
+            logger.info("Enabled prompt performance monitoring")
+        else:
+            self.monitor = None
 
         logger.info(
             f"Initialized Bandit-REINFORCE++ with {self.n_prompts} prompt templates, "
@@ -208,6 +213,26 @@ class BanditReinforcePlusPlus:
         mean_reward = np.mean(rewards)
         self.update_bandit(prompt_idx, problem_embedding, mean_reward)
 
+        # Get UCB statistics for monitoring
+        ucb_value = None
+        predicted_reward = None
+        confidence = None
+
+        if self.enable_monitoring:
+            # Get UCB components from the bandit
+            with torch.no_grad():
+                context_tensor = torch.from_numpy(problem_embedding).float().to(self.device).unsqueeze(0)
+                network = self.bandit.networks[prompt_idx]
+                predicted_reward = network(context_tensor).item()
+                features = network.get_features(context_tensor).squeeze()
+                confidence = self.bandit.exploration_param * torch.sqrt(
+                    torch.matmul(
+                        torch.matmul(features.unsqueeze(0), self.bandit.A_inv[prompt_idx]),
+                        features.unsqueeze(1)
+                    )
+                ).item()
+                ucb_value = predicted_reward + confidence
+
         # Prepare episode statistics
         episode_stats = {
             "episode": self.episode_count,
@@ -218,8 +243,26 @@ class BanditReinforcePlusPlus:
             "mean_reward": mean_reward,
             "best_reward": best_reward,
             "total_reward": self.total_reward,
+            "ucb_value": ucb_value,
+            "predicted_reward": predicted_reward,
+            "confidence": confidence,
             **train_metrics
         }
+
+        # Log to monitor
+        if self.enable_monitoring:
+            self.monitor.log_episode(
+                episode=self.episode_count,
+                prompt_idx=prompt_idx,
+                reward=mean_reward,
+                ucb_value=ucb_value,
+                predicted_reward=predicted_reward,
+                confidence=confidence,
+                metadata={
+                    "best_reward": best_reward,
+                    "num_trajectories": num_trajectories,
+                }
+            )
 
         return episode_stats
 
@@ -302,31 +345,117 @@ class BanditReinforcePlusPlus:
         logger.info("Reset Bandit-REINFORCE++ to initial state")
 
 
-# Predefined prompt templates for mathematical reasoning
-DEFAULT_PROMPT_TEMPLATES = [
-    PromptTemplate(
-        name="direct",
-        template="Solve the following problem directly:\n{problem}\nSolution:",
-        description="Direct problem solving without explicit reasoning steps"
-    ),
-    PromptTemplate(
-        name="step_by_step",
-        template="Solve step by step:\n{problem}\nLet's think step by step.\nSolution:",
-        description="Step-by-step reasoning approach"
-    ),
-    PromptTemplate(
-        name="detailed",
-        template="Provide a detailed solution with explanations:\n{problem}\nDetailed solution with reasoning:",
-        description="Detailed solution with comprehensive explanations"
-    ),
-    PromptTemplate(
-        name="verify",
-        template="Solve and verify your answer:\n{problem}\nSolution (show work and verification):",
-        description="Solution with verification step"
-    ),
-    PromptTemplate(
-        name="formal",
-        template="Provide a formal mathematical solution:\n{problem}\nFormal solution:",
-        description="Formal mathematical approach"
-    ),
-]
+# ============================================================================
+# Helper Functions for Creating Bandit-REINFORCE++ Instances
+# ============================================================================
+
+def create_bandit_reinforce_from_preset(
+    preset_name: str = "diverse_5",
+    context_dim: int = 768,
+    hidden_dims: List[int] = [256, 128],
+    exploration_param: float = 1.0,
+    neural_ucb_kwargs: Optional[Dict] = None,
+    config_path: Optional[str] = None,
+    **kwargs
+) -> BanditReinforcePlusPlus:
+    """
+    Create a Bandit-REINFORCE++ instance from a prompt preset.
+
+    Args:
+        preset_name: Name of the preset to use (from YAML config)
+        context_dim: Dimension of problem embeddings
+        hidden_dims: Hidden dimensions for NeuralUCB
+        exploration_param: Exploration parameter
+        neural_ucb_kwargs: Additional kwargs for NeuralUCB
+        config_path: Optional path to custom prompt config file
+        **kwargs: Additional kwargs for BanditReinforcePlusPlus
+
+    Returns:
+        Configured BanditReinforcePlusPlus instance
+
+    Examples:
+        # Use default preset (diverse_5)
+        >>> bandit_rl = create_bandit_reinforce_from_preset()
+
+        # Use research-backed prompts
+        >>> bandit_rl = create_bandit_reinforce_from_preset("research_backed_8")
+
+        # Use custom config
+        >>> bandit_rl = create_bandit_reinforce_from_preset(
+        ...     "high_performance_10",
+        ...     config_path="my_prompts.yaml"
+        ... )
+    """
+    # Load prompts from preset
+    prompts = load_preset(preset_name, config_path)
+
+    if not prompts:
+        raise ValueError(
+            f"No prompts loaded from preset '{preset_name}'. "
+            f"Check your configuration file."
+        )
+
+    logger.info(
+        f"Creating Bandit-REINFORCE++ with preset '{preset_name}' "
+        f"({len(prompts)} prompts)"
+    )
+
+    return BanditReinforcePlusPlus(
+        prompt_templates=prompts,
+        context_dim=context_dim,
+        hidden_dims=hidden_dims,
+        exploration_param=exploration_param,
+        neural_ucb_kwargs=neural_ucb_kwargs,
+        **kwargs
+    )
+
+
+def create_bandit_reinforce_from_names(
+    prompt_names: List[str],
+    context_dim: int = 768,
+    config_path: Optional[str] = None,
+    **kwargs
+) -> BanditReinforcePlusPlus:
+    """
+    Create a Bandit-REINFORCE++ instance from specific prompt names.
+
+    Args:
+        prompt_names: List of prompt names to use
+        context_dim: Dimension of problem embeddings
+        config_path: Optional path to custom prompt config file
+        **kwargs: Additional kwargs for BanditReinforcePlusPlus
+
+    Returns:
+        Configured BanditReinforcePlusPlus instance
+
+    Examples:
+        >>> bandit_rl = create_bandit_reinforce_from_names([
+        ...     "zero_shot_cot_ape",
+        ...     "plan_and_solve_plus",
+        ...     "solve_and_verify",
+        ... ])
+    """
+    from .prompt_loader import PromptLoader
+
+    loader = PromptLoader(config_path)
+    prompts = []
+
+    for name in prompt_names:
+        prompt = loader.get_prompt(name)
+        if prompt:
+            prompts.append(prompt)
+        else:
+            logger.warning(f"Prompt '{name}' not found, skipping")
+
+    if not prompts:
+        raise ValueError("No valid prompts found from the provided names")
+
+    logger.info(
+        f"Creating Bandit-REINFORCE++ with {len(prompts)} custom prompts"
+    )
+
+    return BanditReinforcePlusPlus(
+        prompt_templates=prompts,
+        context_dim=context_dim,
+        **kwargs
+    )

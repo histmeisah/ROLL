@@ -228,7 +228,10 @@ class BanditRLPipeline(BasePipeline):
 
             # Logging
             if episode_idx % self.config.log_interval == 0:
-                self._log_statistics(episode_idx, episode_stats)
+                metrics = self._log_statistics(episode_idx, episode_stats)
+                # TODO: Pass metrics to ROLL's logger (wandb, tensorboard)
+                # This will be integrated with ROLL's logging system
+                # Example: self.logger.log(metrics, step=episode_idx)
 
             # Checkpointing
             if episode_idx % self.config.checkpoint_interval == 0:
@@ -292,10 +295,47 @@ class BanditRLPipeline(BasePipeline):
             f"Avg(100)={np.mean(recent_rewards):.3f}"
         )
 
-        # Log prompt usage distribution
+        # Prepare metrics for ROLL's logging system (wandb, tensorboard, etc.)
+        metrics = {
+            # Episode metrics
+            "bandit/episode_reward": episode_stats['mean_reward'],
+            "bandit/episode_best_reward": episode_stats['best_reward'],
+            "bandit/episode_prompt_idx": episode_stats['prompt_idx'],
+            "bandit/recent_avg_reward": np.mean(recent_rewards),
+
+            # UCB metrics
+            "bandit/ucb_value": episode_stats.get('ucb_value', 0.0),
+            "bandit/predicted_reward": episode_stats.get('predicted_reward', 0.0),
+            "bandit/confidence": episode_stats.get('confidence', 0.0),
+        }
+
+        # Log per-prompt metrics
+        if self.bandit_rl.enable_monitoring and hasattr(self.bandit_rl, 'monitor'):
+            summary = self.bandit_rl.monitor.get_summary()
+
+            # Per-prompt performance
+            for prompt_name, stats in summary['prompt_stats'].items():
+                safe_name = prompt_name.replace('/', '_')  # wandb-safe name
+                metrics[f"prompts/{safe_name}/mean_reward"] = stats['mean_reward']
+                metrics[f"prompts/{safe_name}/success_rate"] = stats['success_rate']
+                metrics[f"prompts/{safe_name}/selections"] = stats['total_selections']
+
+            # Selection distribution
+            for prompt_name, freq in summary['selection_distribution'].items():
+                safe_name = prompt_name.replace('/', '_')
+                metrics[f"selection_dist/{safe_name}"] = freq
+
+            # Convergence metrics
+            metrics["bandit/is_converged"] = summary['convergence']['is_converged']
+
+        # Return metrics for ROLL's logger to handle
+        # ROLL will automatically log to wandb, tensorboard, etc.
+        return metrics
+
+        # Log prompt usage distribution periodically
         if episode_idx % (self.config.log_interval * 10) == 0:
-            stats = self.bandit_rl.get_statistics()
-            logger.info(f"Bandit statistics: {stats}")
+            if self.bandit_rl.enable_monitoring and hasattr(self.bandit_rl, 'monitor'):
+                self.bandit_rl.monitor.print_summary()
 
     def _save_checkpoint(self, episode_idx: int):
         """Save checkpoint."""

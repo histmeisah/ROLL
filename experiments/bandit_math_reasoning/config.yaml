@@ -1,0 +1,227 @@
+# Bandit-Reinforcement++ Configuration for Mathematical Reasoning
+# This config integrates NeuralUCB prompt selection with REINFORCE++ policy training
+
+defaults:
+  - _self_
+  - override hydra/job_logging: colorlog
+
+# Experiment metadata
+exp_name: "bandit_math_reinforce"
+seed: 42
+
+# ============================================================================
+# Bandit Configuration
+# ============================================================================
+bandit_config:
+  # Prompt configuration
+  prompt_config_path: "configs/prompts/math_reasoning_prompts.yaml"
+  preset_name: "diverse_5"  # Use 5 diverse prompts
+
+  # Problem encoder for context embeddings
+  encoder_model: "sentence-transformers/all-MiniLM-L6-v2"  # 384-dim embeddings
+  context_dim: 384
+
+  # NeuralUCB parameters
+  hidden_dims: [256, 128]  # Neural network architecture
+  exploration_param: 1.0  # UCB alpha (exploration bonus)
+  learning_rate: 0.001
+  reg_param: 1.0  # Ridge regression regularization
+  buffer_size: 10000  # Experience replay buffer size
+  batch_size: 32
+  update_freq: 10  # Train networks every N updates
+
+  # Monitoring
+  enable_monitoring: true
+
+# ============================================================================
+# RL Training Configuration
+# ============================================================================
+
+# Advantage estimator: REINFORCE (no critic needed for single-step tasks)
+adv_estimator: "reinforce"
+
+# PPO parameters
+ppo_epochs: 1
+ppo_mini_batch_size: 8
+init_kl_coef: 0.1
+target_kl: null
+kl_horizon: 10000
+whiten_advantages: true
+whiten_rewards: false
+clip_range_ratio: 0.2
+clip_range_value: 0.2
+
+# Rollout configuration
+rollout_batch_size: 128  # Collect 128 problem solutions per iteration
+sequence_length: 1024  # Max tokens for problem + solution
+num_return_sequences_in_group: 1  # Single trajectory per problem
+
+# Training steps
+max_steps: 1000  # Total training iterations
+warmup_steps: 0
+log_interval: 10
+save_interval: 100
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+pretrain: "Qwen/Qwen2.5-0.5B-Instruct"  # Use small model for testing
+
+# Actor (Training)
+actor_train:
+  name: "actor_train"
+  worker_cls: roll.distributed.worker.actor_worker.ActorWorker
+  resource:
+    gpu: 1
+    cpu: 4
+  model_args:
+    model_name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+    torch_dtype: bfloat16
+  training_args:
+    learning_rate: 5.0e-6
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 8
+    warmup_steps: 10
+    max_grad_norm: 1.0
+    weight_decay: 0.01
+  strategy_args:
+    strategy_name: megatron_train
+    zero_stage: 2
+    offload: false
+
+# Actor (Inference)
+actor_infer:
+  name: "actor_infer"
+  worker_cls: roll.distributed.worker.actor_worker.ActorWorker
+  resource:
+    gpu: 1
+    cpu: 4
+  model_args:
+    model_name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+    torch_dtype: bfloat16
+  generating_args:
+    max_new_tokens: 512  # Allow detailed reasoning
+    temperature: 0.8  # Some exploration
+    top_p: 0.95
+    top_k: 50
+    do_sample: true
+    repetition_penalty: 1.1
+  strategy_args:
+    strategy_name: vllm
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.8
+
+# Reference model (for KL penalty)
+reference:
+  name: "reference"
+  worker_cls: roll.distributed.worker.actor_worker.ActorWorker
+  resource:
+    gpu: 1
+    cpu: 4
+  model_args:
+    model_name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+    torch_dtype: bfloat16
+  strategy_args:
+    strategy_name: vllm
+    tensor_parallel_size: 1
+
+# ============================================================================
+# Environment Configuration
+# ============================================================================
+
+# Training environment
+train_env_manager:
+  num_env_groups: 32  # 32 environment groups
+  group_size: 4  # 4 parallel environments per group
+  tags: [MathReasoningBandit]
+  num_groups_partition: [32]
+
+# Validation environment (optional)
+val_env_manager:
+  num_env_groups: 8
+  group_size: 4
+  tags: [MathReasoningBandit]
+  num_groups_partition: [8]
+
+# Custom environment definition
+custom_envs:
+  MathReasoningBandit:
+    env_type: "math_reasoning_bandit"
+    max_tokens_per_step: 512
+    env_manager_cls: "roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager"
+
+    # System prompt
+    agent_system_template: |
+      You are an expert mathematician. Solve problems step by step with clear reasoning.
+      Provide your final answer in the format: Answer: [your answer]
+
+    # Problem prompt template (filled by selected bandit prompt)
+    agent_template: |
+      {state}
+
+    # Reward template (not used for single-step tasks)
+    reward_template: ""
+
+    # Environment configuration
+    env_config:
+      max_steps: 1  # Single-step task
+      dataset_name: "gsm8k"
+      dataset_split: "train"
+      dataset_seed: 42
+
+      # Answer extraction patterns
+      answer_patterns:
+        - '\\boxed\{(.+?)\}'  # LaTeX format
+        - '<answer>(.+?)</answer>'  # XML format
+        - '(?:Answer|答案)[:：]\s*(.+)'  # "Answer:" format
+
+      # Reward configuration
+      reward_correct: 1.0
+      reward_incorrect: 0.0
+      reward_partial: 0.5
+
+      # Verification settings
+      enable_numerical_matching: true
+      numerical_tolerance: 0.001
+      enable_partial_matching: true
+
+      # Note: bandit_actor, prompt_templates, problem_encoder
+      # will be injected by BanditAgenticPipeline
+
+# ============================================================================
+# Logging and Checkpointing
+# ============================================================================
+
+# Weights & Biases
+wandb:
+  enabled: false  # Set to true to enable wandb logging
+  project: "bandit-math-reasoning"
+  name: "neural_ucb_reinforce_gsm8k"
+  entity: null  # Set your wandb entity
+
+# Output directory
+output_dir: "./outputs/bandit_math_reasoning"
+
+# Checkpoint settings
+save_checkpoint: true
+checkpoint_dir: "./checkpoints/bandit_math_reasoning"
+
+# ============================================================================
+# Optional: Replay Buffer (for off-policy training)
+# ============================================================================
+replay:
+  enabled: false  # Can enable for off-policy training
+  capacity: 10000
+  train_steps_per_env_step: 2
+  sampling_mode: "trajectory"
+  sample_method: "uniform"
+
+# ============================================================================
+# Hydra Configuration
+# ============================================================================
+hydra:
+  run:
+    dir: ${output_dir}/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${output_dir}/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
