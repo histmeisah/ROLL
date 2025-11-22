@@ -18,6 +18,7 @@ class MathReasoningBanditConfig(BaseEnvConfig):
     dataset_name: str = "gsm8k"  # Options: gsm8k, math, aime
     dataset_split: str = "train"
     dataset_seed: int = 42
+    dataset_path: Optional[str] = None  # Path to local dataset file (JSON/JSONL)
 
     # Answer extraction settings
     answer_patterns: List[str] = field(default_factory=lambda: [

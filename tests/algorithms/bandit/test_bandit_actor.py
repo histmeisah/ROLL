@@ -68,7 +68,7 @@ def test_neural_ucb_local():
     stats = bandit.get_statistics()
     print(f"\n✓ Statistics:")
     print(f"  Total pulls: {stats['total_pulls']}")
-    print(f"  Arm pulls: {stats['arm_pulls']}")
+    print(f"  Arm counts: {stats['arm_counts']}")
     print(f"  Mean rewards: {[f'{r:.2f}' for r in stats['mean_rewards']]}")
 
     # Arm 0 should have highest mean reward
@@ -86,7 +86,7 @@ def test_bandit_actor_ray():
 
     # Initialize Ray
     if not ray.is_initialized():
-        ray.init(num_cpus=4, num_gpus=0, ignore_reinit_error=True, log_to_driver=False)
+        ray.init(num_cpus=4, num_gpus=1, ignore_reinit_error=True, log_to_driver=False)
         print("✓ Ray initialized")
 
     try:

@@ -25,6 +25,7 @@ class MathDataset:
         split: str = "train",
         seed: int = 42,
         max_samples: Optional[int] = None,
+        dataset_path: Optional[str] = None,
     ):
         """
         Initialize dataset.
@@ -34,9 +35,11 @@ class MathDataset:
             split: Data split (train, test, validation)
             seed: Random seed for sampling
             max_samples: Maximum number of samples to load (None = all)
+            dataset_path: Path to local dataset file (JSON/JSONL). If provided, loads from local file instead of HuggingFace
         """
         self.dataset_name = dataset_name
         self.split = split
+        self.dataset_path = dataset_path
         self.rng = np.random.RandomState(seed)
         self.problems = []
 
@@ -49,7 +52,15 @@ class MathDataset:
         )
 
     def _load_dataset(self, max_samples: Optional[int] = None):
-        """Load dataset from HuggingFace or local source."""
+        """Load dataset from local file or HuggingFace."""
+        # If local dataset path provided, load from file
+        logger.info(f"Loading dataset: dataset_path={self.dataset_path}, dataset_name={self.dataset_name}, split={self.split}")
+        if self.dataset_path:
+            logger.info(f"Using local dataset file: {self.dataset_path}")
+            self._load_from_json(self.dataset_path, max_samples)
+            return
+
+        # Otherwise, load from HuggingFace
         try:
             from datasets import load_dataset
         except ImportError:
@@ -65,6 +76,70 @@ class MathDataset:
             self._load_math(max_samples)
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
+
+    def _load_from_json(self, file_path: str, max_samples: Optional[int] = None):
+        """Load dataset from local JSON/JSONL file."""
+        import json
+        import os
+
+        logger.info(f"Loading dataset from local file: {file_path}")
+        logger.info(f"File exists: {os.path.exists(file_path)}")
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                # Try reading as JSONL (one JSON per line)
+                for idx, line in enumerate(f):
+                    if max_samples and idx >= max_samples:
+                        break
+
+                    try:
+                        data = json.loads(line.strip())
+
+                        # Handle GSM8K format
+                        if "question" in data and "answer" in data:
+                            answer_text = data["answer"]
+                            if "####" in answer_text:
+                                final_answer = answer_text.split("####")[-1].strip()
+                            else:
+                                final_answer = answer_text.strip()
+
+                            self.problems.append({
+                                "problem": data["question"],
+                                "answer": final_answer,
+                                "full_solution": answer_text,
+                                "dataset": self.dataset_name,
+                            })
+                        # Handle other formats (AIME, MATH, etc.)
+                        elif "problem" in data:
+                            # For AIME/MATH: "answer" is the final answer, "solution" is the full solution
+                            final_answer = data.get("answer", "")
+                            full_solution = data.get("solution", "")
+
+                            self.problems.append({
+                                "problem": data["problem"],
+                                "answer": final_answer,  # Use "answer" field as the correct answer
+                                "full_solution": full_solution,
+                                "dataset": self.dataset_name,
+                                "level": data.get("level", "unknown"),
+                                "type": data.get("type", "unknown"),
+                            })
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse line {idx}: {e}")
+                        continue
+
+        except Exception as e:
+            import traceback
+            logger.error(f"Failed to load dataset from {file_path}: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.warning("Using fallback data for testing")
+            self._load_fallback_data()
+            return
+
+        logger.info(f"Successfully loaded {len(self.problems)} problems from {file_path}")
+
+        if len(self.problems) == 0:
+            logger.warning(f"No problems loaded from {file_path}. Using fallback data.")
+            self._load_fallback_data()
 
     def _load_gsm8k(self, max_samples: Optional[int] = None):
         """Load GSM8K dataset."""

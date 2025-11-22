@@ -149,12 +149,21 @@ class TrajEnvManager(BaseEnvManager):
                 self.logger.debug(f"group_id: {self.env_config['group_id']} env_id: {self.env_config['env_id']} episode_id: {self.episode_id} start_step {start_step} gen_stats: {log_stats}")
                 log_stats = {"generate_time": [], "step_time": [], "current_step": []}
 
-                rollout: DataProto = self.formulate_rollouts(rollout_cache)
-                traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
-                traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
-                rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id] * rollout.batch.batch_size[0], dtype=object)
-                rollout.non_tensor_batch["traj_id"] = np.array([traj_id] * rollout.batch.batch_size[0], dtype=object)
-                ray.get(self.output_queue.put.remote(self.env_config['group_id'], self.episode_id, start_step, rollout))
+                # Only formulate rollouts if at least one action was executed
+                # This prevents crash when generation fails immediately (e.g., prompt too long)
+                if rollout_cache.step > 0:
+                    rollout: DataProto = self.formulate_rollouts(rollout_cache)
+                    traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
+                    traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
+                    rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id] * rollout.batch.batch_size[0], dtype=object)
+                    rollout.non_tensor_batch["traj_id"] = np.array([traj_id] * rollout.batch.batch_size[0], dtype=object)
+                    ray.get(self.output_queue.put.remote(self.env_config['group_id'], self.episode_id, start_step, rollout))
+                else:
+                    # Skip empty trajectory (no action executed due to generation failure)
+                    self.logger.warning(
+                        f"env_id: {self.env_config['env_id']} episode_id: {self.episode_id} "
+                        f"Skipping empty trajectory (stop_reason: {stop_reason}, step: {rollout_cache.step})"
+                    )
 
                 if not self.running or (is_sync_training and self.episode_id >= self.worker_config.max_traj_per_env):
                     self.rollout_cache: Optional[RolloutCache] = None

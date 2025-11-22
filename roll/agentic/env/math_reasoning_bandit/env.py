@@ -23,6 +23,28 @@ from .dataset import MathDataset
 logger = logging.getLogger(__name__)
 
 
+def get_global_bandit_actor():
+    """
+    Get global bandit actor from startup script.
+
+    This allows environments to access the BanditActor even when it cannot
+    be passed through config due to OmegaConf limitations.
+    """
+    try:
+        import sys
+        # Try to get from start_bandit_aime module
+        if 'experiments.bandit_aime_reasoning.start_bandit_aime' in sys.modules:
+            module = sys.modules['experiments.bandit_aime_reasoning.start_bandit_aime']
+            return getattr(module, 'GLOBAL_BANDIT_ACTOR', None)
+        # Try to get from start_bandit_math_reasoning module
+        if 'experiments.bandit_math_reasoning.start_bandit_math_reasoning' in sys.modules:
+            module = sys.modules['experiments.bandit_math_reasoning.start_bandit_math_reasoning']
+            return getattr(module, 'GLOBAL_BANDIT_ACTOR', None)
+    except Exception as e:
+        logger.debug(f"Failed to get global bandit actor: {e}")
+    return None
+
+
 class MathReasoningBanditEnv(BaseEnv):
     """
     Math reasoning environment with bandit-based prompt selection.
@@ -42,8 +64,12 @@ class MathReasoningBanditEnv(BaseEnv):
         super().__init__(config)
         self.config = config
 
-        # These will be injected by pipeline
+        # These will be injected by pipeline or from global registry
         self.bandit_actor = config.bandit_actor
+        if self.bandit_actor is None:
+            # Try to get from global registry
+            self.bandit_actor = get_global_bandit_actor()
+
         self.prompt_templates = config.prompt_templates
         self.problem_encoder = config.problem_encoder
 
@@ -52,6 +78,7 @@ class MathReasoningBanditEnv(BaseEnv):
             dataset_name=config.dataset_name,
             split=config.dataset_split,
             seed=config.dataset_seed,
+            dataset_path=config.dataset_path,
         )
 
         # Current episode state
@@ -234,16 +261,13 @@ class MathReasoningBanditEnv(BaseEnv):
             except Exception as e:
                 logger.warning(f"Bandit update failed: {e}")
 
-        # 4. Prepare metrics
+        # 4. Prepare metrics (只包含数值类型)
         metrics = {
-            "action_is_valid": True,
-            "action_is_effective": True,
-            "success": (reward >= self.config.reward_correct - 1e-6),
-            "prompt_idx": self.current_prompt_idx,
-            "prompt_name": self.current_prompt_name,
-            "extracted_answer": str(extracted_answer),
-            "ground_truth": str(self.current_ground_truth),
-            "reward": reward,
+            "action_is_valid": 1.0,  # 转换为float
+            "action_is_effective": 1.0,  # 转换为float
+            "success": 1.0 if (reward >= self.config.reward_correct - 1e-6) else 0.0,
+            "prompt_idx": float(self.current_prompt_idx),
+            "reward": float(reward),
         }
 
         # 5. Math reasoning is single-step, always terminate

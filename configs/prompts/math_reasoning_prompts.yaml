@@ -207,6 +207,29 @@ presets:
       - plan_and_solve_plus     # PS+
       - solve_and_verify        # Verification
 
+  all_prompts_19:
+    description: "All 19 prompts for comprehensive testing"
+    prompts:
+      - zero_shot_cot_classic
+      - zero_shot_cot_ape
+      - zero_shot_cot_careful
+      - zero_shot_cot_solve
+      - plan_and_solve_basic
+      - plan_and_solve_plus
+      - plan_execute_verify
+      - detailed_explanation
+      - show_work
+      - reasoning_chain
+      - solve_and_verify
+      - double_check
+      - reflect_and_solve
+      - structured_solution
+      - formal_proof
+      - direct_solve
+      - answer_directly
+      - think_aloud
+      - analogical_reasoning
+
 
 # ============================================================================
 # Category Descriptions
