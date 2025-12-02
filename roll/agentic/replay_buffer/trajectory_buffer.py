@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 from collections import deque
 import random
-import logging
 import numpy as np
 import torch
 from transformers import PreTrainedTokenizer
@@ -17,10 +16,11 @@ from tensordict import TensorDict
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.utils.functionals import pad_to_length
+from roll.utils.logging import get_logger
 from .base_buffer import BaseReplayBuffer
 from .segment_tree import SumSegmentTree, MinSegmentTree, next_power_of_2
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 @dataclass
@@ -73,43 +73,44 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
     
     def __init__(
         self,
-        capacity: int = 100000,  # Number of complete trajectories
-        batch_size: int = 128,   # Should match rollout batch size
+        capacity: int = 100000,
+        batch_size: int = 128,
         seed: int = 42,
-        priority_fn: callable = None,  # Priority calculation function
-        priority_exponent: float = 1.0,  # Priority exponent (alpha in PER)
-        priority_kwargs: dict = None,  # Additional kwargs for priority function
-        age_decay: float = 1000.0,  # Age decay constant for freshness weighting
-        use_advantage_priority: bool = False  # Whether to update priority with advantages after training
+        priority_fn: callable = None,
+        priority_exponent: float = 0.6,
+        age_decay: float = 1000.0,
+        enable_age_decay: bool = False,
+        eviction_strategy: str = "fifo"
     ):
         super().__init__(capacity, batch_size, seed)
-        # Fixed-size array with validity mask for perfect index alignment
-        self.trajectories = [None] * capacity  # Pre-allocated slots
-        self.valid_mask = [False] * capacity   # Track which slots are occupied
-        self.num_valid = 0  # Number of valid trajectories
+        self.trajectories = [None] * capacity
+        self.valid_mask = [False] * capacity
+        self.num_valid = 0
         self.rng = random.Random(seed)
-        self.enable_smart_eviction = True  # Can be toggled for A/B testing
+        self.eviction_strategy = eviction_strategy.lower()
+        self.enable_smart_eviction = (self.eviction_strategy == "smart")
 
-        # Priority-related attributes
+        # Priority configuration
         from .priority_functions import uniform_priority
         self.priority_fn = priority_fn or uniform_priority
         self.priority_exponent = priority_exponent
-        self.priority_kwargs = priority_kwargs or {}
 
-        # Segment Tree for efficient O(log n) prioritized sampling (PER)
-        # Capacity must be power of 2 for segment tree
+        # Segment Tree for O(log n) prioritized sampling
         self._tree_capacity = next_power_of_2(capacity)
         self._it_sum = SumSegmentTree(self._tree_capacity)
         self._it_min = MinSegmentTree(self._tree_capacity)
-        self._max_priority = 1.0  # Track maximum priority for new samples
+        self._max_priority = 1.0
 
-        # Age-based priority configuration
+        # Age-based freshness weighting (optional, default off for standard PER behavior)
+        self.enable_age_decay = enable_age_decay
         self.age_decay = age_decay
-        self.use_advantage_priority = use_advantage_priority
-        self.current_global_step = 0  # Track current global step for age calculation
+        self.current_global_step = 0
 
-        logger.info(f"Initialized TrajectoryReplayBuffer with capacity={capacity}, tree_capacity={self._tree_capacity}, "
-                   f"priority_fn={self.priority_fn.__name__}, age_decay={age_decay}, use_advantage_priority={use_advantage_priority}")
+        logger.info(
+            f"TrajectoryReplayBuffer: capacity={capacity}, priority_fn={self.priority_fn.__name__}, "
+            f"priority_exponent={priority_exponent}, enable_age_decay={enable_age_decay}, "
+            f"age_decay={age_decay}, eviction={eviction_strategy}"
+        )
     
     @property
     def buffer_type(self) -> str:
@@ -186,7 +187,7 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
 
             # Calculate priority for this trajectory
             try:
-                priority = self.priority_fn(trajectory, global_step, **self.priority_kwargs)
+                priority = self.priority_fn(trajectory, global_step)
                 trajectory.priority = float(priority)
             except Exception as e:
                 logger.warning(f"Failed to calculate priority, using default 1.0: {e}")
@@ -205,12 +206,12 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             self.trajectories[slot_idx] = trajectory
             self.valid_mask[slot_idx] = True
 
-            # Update segment trees with priority^alpha (PER convention)
-            # New samples get max priority to ensure they're sampled at least once
-            priority_alpha = max(trajectory.priority, self._max_priority) ** self.priority_exponent
+            # Update segment trees with max_priority^alpha (standard PER convention)
+            # New samples get max_priority to ensure they're sampled at least once
+            # The actual priority will be updated after training via update_priorities()
+            priority_alpha = self._max_priority ** self.priority_exponent
             self._it_sum[slot_idx] = priority_alpha
             self._it_min[slot_idx] = priority_alpha
-            self._max_priority = max(self._max_priority, trajectory.priority)
 
             self.total_stored += 1
 
@@ -607,72 +608,68 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
 
     def update_priorities(self, indices: List[int], priorities: np.ndarray, current_global_step: Optional[int] = None) -> None:
         """
-        Update priorities for sampled trajectories after training, with age-aware weighting.
+        Update priorities for sampled trajectories after training (standard PER).
 
-        This implements a two-factor priority system:
-        1. Intrinsic value (advantage-based): How surprising/valuable the sample is
-        2. Freshness weight (age-based): How recent the sample is
+        Standard PER formula:
+            tree[idx] = priority^α
+            max_priority = max(max_priority, priority)
 
-        Final effective priority = intrinsic_value * freshness_weight
-        where freshness_weight = exp(-age / age_decay)
-
-        Time complexity: O(k * log n) where k = len(indices)
+        Optional age decay (when enable_age_decay=True):
+            effective_priority = priority × exp(-age / age_decay)
+            tree[idx] = effective_priority^α
 
         Args:
             indices: Buffer indices of sampled trajectories
-            priorities: New intrinsic priority values (e.g., |advantage|, |TD-error|, |loss|)
-            current_global_step: Current training step for age calculation (optional, uses self.current_global_step if None)
-
-        Example:
-            >>> # After training and computing advantages
-            >>> advantages = batch["advantages"]  # [batch_size, seq_len]
-            >>> response_mask = batch["response_mask"]  # [batch_size, seq_len]
-            >>> priorities = TrajectoryReplayBuffer.compute_advantage_priorities(batch)
-            >>> buffer.update_priorities(sampled_indices, priorities, current_global_step)
+            priorities: New priority values (e.g., |advantage|, |TD-error|)
+            current_global_step: Current training step for age calculation (only used if enable_age_decay=True)
         """
         assert len(indices) == len(priorities), \
             f"Indices and priorities length mismatch: {len(indices)} vs {len(priorities)}"
 
         global_step = current_global_step if current_global_step is not None else self.current_global_step
 
-        for slot_idx, intrinsic_priority in zip(indices, priorities):
+        for slot_idx, priority in zip(indices, priorities):
             if not (0 <= slot_idx < self.capacity) or not self.valid_mask[slot_idx]:
                 logger.warning(f"Invalid slot {slot_idx}, skipping priority update")
                 continue
 
-            # Ensure intrinsic priority is positive (add small epsilon)
-            intrinsic_priority = max(float(intrinsic_priority), 1e-6)
+            # Ensure priority is positive
+            priority = max(float(priority), 1e-6)
 
             # Update stored priority in trajectory
-            self.trajectories[slot_idx].priority = intrinsic_priority
+            self.trajectories[slot_idx].priority = priority
 
-            # Compute age-based freshness weight
-            sample_age = global_step - self.trajectories[slot_idx].global_step
-            freshness_weight = np.exp(-sample_age / self.age_decay)
+            # Compute effective priority (with optional age decay)
+            if self.enable_age_decay:
+                sample_age = global_step - self.trajectories[slot_idx].global_step
+                freshness_weight = np.exp(-sample_age / self.age_decay)
+                effective_priority = priority * freshness_weight
+            else:
+                effective_priority = priority
 
-            # Compute effective priority: intrinsic value × freshness
-            effective_priority = intrinsic_priority * freshness_weight
-
-            # Update segment trees with effective_priority^alpha
+            # Update segment trees with priority^alpha (standard PER)
             priority_alpha = effective_priority ** self.priority_exponent
             self._it_sum[slot_idx] = priority_alpha
             self._it_min[slot_idx] = priority_alpha
 
             # Track maximum priority
-            self._max_priority = max(self._max_priority, effective_priority)
+            self._max_priority = max(self._max_priority, priority)
 
-        logger.debug(f"Updated priorities for {len(indices)} trajectories with age decay. "
-                    f"Max effective priority: {self._max_priority:.4f}")
+        logger.debug(f"Updated priorities for {len(indices)} trajectories. "
+                    f"Max priority: {self._max_priority:.4f}, age_decay={self.enable_age_decay}")
 
     def get_effective_priority(self, idx: int, current_global_step: Optional[int] = None) -> float:
         """
         Compute effective priority for a given buffer index.
 
-        effective_priority = intrinsic_priority * exp(-age / age_decay)
+        If enable_age_decay=True:
+            effective_priority = priority × exp(-age / age_decay)
+        Otherwise:
+            effective_priority = priority
 
         Args:
             idx: Buffer index
-            current_global_step: Current training step (optional)
+            current_global_step: Current training step (only used if enable_age_decay=True)
 
         Returns:
             Effective priority value
@@ -680,11 +677,15 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         if not (0 <= idx < self.capacity) or not self.valid_mask[idx]:
             return 0.0
 
-        global_step = current_global_step if current_global_step is not None else self.current_global_step
-        sample_age = global_step - self.trajectories[idx].global_step
-        freshness_weight = np.exp(-sample_age / self.age_decay)
+        priority = self.trajectories[idx].priority
 
-        return self.trajectories[idx].priority * freshness_weight
+        if self.enable_age_decay:
+            global_step = current_global_step if current_global_step is not None else self.current_global_step
+            sample_age = global_step - self.trajectories[idx].global_step
+            freshness_weight = np.exp(-sample_age / self.age_decay)
+            return priority * freshness_weight
+
+        return priority
 
     @staticmethod
     def compute_advantage_priorities(batch: DataProto) -> np.ndarray:

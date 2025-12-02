@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 from collections import deque
 import random
-import logging
 import numpy as np
 import torch
 from transformers import PreTrainedTokenizer
@@ -17,10 +16,11 @@ from tensordict import TensorDict
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.utils.functionals import pad_to_length
+from roll.utils.logging import get_logger
 from .base_buffer import BaseReplayBuffer
 from .segment_tree import SumSegmentTree, MinSegmentTree, next_power_of_2
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 @dataclass 
@@ -51,10 +51,15 @@ class StepEntry:
     traj_id: str
     state_hash: str  # Added missing state_hash field
     step: int  # CRITICAL: Step index within episode, required for gigpo
-    
+
+    # Episode termination signals (following Stable-Baselines3/Tianshou convention)
+    done: bool = False          # True if this is the last step of the episode
+    terminated: bool = False    # True if episode ended due to environment termination
+    truncated: bool = False     # True if episode ended due to time limit
+
     # Storage metadata
-    stored_at_step: int
-    step_length: int
+    stored_at_step: int = 0
+    step_length: int = 0
 
     # Priority-related metadata
     priority: float = 1.0       # Current priority value (intrinsic value)
@@ -75,72 +80,61 @@ class StepReplayBuffer(BaseReplayBuffer):
     
     def __init__(
         self,
-        capacity: int = 1000000,  # Number of individual steps
-        batch_size: int = 128,    # Should match rollout batch size
+        capacity: int = 1000000,
+        batch_size: int = 128,
         seed: int = 42,
-        priority_fn: callable = None,  # Priority calculation function
-        priority_exponent: float = 1.0,  # Priority exponent (alpha in PER)
-        priority_kwargs: dict = None,  # Additional kwargs for priority function
-        enable_nstep: bool = False,  # Enable n-step returns
-        n_step: int = 5,  # Number of steps for n-step returns
-        gamma: float = 0.99,  # Discount factor for n-step returns
-        age_decay: float = 1000.0,  # Age decay constant for freshness weighting
-        use_advantage_priority: bool = False  # Whether to update priority with advantages after training
+        priority_fn: callable = None,
+        priority_exponent: float = 0.6,
+        enable_nstep: bool = False,
+        n_step: int = 5,
+        gamma: float = 0.99,
+        enable_age_decay: bool = False,
+        age_decay: float = 1000.0,
     ):
         super().__init__(capacity, batch_size, seed)
         self.steps = deque(maxlen=capacity)
         self.rng = random.Random(seed)
 
-        # Priority-related attributes
+        # Priority configuration
         from .priority_functions import uniform_priority
         self.priority_fn = priority_fn or uniform_priority
         self.priority_exponent = priority_exponent
-        self.priority_kwargs = priority_kwargs or {}
 
-        # Segment Tree for efficient O(log n) prioritized sampling (PER)
-        # Capacity must be power of 2 for segment tree
+        # Segment Tree for O(log n) prioritized sampling
         self._tree_capacity = next_power_of_2(capacity)
         self._it_sum = SumSegmentTree(self._tree_capacity)
         self._it_min = MinSegmentTree(self._tree_capacity)
-        self._max_priority = 1.0  # Track maximum priority for new samples
+        self._max_priority = 1.0
 
         # N-Step configuration
         self.enable_nstep = enable_nstep
         self.n_step = n_step
         self.gamma = gamma
 
-        # Age-based priority configuration
+        # Age-based freshness weighting (optional, default off for standard PER behavior)
+        self.enable_age_decay = enable_age_decay
         self.age_decay = age_decay
-        self.use_advantage_priority = use_advantage_priority
-        self.current_global_step = 0  # Track current global step for age calculation
+        self.current_global_step = 0
 
-        # Episode Index for n-step returns and GAE
-        # Maps (traj_id, step) -> buffer_idx for efficient episode structure lookup
+        # Episode Index for n-step returns
         self._episode_index: Dict[str, Dict[int, int]] = {}
-        """
-        Episode index mapping: {traj_id: {step_num: buffer_idx}}
-
-        Example:
-        {
-            "ep_001": {0: 42, 1: 43, 2: 44, 3: 45},  # 4-step episode
-            "ep_002": {0: 123, 1: 124},               # 2-step episode
-        }
-        """
-
         self._buffer_to_episode: Dict[int, Tuple[str, int]] = {}
-        """
-        Reverse mapping: {buffer_idx: (traj_id, step_num)}
-        Enables O(1) lookup from buffer index to episode structure.
-        """
 
-        logger.info(f"Initialized StepReplayBuffer with capacity={capacity}, tree_capacity={self._tree_capacity}, "
-                   f"priority_fn={self.priority_fn.__name__}, enable_nstep={enable_nstep}, n_step={n_step}, gamma={gamma}, "
-                   f"age_decay={age_decay}, use_advantage_priority={use_advantage_priority}")
+        logger.info(
+            f"StepReplayBuffer: capacity={capacity}, priority_fn={self.priority_fn.__name__}, "
+            f"enable_nstep={enable_nstep}, n_step={n_step}, gamma={gamma}, "
+            f"enable_age_decay={enable_age_decay}, age_decay={age_decay}"
+        )
     
     @property
     def buffer_type(self) -> str:
         return "step"
-    
+
+    @property
+    def num_valid(self) -> int:
+        """Return current number of valid steps in buffer."""
+        return len(self.steps)
+
     def push_from_dataproto(self, batch: DataProto, global_step: int) -> None:
         """
         Store step data from StepEnvManager.
@@ -187,10 +181,15 @@ class StepReplayBuffer(BaseReplayBuffer):
             
             # Extract step index - CRITICAL for gigpo algorithm
             step = int(batch.non_tensor_batch["step"][i]) if "step" in batch.non_tensor_batch else 0
-            
+
+            # Extract episode termination signals (following Stable-Baselines3/Tianshou convention)
+            done = bool(batch.non_tensor_batch["done"][i]) if "done" in batch.non_tensor_batch else False
+            terminated = bool(batch.non_tensor_batch["terminated"][i]) if "terminated" in batch.non_tensor_batch else False
+            truncated = bool(batch.non_tensor_batch["truncated"][i]) if "truncated" in batch.non_tensor_batch else False
+
             # Calculate step length from attention mask
             step_length = int(attention_mask.sum())
-            
+
             step_entry = StepEntry(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -211,6 +210,9 @@ class StepReplayBuffer(BaseReplayBuffer):
                 traj_id=traj_id,
                 state_hash=state_hash,  # Add state_hash
                 step=step,  # Add step index for gigpo
+                done=done,  # Episode termination flag
+                terminated=terminated,  # Environment termination flag
+                truncated=truncated,  # Time limit truncation flag
                 stored_at_step=global_step,
                 step_length=step_length,
                 global_step=global_step  # Store global step for age calculation
@@ -218,7 +220,7 @@ class StepReplayBuffer(BaseReplayBuffer):
 
             # Calculate priority for this step
             try:
-                priority = self.priority_fn(step_entry, global_step, **self.priority_kwargs)
+                priority = self.priority_fn(step_entry, global_step)
                 step_entry.priority = float(priority)
             except Exception as e:
                 logger.warning(f"Failed to calculate priority, using default 1.0: {e}")
@@ -232,12 +234,12 @@ class StepReplayBuffer(BaseReplayBuffer):
             if len(self.steps) == self.capacity:
                 self._cleanup_evicted_step(current_idx)
 
-            # Update segment trees with priority^alpha (PER convention)
-            # New samples get max priority to ensure they're sampled at least once
-            priority_alpha = max(step_entry.priority, self._max_priority) ** self.priority_exponent
+            # Update segment trees with max_priority^alpha (standard PER convention)
+            # New samples get max_priority to ensure they're sampled at least once
+            # The actual priority will be updated after training via update_priorities()
+            priority_alpha = self._max_priority ** self.priority_exponent
             self._it_sum[current_idx] = priority_alpha
             self._it_min[current_idx] = priority_alpha
-            self._max_priority = max(self._max_priority, step_entry.priority)
 
             # Update episode index for n-step returns
             if traj_id not in self._episode_index:
@@ -255,7 +257,15 @@ class StepReplayBuffer(BaseReplayBuffer):
             gc.collect()
             logger.info(f"Replay buffer GC triggered at {self.total_stored} steps stored")
 
-        logger.debug(f"Stored {batch_size} steps. Total stored: {len(self.steps)}")
+        # Debug: Count done flags in this batch
+        done_count_in_batch = sum(1 for i in range(batch_size) if "done" in batch.non_tensor_batch and bool(batch.non_tensor_batch["done"][i]))
+
+        logger.info(
+            f"[STORE] Stored {batch_size} steps. Total: {len(self.steps)}, "
+            f"episode_index_size={len(self._episode_index)}, "
+            f"buffer_to_episode_size={len(self._buffer_to_episode)}, "
+            f"done_count_in_batch={done_count_in_batch}"
+        )
     
     def can_sample(self, batch_size: Optional[int] = None) -> bool:
         """Check if buffer has enough steps for sampling."""
@@ -480,6 +490,294 @@ class StepReplayBuffer(BaseReplayBuffer):
         logger.debug(f"Sampled {sample_size} steps for training (indices: {len(sampled_indices)})")
         return dataproto, sampled_indices
 
+    def sample_episodes_for_hierarchical(
+        self,
+        num_episodes: int,
+        steps_per_episode: int = None,  # Now optional - if None, use actual episode lengths
+        device: str = 'cpu',
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        sequence_length: int = 4096,
+        compute_importance_weights: bool = False,
+        importance_weight_beta: float = 0.4,
+        max_retries: int = 100,
+        min_episode_length: int = 1  # Minimum episode length to accept
+    ) -> Optional[Tuple[DataProto, List[List[int]]]]:
+        """
+        Sample complete episodes for Hierarchical RL.
+
+        This method samples COMPLETE episodes (from step 0 to done=True),
+        respecting natural episode boundaries. Episodes can have variable lengths.
+
+        Following Stable-Baselines3/Tianshou convention:
+        - Uses `done` flag to identify episode boundaries
+        - Supports variable-length episodes (no fixed steps_per_episode requirement)
+        - Returns `done` mask for GAE computation
+
+        Args:
+            num_episodes: Number of episodes to sample
+            steps_per_episode: If provided, used as max_steps hint. If None, use actual lengths.
+            device: Target device for tensors
+            tokenizer: Tokenizer for padding
+            sequence_length: Maximum sequence length for padding
+            compute_importance_weights: Whether to compute PER importance weights
+            importance_weight_beta: Beta parameter for importance weights
+            max_retries: Maximum retries (unused in new implementation)
+            min_episode_length: Minimum episode length to accept (default 1)
+
+        Returns:
+            Tuple of (DataProto, episode_boundaries):
+            - DataProto: Batch containing all steps from sampled episodes, with `done` mask
+            - episode_boundaries: List of starting indices for each episode in the batch
+        """
+        if len(self._episode_index) == 0:
+            logger.warning("[HIER_SAMPLE] No episodes in buffer - episode_index is empty")
+            return None, []
+
+        buffer_list = list(self.steps)
+        priority_fn_name = self.priority_fn.__name__
+
+        # Build list of complete episodes from the index
+        # An episode is "complete" if it has step 0 and at least one step with done=True
+        complete_episodes = []
+        for traj_id, step_dict in self._episode_index.items():
+            if 0 not in step_dict:
+                continue  # Skip incomplete episodes (no step 0)
+
+            # Get all steps for this episode in order
+            sorted_steps = sorted(step_dict.keys())
+            indices = [step_dict[s] for s in sorted_steps]
+            episode_length = len(indices)
+
+            # Check minimum length requirement
+            if episode_length < min_episode_length:
+                continue
+
+            # Verify the last step has done=True (episode actually ended)
+            last_step_entry = buffer_list[indices[-1]]
+            if not last_step_entry.done:
+                continue  # Episode not yet complete
+
+            complete_episodes.append({
+                'traj_id': traj_id,
+                'indices': indices,
+                'length': episode_length
+            })
+
+        # Log episode statistics
+        if complete_episodes:
+            ep_lengths = [ep['length'] for ep in complete_episodes]
+            logger.info(
+                f"[HIER_SAMPLE] Found {len(complete_episodes)} complete episodes "
+                f"(total in index: {len(self._episode_index)}). "
+                f"Length stats: min={min(ep_lengths)}, max={max(ep_lengths)}, "
+                f"mean={sum(ep_lengths)/len(ep_lengths):.1f}"
+            )
+        else:
+            # Detailed diagnostics - check why episodes are not complete
+            has_step_0 = sum(1 for ep in self._episode_index.values() if 0 in ep)
+            total_steps = sum(len(ep) for ep in self._episode_index.values())
+
+            # Debug: Check done flags in buffer
+            done_count = sum(1 for entry in buffer_list if entry.done)
+
+            # Debug: Sample a few episodes to see their structure
+            sample_debug_info = []
+            for traj_id, step_dict in list(self._episode_index.items())[:3]:
+                sorted_steps = sorted(step_dict.keys())
+                indices = [step_dict[s] for s in sorted_steps]
+                if indices:
+                    # Check if index is valid
+                    last_idx = indices[-1]
+                    if last_idx < len(buffer_list):
+                        last_entry = buffer_list[last_idx]
+                        sample_debug_info.append(
+                            f"traj={traj_id[:8]}, steps={sorted_steps}, "
+                            f"last_idx={last_idx}, done={last_entry.done}, step_attr={last_entry.step}"
+                        )
+                    else:
+                        sample_debug_info.append(
+                            f"traj={traj_id[:8]}, steps={sorted_steps}, "
+                            f"last_idx={last_idx} OUT OF RANGE (buffer_len={len(buffer_list)})"
+                        )
+
+            logger.warning(
+                f"[HIER_SAMPLE] No complete episodes found! "
+                f"Episodes with step 0: {has_step_0}/{len(self._episode_index)}, "
+                f"total indexed steps: {total_steps}, "
+                f"min_episode_length required: {min_episode_length}, "
+                f"done_count in buffer: {done_count}/{len(buffer_list)}"
+            )
+            if sample_debug_info:
+                logger.warning(f"[HIER_SAMPLE] Sample episodes: {sample_debug_info}")
+            return None, []
+
+        # Sample episodes
+        if len(complete_episodes) >= num_episodes:
+            # Enough episodes - sample without replacement
+            if priority_fn_name in ["lifo_priority", "fifo_priority", "uniform_priority"]:
+                sampled_episodes = self.rng.sample(complete_episodes, num_episodes)
+            else:
+                # Priority-based: compute episode priority as mean of step priorities
+                episode_priorities = []
+                for ep in complete_episodes:
+                    ep_priority = sum(buffer_list[idx].priority for idx in ep['indices']) / len(ep['indices'])
+                    episode_priorities.append(max(ep_priority, 1e-8))
+
+                total_priority = sum(episode_priorities)
+                probs = [p / total_priority for p in episode_priorities]
+                sampled_indices = self.rng.choices(range(len(complete_episodes)), weights=probs, k=num_episodes)
+                sampled_episodes = [complete_episodes[i] for i in sampled_indices]
+        else:
+            # Not enough episodes - sample with replacement
+            logger.info(
+                f"[HIER_SAMPLE] Only {len(complete_episodes)} complete episodes available, "
+                f"sampling {num_episodes} with replacement"
+            )
+            sampled_episodes = self.rng.choices(complete_episodes, k=num_episodes)
+
+        # Build the batch - flatten episodes while tracking boundaries
+        all_indices = []
+        episode_boundaries = []
+        episode_lengths = []
+
+        for ep in sampled_episodes:
+            episode_boundaries.append(len(all_indices))
+            episode_lengths.append(len(ep['indices']))
+            all_indices.extend(ep['indices'])
+
+            # Update sample counts
+            if priority_fn_name not in ["lifo_priority", "fifo_priority", "uniform_priority"]:
+                for idx in ep['indices']:
+                    buffer_list[idx].sample_count += 1
+
+        logger.info(
+            f"[HIER_SAMPLE] Sampled {len(sampled_episodes)} episodes, "
+            f"total steps: {len(all_indices)}, "
+            f"episode lengths: min={min(episode_lengths)}, max={max(episode_lengths)}, "
+            f"mean={sum(episode_lengths)/len(episode_lengths):.1f}"
+        )
+
+        total_samples = len(all_indices)
+        max_seq_len = sequence_length
+        target_device = torch.device(device if device is not None else 'cpu')
+
+        # Prepare tensors
+        batch_input_ids = torch.zeros((total_samples, max_seq_len), dtype=torch.long, device=target_device)
+        batch_attention_mask = torch.zeros((total_samples, max_seq_len), dtype=torch.bool, device=target_device)
+        batch_position_ids = torch.zeros((total_samples, max_seq_len), dtype=torch.long, device=target_device)
+        batch_response_mask = torch.zeros((total_samples, max_seq_len), dtype=torch.bool, device=target_device)
+        batch_prompt_mask = torch.zeros((total_samples, max_seq_len), dtype=torch.bool, device=target_device)
+        batch_scores = torch.zeros((total_samples, max_seq_len), dtype=torch.float, device=target_device)
+        batch_penalties = torch.zeros(total_samples, dtype=torch.float, device=target_device)
+        batch_old_log_probs = torch.zeros((total_samples, max_seq_len - 1), dtype=torch.float, device=target_device)
+
+        pad_token_id = tokenizer.pad_token_id if tokenizer else 0
+
+        # Prepare non-tensor batch
+        env_ids = []
+        group_ids = []
+        messages_lists = []
+        tags = []
+        frames_lists = []
+        step_scores_lists = []
+        episode_scores_lists = []
+        traj_group_ids = []
+        traj_ids = []
+        state_hashes = []
+        steps = []
+        dones = []  # Episode termination flags (for GAE computation)
+
+        # Fill batch from sampled indices
+        for i, buffer_idx in enumerate(all_indices):
+            step_entry = buffer_list[buffer_idx]
+
+            # Convert numpy arrays to tensors
+            step_input_ids = torch.from_numpy(step_entry.input_ids)
+            step_attention_mask = torch.from_numpy(step_entry.attention_mask.astype(bool))
+            step_position_ids = torch.from_numpy(step_entry.position_ids)
+            step_response_mask = torch.from_numpy(step_entry.response_mask.astype(bool))
+            step_prompt_mask = torch.from_numpy(step_entry.prompt_mask.astype(bool))
+            step_scores = torch.from_numpy(step_entry.scores)
+            step_behavior_log_probs = torch.from_numpy(step_entry.behavior_log_probs)
+
+            # Pad tensors
+            batch_input_ids[i] = pad_to_length(step_input_ids, max_seq_len, pad_token_id)
+            batch_attention_mask[i] = pad_to_length(step_attention_mask, max_seq_len, 0)
+            batch_position_ids[i] = pad_to_length(step_position_ids, max_seq_len, 0)
+            batch_response_mask[i] = pad_to_length(step_response_mask, max_seq_len, 0)
+            batch_prompt_mask[i] = pad_to_length(step_prompt_mask, max_seq_len, 0)
+            batch_scores[i] = pad_to_length(step_scores, max_seq_len, 0.0)
+            batch_penalties[i] = step_entry.penalty
+            batch_old_log_probs[i] = pad_to_length(step_behavior_log_probs, max_seq_len - 1, 0.0)
+
+            # Collect non-tensor data
+            env_ids.append(step_entry.env_id)
+            group_ids.append(step_entry.group_id)
+            messages_lists.append(step_entry.messages_list)
+            tags.append(step_entry.tag)
+            frames_lists.append(step_entry.frames)
+            step_scores_lists.append(step_entry.step_scores)
+            episode_scores_lists.append(step_entry.episode_scores)
+            traj_group_ids.append(step_entry.traj_group_id)
+            traj_ids.append(step_entry.traj_id)
+            state_hashes.append(step_entry.state_hash)
+            steps.append(step_entry.step)
+            dones.append(step_entry.done)  # Collect done flags
+
+        # Create done mask tensor (CRITICAL for GAE computation)
+        # Following Stable-Baselines3 convention: done[t] = 1 if step t is terminal
+        batch_dones = torch.tensor(dones, dtype=torch.float, device=target_device)
+
+        # Create DataProto
+        dataproto = DataProto()
+        dataproto.batch = TensorDict({
+            "input_ids": batch_input_ids,
+            "attention_mask": batch_attention_mask,
+            "position_ids": batch_position_ids,
+            "response_mask": batch_response_mask,
+            "prompt_mask": batch_prompt_mask,
+            "scores": batch_scores,
+            "penalty": batch_penalties,
+            "old_log_probs": batch_old_log_probs,
+            "dones": batch_dones,  # Episode termination flags for GAE
+        }, batch_size=[total_samples])
+
+        dataproto.non_tensor_batch = {
+            "env_ids": np.array(env_ids, dtype=object),
+            "group_ids": np.array(group_ids, dtype=object),
+            "messages_list": np.array(messages_lists, dtype=object),
+            "tags": np.array(tags, dtype=object),
+            "frames": np.array(frames_lists, dtype=object),
+            "step_scores": np.array(step_scores_lists, dtype=object),
+            "episode_scores": np.array(episode_scores_lists, dtype=object),
+            "traj_group_id": np.array(traj_group_ids, dtype=object),
+            "traj_id": np.array(traj_ids, dtype=object),
+            "state_hash": np.array(state_hashes, dtype=object),
+            "step": np.array(steps, dtype=object),
+            "done": np.array(dones, dtype=object),  # Also in non_tensor for compatibility
+        }
+
+        dataproto.meta_info = {
+            "from_replay_buffer": True,
+            "buffer_type": "step",
+            "sampling_mode": "hierarchical",
+            "num_episodes": len(sampled_episodes),
+            "episode_lengths": episode_lengths,  # Variable lengths per episode
+            "episode_boundaries": episode_boundaries,  # CRITICAL: Episode structure for hierarchical RL
+            "total_samples": total_samples,
+            "buffer_utilization": len(self.steps) / self.capacity,
+            "sampled_indices": all_indices,
+            "dones": batch_dones,  # Episode termination flags for GAE (tensor)
+        }
+
+        # Compute importance weights if requested
+        if compute_importance_weights and priority_fn_name not in ["lifo_priority", "fifo_priority", "uniform_priority"]:
+            importance_weights = self.compute_importance_weights(all_indices, beta=importance_weight_beta)
+            dataproto.batch["importance_weights"] = torch.from_numpy(importance_weights).to(target_device)
+            logger.debug(f"Computed importance weights with beta={importance_weight_beta:.2f}, mean={importance_weights.mean():.4f}")
+
+        return dataproto, episode_boundaries
+
     def _sample_proportional(self, batch_size: int, buffer_size: int) -> List[int]:
         """
         Sample indices based on priorities using Segment Tree.
@@ -522,21 +820,22 @@ class StepReplayBuffer(BaseReplayBuffer):
 
     def update_priorities(self, indices: List[int], priorities: np.ndarray, current_global_step: Optional[int] = None) -> None:
         """
-        Update priorities for sampled steps after training, with age-aware weighting.
+        Update priorities for sampled steps after training (standard PER).
 
-        This implements a two-factor priority system:
-        1. Intrinsic value (advantage-based): How surprising/valuable the sample is
-        2. Freshness weight (age-based): How recent the sample is
+        Standard PER formula:
+            tree[idx] = priority^α
+            max_priority = max(max_priority, priority)
 
-        Final effective priority = intrinsic_value * freshness_weight
-        where freshness_weight = exp(-age / age_decay)
+        Optional age decay (when enable_age_decay=True):
+            effective_priority = priority × exp(-age / age_decay)
+            tree[idx] = effective_priority^α
 
         Time complexity: O(k * log n) where k = len(indices)
 
         Args:
             indices: Buffer indices of sampled steps
-            priorities: New intrinsic priority values (e.g., |advantage|, |TD-error|, |loss|)
-            current_global_step: Current training step for age calculation (optional, uses self.current_global_step if None)
+            priorities: New priority values (e.g., |advantage|, |TD-error|)
+            current_global_step: Current training step for age calculation (only used if enable_age_decay=True)
 
         Example:
             >>> # After training and computing advantages
@@ -551,40 +850,44 @@ class StepReplayBuffer(BaseReplayBuffer):
         buffer_list = list(self.steps)
         global_step = current_global_step if current_global_step is not None else self.current_global_step
 
-        for idx, intrinsic_priority in zip(indices, priorities):
+        for idx, priority in zip(indices, priorities):
             if not (0 <= idx < len(buffer_list)):
                 logger.warning(f"Invalid index {idx} for buffer size {len(buffer_list)}, skipping")
                 continue
 
-            # Ensure intrinsic priority is positive (add small epsilon)
-            intrinsic_priority = max(float(intrinsic_priority), 1e-6)
+            # Ensure priority is positive (add small epsilon)
+            priority = max(float(priority), 1e-6)
 
-            # Compute age-based freshness weight
-            sample_age = global_step - buffer_list[idx].global_step
-            freshness_weight = np.exp(-sample_age / self.age_decay)
+            # Update step entry priority (store raw value for debugging)
+            buffer_list[idx].priority = priority
 
-            # Compute effective priority: intrinsic value × freshness
-            effective_priority = intrinsic_priority * freshness_weight
+            # Compute effective priority (with optional age decay)
+            if self.enable_age_decay:
+                sample_age = global_step - buffer_list[idx].global_step
+                freshness_weight = np.exp(-sample_age / self.age_decay)
+                effective_priority = priority * freshness_weight
+            else:
+                effective_priority = priority
 
-            # Update segment trees with effective_priority^alpha
+            # Update segment trees with priority^alpha (standard PER)
             priority_alpha = effective_priority ** self.priority_exponent
             self._it_sum[idx] = priority_alpha
             self._it_min[idx] = priority_alpha
 
-            # Update step entry intrinsic priority (store raw value for debugging)
-            buffer_list[idx].priority = intrinsic_priority
-
             # Track maximum priority
-            self._max_priority = max(self._max_priority, effective_priority)
+            self._max_priority = max(self._max_priority, priority)
 
-        logger.debug(f"Updated priorities for {len(indices)} steps with age decay. "
-                    f"Max effective priority: {self._max_priority:.4f}")
+        logger.debug(f"Updated priorities for {len(indices)} steps. "
+                    f"Max priority: {self._max_priority:.4f}, age_decay={self.enable_age_decay}")
 
     def get_effective_priority(self, idx: int, current_global_step: Optional[int] = None) -> float:
         """
         Compute effective priority for a given buffer index.
 
-        effective_priority = intrinsic_priority * exp(-age / age_decay)
+        If enable_age_decay=True:
+            effective_priority = priority × exp(-age / age_decay)
+        Otherwise:
+            effective_priority = priority
 
         Args:
             idx: Buffer index
@@ -597,11 +900,13 @@ class StepReplayBuffer(BaseReplayBuffer):
         if not (0 <= idx < len(buffer_list)):
             return 0.0
 
-        global_step = current_global_step if current_global_step is not None else self.current_global_step
-        sample_age = global_step - buffer_list[idx].global_step
-        freshness_weight = np.exp(-sample_age / self.age_decay)
-
-        return buffer_list[idx].priority * freshness_weight
+        if self.enable_age_decay:
+            global_step = current_global_step if current_global_step is not None else self.current_global_step
+            sample_age = global_step - buffer_list[idx].global_step
+            freshness_weight = np.exp(-sample_age / self.age_decay)
+            return buffer_list[idx].priority * freshness_weight
+        else:
+            return buffer_list[idx].priority
 
     @staticmethod
     def compute_advantage_priorities(batch: DataProto) -> np.ndarray:

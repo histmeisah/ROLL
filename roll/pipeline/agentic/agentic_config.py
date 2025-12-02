@@ -210,25 +210,65 @@ class ReplayConfig:
         metadata={"help": "Truncation horizon for GAE computation (limits lookback)."}
     )
 
-    # Age-based Priority Configuration
+    # ==========================================================================
+    # Priority Configuration (Prioritized Experience Replay)
+    # ==========================================================================
+    # priority_function determines BOTH initial priority AND update metric.
+    # This ensures consistency - no more split between "initial" and "update" priorities.
+    #
+    # Available functions:
+    #   - "uniform": Equal priority, random sampling (default)
+    #   - "lifo": Last-In-First-Out, newest samples first (Echo mode)
+    #   - "fifo": First-In-First-Out, oldest samples first
+    #   - "reward": Priority = |reward|, updated with reward after training
+    #   - "advantage": Priority = |advantage|, updated after training
+    #   - "td_error": Priority = |TD-error|, standard PER
+    #   - "recency": Priority decays with age (no update needed)
+    # ==========================================================================
+    priority_function: str = field(
+        default="uniform",
+        metadata={
+            "help": "Priority function for sampling. Determines both initial priority and update metric. "
+                    "Options: uniform, lifo, fifo, reward, advantage, td_error, recency."
+        }
+    )
+    priority_exponent: float = field(
+        default=0.6,
+        metadata={
+            "help": "Priority exponent (alpha in PER). 0.0 = uniform sampling, 1.0 = full prioritization."
+        }
+    )
+    importance_sampling_correction: bool = field(
+        default=False,
+        metadata={
+            "help": "Apply importance sampling correction to compensate for non-uniform sampling bias."
+        }
+    )
+    importance_beta: float = field(
+        default=0.4,
+        metadata={
+            "help": "Importance sampling exponent (beta in PER). Should anneal from 0.4 to 1.0 during training."
+        }
+    )
+    enable_age_decay: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable age-based freshness weighting. When False (default), uses standard PER. "
+                    "When True, older samples get lower effective priority."
+        }
+    )
     age_decay: float = field(
         default=1000.0,
         metadata={
-            "help": "Age decay constant for freshness weighting in priority replay. "
-                    "Effective priority = intrinsic_priority * exp(-age / age_decay). "
-                    "Larger values (e.g., 10000) decay slower (older samples stay relevant longer). "
-                    "Smaller values (e.g., 100) decay faster (strong preference for fresh samples)."
+            "help": "Age decay constant for freshness weighting (only used if enable_age_decay=True). "
+                    "Effective priority = priority * exp(-age / age_decay). "
+                    "Smaller values = stronger preference for fresh samples."
         }
     )
-
-    # Advantage-based Priority Configuration
-    use_advantage_priority: bool = field(
-        default=False,
+    eviction_strategy: Literal["fifo", "smart"] = field(
+        default="fifo",
         metadata={
-            "help": "Whether to update replay buffer priorities using advantages after training. "
-                    "If True, priorities are updated with |advantage| after compute_advantage(). "
-                    "Initial priorities (at push) still use the configured priority function (e.g., reward). "
-                    "This implements the two-stage priority strategy: reward → advantage."
+            "help": "Eviction strategy when buffer is full. 'fifo' (default) or 'smart'."
         }
     )
 

@@ -316,6 +316,36 @@ PRIORITY_FUNCTIONS = {
     "length": length_priority,           # Priority based on sequence length
 }
 
+# Mapping: priority_function -> update_metric
+# This ensures consistency: the same signal used for initial priority is used for updates
+PRIORITY_UPDATE_METRIC = {
+    # No update needed (deterministic or auto-decaying)
+    "uniform": None,
+    "lifo": None,
+    "fifo": None,
+    "recency": None,   # Age decays automatically
+    "length": None,    # Length doesn't change
+
+    # Update with the same metric after training
+    "reward": "reward",
+    "advantage": "advantage",
+    "td_error": "td_error",
+    "combined": "reward",  # Only reward part needs update, recency auto-decays
+}
+
+
+def get_update_metric(priority_function: str) -> str:
+    """
+    Get the update metric for a given priority function.
+
+    Args:
+        priority_function: Name of the priority function
+
+    Returns:
+        Update metric name, or None if no update needed
+    """
+    return PRIORITY_UPDATE_METRIC.get(priority_function.lower(), None)
+
 
 def get_priority_function(name: str):
     """

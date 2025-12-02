@@ -329,11 +329,26 @@ class ActorWorker(Worker):
             dual_clip_loss = -torch.max(-pg_loss, (1 + self.pipeline_config.pg_clip * 2) * advantages)
             pg_loss = torch.where(advantages < 0, dual_clip_loss, pg_loss)
 
-        pg_loss = agg_loss(loss_mat=pg_loss, loss_mask=response_mask, loss_agg_mode=self.pipeline_config.loss_agg_mode)
+        # Apply PER importance sampling weights if available
+        # This corrects the bias introduced by prioritized sampling
+        # Formula: weighted_loss = importance_weight * loss
+        per_importance_weights = data.batch.get("importance_weights", None)
+
+        pg_loss = agg_loss(
+            loss_mat=pg_loss,
+            loss_mask=response_mask,
+            loss_agg_mode=self.pipeline_config.loss_agg_mode,
+            weights=per_importance_weights
+        )
 
         kl_loss = compute_approx_kl(log_probs=log_probs, log_probs_base=ref_log_probs, action_mask=response_mask,
                                     kl_penalty="k3")
-        kl_loss = agg_loss(loss_mat=kl_loss, loss_mask=response_mask, loss_agg_mode=self.pipeline_config.loss_agg_mode)
+        kl_loss = agg_loss(
+            loss_mat=kl_loss,
+            loss_mask=response_mask,
+            loss_agg_mode=self.pipeline_config.loss_agg_mode,
+            weights=per_importance_weights
+        )
 
         approxkl = compute_approx_kl(
             log_probs=log_probs, log_probs_base=old_log_probs, action_mask=response_mask, kl_penalty="mse"
@@ -377,6 +392,12 @@ class ActorWorker(Worker):
             "actor/policykl": agg_loss(loss_mat=policykl, loss_mask=response_mask,
                                        loss_agg_mode=self.pipeline_config.loss_agg_mode).detach().item(),
         }
+
+        # Log PER importance weights statistics if available
+        if per_importance_weights is not None:
+            pg_metrics["actor/per_importance_weights_mean"] = per_importance_weights.mean().detach().item()
+            pg_metrics["actor/per_importance_weights_max"] = per_importance_weights.max().detach().item()
+            pg_metrics["actor/per_importance_weights_min"] = per_importance_weights.min().detach().item()
 
         # Return log_probs for off-policy monitoring (detach to avoid keeping computation graph)
         return total_loss, pg_metrics, {"log_probs": log_probs.detach()}

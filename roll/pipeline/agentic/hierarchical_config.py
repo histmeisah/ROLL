@@ -238,13 +238,55 @@ def validate_hierarchical_config(config: HierarchicalRLConfig, pipeline_config=N
                     f"got {pipeline_config.env_manager_type}"
                 )
 
-        # Warn if not using replay buffer
-        if hasattr(pipeline_config, 'replay'):
-            if not pipeline_config.replay.enabled:
-                logger.warning(
-                    "Hierarchical RL is recommended to use with replay buffer "
-                    "for better step-level learning"
+        # Validate replay buffer configuration for step-level GAE/N-step
+        # NOTE: Fresh batches can now extract episode boundaries from traj_id field,
+        # so replay buffer is recommended but not strictly required.
+        if config.step_level_estimator in ["gae", "nstep"]:
+            if hasattr(pipeline_config, 'replay') and pipeline_config.replay.enabled:
+                # Validate steps_per_episode configuration for replay buffer sampling
+                if not hasattr(pipeline_config.replay, 'steps_per_episode'):
+                    logger.warning(
+                        f"replay.steps_per_episode not configured. "
+                        f"For replay buffer hierarchical sampling, set this to match your episode length. "
+                        f"Fresh batches will auto-extract episode boundaries from traj_id."
+                    )
+                else:
+                    steps_per_episode = pipeline_config.replay.steps_per_episode
+                    if steps_per_episode < 2:
+                        logger.warning(
+                            f"replay.steps_per_episode={steps_per_episode} is < 2. "
+                            f"For step-level GAE/N-step with replay buffer, consider setting >= 2. "
+                            f"Fresh batches will auto-extract episode boundaries from traj_id."
+                        )
+                    else:
+                        # Validate batch size compatibility
+                        if hasattr(pipeline_config, 'rollout_batch_size'):
+                            batch_size = pipeline_config.rollout_batch_size
+                            if batch_size % steps_per_episode != 0:
+                                logger.warning(
+                                    f"rollout_batch_size ({batch_size}) is not divisible by "
+                                    f"steps_per_episode ({steps_per_episode}). "
+                                    f"This may lead to inefficient sampling. "
+                                    f"Consider setting batch_size to a multiple of steps_per_episode."
+                                )
+
+                # Recommend specific buffer settings
+                logger.info(
+                    f"Hierarchical RL with {config.step_level_estimator} and replay buffer enabled. "
+                    f"Replay batches will use sample_episodes_for_hierarchical() for correct bootstrap."
                 )
+            else:
+                logger.info(
+                    f"Hierarchical RL with {config.step_level_estimator} without replay buffer. "
+                    f"Fresh batches will auto-extract episode boundaries from traj_id field. "
+                    f"Ensure StepEnvManager is used (provides traj_id for each step)."
+                )
+        else:
+            # monte_carlo estimator doesn't need episode structure
+            logger.info(
+                f"Using step_level_estimator='{config.step_level_estimator}' which doesn't require "
+                f"episode structure. Replay buffer is optional."
+            )
 
     logger.info(
         f"Hierarchical RL config validated: "

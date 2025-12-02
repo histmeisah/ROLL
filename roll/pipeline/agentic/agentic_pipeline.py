@@ -51,6 +51,7 @@ class AgenticPipeline(BasePipeline):
     def __init__(self, pipeline_config: AgenticConfig):
         super().__init__(pipeline_config)
         self.pipeline_config: AgenticConfig
+        self.logger = logger  # Initialize logger instance
 
         self.pipeline_config.set_max_steps(max_steps=self.pipeline_config.max_steps)
 
@@ -174,19 +175,10 @@ class AgenticPipeline(BasePipeline):
             # Calculate batch size
             batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
 
-            # Create NumPy-based replay buffer with priority support (memory-efficient, proven stable)
-            # Default to 'lifo' for Echo mode compatibility (train_steps_per_env_step=1)
-            # Support both old flat config and new nested priority config
-            if hasattr(rb_cfg, 'priority') and rb_cfg.priority is not None:
-                # New nested config structure
-                priority_function = getattr(rb_cfg.priority, 'function', 'lifo')
-                priority_exponent = getattr(rb_cfg.priority, 'alpha', 0.6)
-                priority_kwargs = getattr(rb_cfg.priority, 'kwargs', {})
-            else:
-                # Old flat config structure (backward compatibility)
-                priority_function = getattr(rb_cfg, 'priority_function', 'lifo')
-                priority_exponent = getattr(rb_cfg, 'priority_exponent', 0.6)
-                priority_kwargs = getattr(rb_cfg, 'priority_kwargs', {})
+            # Priority configuration - simple flat structure
+            priority_function = getattr(rb_cfg, 'priority_function', 'uniform')
+            priority_exponent = getattr(rb_cfg, 'priority_exponent', 0.6)
+            self._priority_function = priority_function
 
             logger.info(
                 f"Creating replay buffer: manager_type={manager_type}, capacity={rb_cfg.capacity}, "
@@ -201,12 +193,12 @@ class AgenticPipeline(BasePipeline):
                 seed=self.pipeline_config.seed,
                 priority_function=priority_function,
                 priority_exponent=priority_exponent,
-                priority_kwargs=priority_kwargs,
                 enable_nstep=getattr(rb_cfg, 'enable_nstep', False),
                 n_step=getattr(rb_cfg, 'n_step', 5),
                 gamma=getattr(rb_cfg, 'nstep_gamma', 0.99),
+                enable_age_decay=getattr(rb_cfg, 'enable_age_decay', False),
                 age_decay=getattr(rb_cfg, 'age_decay', 1000.0),
-                use_advantage_priority=getattr(rb_cfg, 'use_advantage_priority', False),
+                eviction_strategy=getattr(rb_cfg, 'eviction_strategy', 'fifo'),
             )
 
             logger.info(f"Successfully initialized replay buffer: {type(self.replay_buffer).__name__}")
@@ -461,6 +453,11 @@ class AgenticPipeline(BasePipeline):
                     # Compute advantages using hierarchical RL or standard method
                     if self.hierarchical_computer is not None:
                         # Hierarchical RL: Use two-level advantage computation
+                        # NOTE: Fresh batch from EnvManager doesn't have episode structure,
+                        # so step-level GAE/N-step will compute over independent steps (incorrect bootstrap).
+                        # Consider using monte_carlo estimator for fresh batch, or only use hierarchical RL
+                        # with replay buffer where episode structure is available.
+
                         # Extract environment rewards (step-level)
                         env_rewards = batch.batch.get("response_level_rewards", None)
                         if env_rewards is None:
@@ -476,12 +473,59 @@ class AgenticPipeline(BasePipeline):
                         # Store original token rewards for mixing if needed
                         original_token_rewards = batch.batch.get("token_level_rewards", None)
 
+                        # Extract dones tensor (PREFERRED) or episode_boundaries (legacy)
+                        # Following Stable-Baselines3/Tianshou convention for episode handling
+                        dones = None
+                        episode_boundaries = batch.meta_info.get("episode_boundaries", None)
+                        steps_per_episode = batch.meta_info.get("steps_per_episode", None)
+
+                        # Try to extract dones from non_tensor_batch (fresh batch from StepEnvManager)
+                        if "done" in batch.non_tensor_batch:
+                            # Convert bool array to float tensor for GAE computation
+                            done_array = batch.non_tensor_batch["done"]
+                            dones = torch.tensor([bool(d) for d in done_array], dtype=torch.float32, device=env_rewards.device)
+                            num_episodes = int(dones.sum().item())
+                            logger.info(
+                                f"Extracted dones from fresh batch: "
+                                f"{num_episodes} episode ends in batch of {len(dones)} steps"
+                            )
+                        # Fallback: Try to extract from meta_info (replay batch)
+                        elif "dones" in batch.meta_info:
+                            dones = batch.meta_info["dones"]
+                            if not isinstance(dones, torch.Tensor):
+                                dones = torch.tensor(dones, dtype=torch.float32, device=env_rewards.device)
+                            num_episodes = int(dones.sum().item())
+                            logger.info(
+                                f"Extracted dones from meta_info: "
+                                f"{num_episodes} episode ends in batch of {len(dones)} steps"
+                            )
+                        # Legacy fallback: extract from traj_id (for backward compatibility)
+                        elif episode_boundaries is None:
+                            episode_boundaries, steps_per_episode = extract_episode_boundaries_from_batch(batch)
+                            if episode_boundaries is not None:
+                                logger.info(
+                                    f"Extracted episode structure from traj_id (legacy): "
+                                    f"{len(episode_boundaries)} episodes, {steps_per_episode} steps/episode"
+                                )
+
+                        # Warn if no episode info available for GAE/N-step
+                        has_episode_info = dones is not None or episode_boundaries is not None
+                        if not has_episode_info and self.pipeline_config.hierarchical.step_level_estimator in ["gae", "nstep"]:
+                            logger.warning(
+                                f"Fresh batch lacks episode structure for hierarchical {self.pipeline_config.hierarchical.step_level_estimator}. "
+                                f"No dones or traj_id found in batch. Step-level advantages will be computed over independent steps (incorrect bootstrap). "
+                                f"Consider using step_level_estimator='monte_carlo' for fresh batch."
+                            )
+
                         # Compute hierarchical advantages
                         hier_results = self.hierarchical_computer.compute(
                             env_rewards=env_rewards,
                             token_values=token_values,
                             response_masks=response_mask,
-                            original_token_rewards=original_token_rewards
+                            original_token_rewards=original_token_rewards,
+                            episode_boundaries=episode_boundaries,
+                            steps_per_episode=steps_per_episode,
+                            dones=dones
                         )
 
                         # Replace batch data with hierarchical results
@@ -717,20 +761,53 @@ class AgenticPipeline(BasePipeline):
                                 )
 
                             else:
-                                # No filtering: sample normally
-                                sample_result = self.replay_buffer.sample_for_training(
-                                    batch_size=training_batch_size,
-                                    device='cpu',
-                                    tokenizer=self.tokenizer,
-                                    sequence_length=self.pipeline_config.sequence_length,
-                                    sampling_mode=rb_cfg.sampling_mode,
-                                    steps_per_episode=rb_cfg.steps_per_episode,
-                                    sample_method=getattr(rb_cfg, 'sample_method', 'uniform'),
-                                    candidates_per_group=getattr(rb_cfg, 'candidates_per_group', 1),
-                                    group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
-                                    compute_importance_weights=getattr(rb_cfg.priority, 'use_importance_weights', False) if hasattr(rb_cfg, 'priority') else False,
-                                    importance_weight_beta=getattr(rb_cfg.priority, 'importance_beta', 0.4) if hasattr(rb_cfg, 'priority') else 0.4,
+                                # Determine sampling method based on hierarchical RL mode
+                                use_hierarchical_sampling = (
+                                    self.hierarchical_computer is not None and
+                                    self.pipeline_config.hierarchical.step_level_estimator in ["gae", "nstep"]
                                 )
+
+                                if use_hierarchical_sampling:
+                                    # Hierarchical RL sampling: sample episode sequences
+                                    steps_per_episode = getattr(rb_cfg, 'steps_per_episode', 4)
+                                    num_episodes = training_batch_size // steps_per_episode
+
+                                    if num_episodes == 0:
+                                        logger.error(
+                                            f"Training batch size ({training_batch_size}) is smaller than "
+                                            f"steps_per_episode ({steps_per_episode}). Cannot sample episode sequences!"
+                                        )
+                                        break
+
+                                    logger.info(
+                                        f"Hierarchical sampling: {num_episodes} episodes × {steps_per_episode} steps = "
+                                        f"{num_episodes * steps_per_episode} total samples"
+                                    )
+
+                                    sample_result = self.replay_buffer.sample_episodes_for_hierarchical(
+                                        num_episodes=num_episodes,
+                                        steps_per_episode=steps_per_episode,
+                                        device='cpu',
+                                        tokenizer=self.tokenizer,
+                                        sequence_length=self.pipeline_config.sequence_length,
+                                        compute_importance_weights=getattr(rb_cfg, 'importance_sampling_correction', False),
+                                        importance_weight_beta=getattr(rb_cfg, 'importance_beta', 0.4),
+                                    )
+                                else:
+                                    # Standard sampling: independent steps
+                                    sample_result = self.replay_buffer.sample_for_training(
+                                        batch_size=training_batch_size,
+                                        device='cpu',
+                                        tokenizer=self.tokenizer,
+                                        sequence_length=self.pipeline_config.sequence_length,
+                                        sampling_mode=rb_cfg.sampling_mode,
+                                        steps_per_episode=rb_cfg.steps_per_episode,
+                                        sample_method=getattr(rb_cfg, 'sample_method', 'uniform'),
+                                        candidates_per_group=getattr(rb_cfg, 'candidates_per_group', 1),
+                                        group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
+                                        compute_importance_weights=getattr(rb_cfg, 'importance_sampling_correction', False),
+                                        importance_weight_beta=getattr(rb_cfg, 'importance_beta', 0.4),
+                                    )
 
                                 # Unpack result: (DataProto, indices) or None
                                 if sample_result is None or (isinstance(sample_result, tuple) and sample_result[0] is None):
@@ -837,11 +914,27 @@ class AgenticPipeline(BasePipeline):
                                 response_mask = mb.batch["response_mask"][:, 1:]
                                 original_token_rewards = mb.batch.get("token_level_rewards", None)
 
+                                # Extract dones tensor (PREFERRED) or episode_boundaries (legacy)
+                                # Following Stable-Baselines3/Tianshou convention for episode handling
+                                # Try meta_info first, then batch (for flexibility)
+                                dones = mb.meta_info.get("dones", None)
+                                if dones is None and "dones" in mb.batch:
+                                    dones = mb.batch["dones"]
+                                episode_boundaries = mb.meta_info.get("episode_boundaries", None)
+                                steps_per_episode = mb.meta_info.get("steps_per_episode", None)
+
+                                # Convert dones to tensor if needed
+                                if dones is not None and not isinstance(dones, torch.Tensor):
+                                    dones = torch.tensor(dones, dtype=torch.float32, device=env_rewards.device)
+
                                 hier_results = self.hierarchical_computer.compute(
                                     env_rewards=env_rewards,
                                     token_values=token_values,
                                     response_masks=response_mask,
-                                    original_token_rewards=original_token_rewards
+                                    original_token_rewards=original_token_rewards,
+                                    episode_boundaries=episode_boundaries,
+                                    steps_per_episode=steps_per_episode,
+                                    dones=dones
                                 )
 
                                 mb.batch["advantages"] = hier_results["token_advantages"]
@@ -933,22 +1026,12 @@ class AgenticPipeline(BasePipeline):
                             actor_metrics = DataProto.materialize_concat(data_refs=all_actor_refs)
                             metrics.update(reduce_metrics(actor_metrics.meta_info.pop("metrics", {})))
 
-                            # PER: Update priorities based on training loss or advantages
-                            update_enabled = (getattr(rb_cfg.priority, 'update_after_train', False)
-                                            if hasattr(rb_cfg, 'priority') else False)
+                            # PER: Update priorities based on priority_function
+                            # The update_metric is automatically derived from priority_function
+                            from roll.agentic.replay_buffer.priority_functions import get_update_metric
+                            priority_metric = get_update_metric(self._priority_function)
 
-                            # Auto-enable if use_advantage_priority is set
-                            if getattr(rb_cfg, 'use_advantage_priority', False):
-                                update_enabled = True
-
-                            if all_sampled_indices and update_enabled:
-                                # If use_advantage_priority=True, override metric to 'advantage'
-                                if getattr(rb_cfg, 'use_advantage_priority', False):
-                                    priority_metric = 'advantage'
-                                else:
-                                    priority_metric = (getattr(rb_cfg.priority, 'update_metric', 'loss')
-                                                     if hasattr(rb_cfg, 'priority') else 'loss')
-
+                            if all_sampled_indices and priority_metric is not None:
                                 self._update_replay_priorities(
                                     actor_metrics=actor_metrics,
                                     sampled_indices_list=all_sampled_indices,
@@ -1242,17 +1325,18 @@ class AgenticPipeline(BasePipeline):
             fresh_batch_size = fresh_batch.batch.batch_size[0]
             # Ensure device is not None - fall back to 'cpu' if needed
             target_device = fresh_batch.batch.device if fresh_batch.batch.device is not None else 'cpu'
+            rb_cfg = self.pipeline_config.replay
             with Timer(name="replay_buffer_sample", logger=None) as timer:
                 sample_result = self.replay_buffer.sample_for_training(
                     batch_size=fresh_batch_size,
                     device=target_device,
                     tokenizer=self.tokenizer,
                     sequence_length=self.pipeline_config.sequence_length,
-                    sampling_mode=self.pipeline_config.replay.sampling_mode,
-                    steps_per_episode=self.pipeline_config.replay.steps_per_episode,
-                    sample_method=getattr(self.pipeline_config.replay, 'sample_method', 'lifo'),
-                    compute_importance_weights=getattr(self.pipeline_config.replay.priority, 'use_importance_weights', False) if hasattr(self.pipeline_config.replay, 'priority') else False,
-                    importance_weight_beta=getattr(self.pipeline_config.replay.priority, 'importance_beta', 0.4) if hasattr(self.pipeline_config.replay, 'priority') else 0.4,
+                    sampling_mode=rb_cfg.sampling_mode,
+                    steps_per_episode=rb_cfg.steps_per_episode,
+                    sample_method=getattr(rb_cfg, 'sample_method', 'lifo'),
+                    compute_importance_weights=getattr(rb_cfg, 'importance_sampling_correction', False),
+                    importance_weight_beta=getattr(rb_cfg, 'importance_beta', 0.4),
                 )
 
             # Handle return value (backward compatible)
@@ -1373,77 +1457,52 @@ class AgenticPipeline(BasePipeline):
         actor_metrics: DataProto,
         sampled_indices_list: List[List[int]],
         batches: List[DataProto],
-        priority_metric: str = 'loss',
+        priority_metric: str = 'advantage',
         global_step: int = 0
     ):
         """
         Update replay buffer priorities based on training metrics.
 
-        This implements the priority update step in Prioritized Experience Replay (PER).
-        After training, we update the priorities of sampled trajectories/steps based on
-        a priority metric (loss, advantage, KL divergence, etc.).
+        The priority_metric is automatically determined by priority_function via
+        get_update_metric(). This ensures consistency: same signal for initial
+        priority and updates.
 
         Args:
-            actor_metrics: Metrics from actor training (contains per-sample losses)
+            actor_metrics: Metrics from actor training
             sampled_indices_list: List of sampled indices for each training batch
-            batches: List of sampled batches (for extracting advantages if needed)
-            priority_metric: Metric to use for priority ('loss', 'advantage', 'kl', 'reward')
+            batches: List of sampled batches (for extracting advantages/td_error)
+            priority_metric: Metric to use ('advantage', 'td_error', 'reward')
             global_step: Current training step (used for age-based priority decay)
         """
         try:
-            # Extract priority values based on chosen metric
-            if priority_metric == 'loss':
-                # Use per-sample loss as priority
-                # actor_metrics.meta_info["metrics"] should contain "train/loss"
-                metrics_dict = actor_metrics.meta_info.get("metrics", {})
-
-                # Try to get per-sample loss
-                if "train/loss" in metrics_dict:
-                    loss_value = metrics_dict["train/loss"]
-
-                    # If loss is a scalar (averaged), we can't update per-sample priorities
-                    if isinstance(loss_value, (int, float)):
-                        logger.warning("Loss is a scalar, cannot update per-sample priorities. Skipping priority update.")
-                        return
-
-                    # If loss is a tensor with per-sample values
-                    import torch
-                    if isinstance(loss_value, torch.Tensor):
-                        priorities = loss_value.detach().cpu().numpy()
-                    else:
-                        logger.warning(f"Loss has unexpected type {type(loss_value)}, skipping priority update")
-                        return
-                else:
-                    logger.warning("train/loss not found in metrics, skipping priority update")
-                    return
-
-            elif priority_metric == 'advantage':
+            if priority_metric == 'advantage':
                 # Use absolute advantage as priority
-                # Concatenate advantages from all batches
-                import torch
                 advantages = torch.cat([batch.batch["advantages"] for batch in batches], dim=0)
                 priorities = torch.abs(advantages).mean(dim=1).detach().cpu().numpy()
 
-            elif priority_metric == 'kl':
-                # Use KL divergence as priority (measures policy change)
-                import torch
-                kl_values = []
+            elif priority_metric == 'td_error':
+                # Use TD-error from critic as priority (standard PER)
+                # TD-error = |V(s) - (r + γV(s'))|, computed during critic training
+                td_errors = []
                 for batch in batches:
-                    if "old_log_probs" in batch.batch and "log_probs" in batch.batch:
-                        kl = (batch.batch["old_log_probs"] - batch.batch["log_probs"]).mean(dim=1)
-                        kl_values.append(kl)
+                    if "td_error" in batch.batch:
+                        td_errors.append(batch.batch["td_error"])
+                    elif "returns" in batch.batch and "values" in batch.batch:
+                        # Compute TD-error from returns and values
+                        td_error = torch.abs(batch.batch["returns"] - batch.batch["values"])
+                        td_errors.append(td_error.mean(dim=1))
 
-                if kl_values:
-                    priorities = torch.cat(kl_values, dim=0).detach().cpu().numpy()
+                if td_errors:
+                    priorities = torch.cat(td_errors, dim=0).detach().cpu().numpy()
                 else:
-                    logger.warning("KL divergence cannot be computed, skipping priority update")
+                    logger.warning("TD-error not available in batch, skipping priority update")
                     return
 
             elif priority_metric == 'reward':
                 # Use absolute reward as priority
-                import torch
                 rewards = torch.cat([batch.batch["scores"].sum(dim=1) for batch in batches], dim=0)
                 priorities = torch.abs(rewards).detach().cpu().numpy()
+
             else:
                 logger.warning(f"Unknown priority_metric '{priority_metric}', skipping priority update")
                 return
@@ -1679,3 +1738,71 @@ def compute_data_metrics(batch):
             "critic/step_rewards_norm/min": step_rewards_norm.min().detach().item(),
         })
     return metrics
+
+
+def extract_episode_boundaries_from_batch(batch: DataProto) -> tuple:
+    """
+    Extract episode boundaries from a batch using traj_id field.
+
+    For StepEnvManager, each step has a traj_id that identifies which episode it belongs to.
+    This function groups steps by traj_id and returns the episode boundaries.
+
+    Args:
+        batch: DataProto containing non_tensor_batch with "traj_id" field
+
+    Returns:
+        Tuple of (episode_boundaries, steps_per_episode) or (None, None) if not available
+        - episode_boundaries: List[int] of starting indices for each episode
+        - steps_per_episode: int, number of steps per episode (assumes uniform)
+
+    Example:
+        If batch has traj_id = ["ep1", "ep1", "ep1", "ep2", "ep2", "ep2"]
+        Returns: ([0, 3], 3)  # Episode 0 starts at idx 0, Episode 1 starts at idx 3
+    """
+    # Check if traj_id is available
+    if batch.non_tensor_batch is None or "traj_id" not in batch.non_tensor_batch:
+        logger.debug("extract_episode_boundaries: No traj_id in batch")
+        return None, None
+
+    traj_ids = batch.non_tensor_batch["traj_id"]
+    if len(traj_ids) == 0:
+        return None, None
+
+    # Group by traj_id to find episode boundaries
+    episode_boundaries = []
+    episode_sizes = []
+    current_traj_id = None
+    current_episode_start = 0
+
+    for i, traj_id in enumerate(traj_ids):
+        if traj_id != current_traj_id:
+            if current_traj_id is not None:
+                episode_sizes.append(i - current_episode_start)
+            episode_boundaries.append(i)
+            current_traj_id = traj_id
+            current_episode_start = i
+
+    # Add the last episode size
+    if current_traj_id is not None:
+        episode_sizes.append(len(traj_ids) - current_episode_start)
+
+    if len(episode_boundaries) == 0:
+        return None, None
+
+    # Check if all episodes have the same size
+    if len(set(episode_sizes)) == 1:
+        steps_per_episode = episode_sizes[0]
+    else:
+        # Variable episode sizes - use max and log warning
+        steps_per_episode = max(episode_sizes)
+        logger.warning(
+            f"extract_episode_boundaries: Variable episode sizes detected: {episode_sizes}. "
+            f"Using max size {steps_per_episode}. This may affect hierarchical RL computation."
+        )
+
+    logger.debug(
+        f"Extracted episode boundaries: {len(episode_boundaries)} episodes, "
+        f"steps_per_episode={steps_per_episode}, boundaries={episode_boundaries[:5]}..."
+    )
+
+    return episode_boundaries, steps_per_episode

@@ -4,16 +4,16 @@
 """
 
 import random
-import logging
 from typing import Dict, Any, Tuple
 import datasets
 from roll.agentic.env.base import BaseEnv
 from roll.agentic.utils import all_seed
 from roll.agentic.rollout.env_action_limiter import get_global_limiter
+from roll.utils.logging import get_logger
 from .config import NQSearchEnvConfig
 from .utils import parse_action_content, call_retrieval_server, evaluate_answer_em
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 class NQSearchEnv(BaseEnv):

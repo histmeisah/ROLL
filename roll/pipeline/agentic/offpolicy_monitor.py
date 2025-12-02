@@ -130,19 +130,22 @@ def compute_offpolicy_metrics(
         metrics["offpolicy/importance_weight/max"] = ratio.max().detach().item()
         metrics["offpolicy/importance_weight/min"] = ratio.min().detach().item()
 
-        # Sample-level statistics (for alignment with filtering)
-        # Compute per-sample mean ratio (same as filter uses)
-        # First reshape ratio back to [batch_size, seq_len] from flattened valid tokens
+        # Sample-level statistics (for alignment with filtering and ROLL's seq mode)
+        # Use geometric mean: exp(mean(log_ratio)) instead of mean(exp(log_ratio))
+        # First reshape log_ratio back to [batch_size, seq_len] from flattened valid tokens
         batch_size = response_mask.shape[0]
         seq_len = response_mask.shape[1]
 
-        # Create a full ratio tensor and fill in the valid positions
-        full_ratio = torch.zeros(batch_size, seq_len, device=ratio.device, dtype=ratio.dtype)
-        full_ratio[response_mask] = ratio
+        # Create a full log_ratio tensor and fill in the valid positions
+        full_log_ratio = torch.zeros(batch_size, seq_len, device=log_ratio.device, dtype=log_ratio.dtype)
+        full_log_ratio[response_mask] = log_ratio
 
-        # Now compute per-sample mean
+        # Compute per-sample ratio using geometric mean (consistent with ROLL's seq mode and filter)
+        # 1. First compute mean of log_ratio (in log space)
+        # 2. Then exp to get the ratio
         valid_tokens_per_sample = response_mask.sum(dim=1).clamp(min=1)  # [batch_size]
-        sample_ratio = (full_ratio * response_mask).sum(dim=1) / valid_tokens_per_sample
+        masked_log_ratio = (full_log_ratio * response_mask).sum(dim=1) / valid_tokens_per_sample
+        sample_ratio = torch.exp(masked_log_ratio)
 
         metrics["offpolicy/sample_importance_weight/mean"] = sample_ratio.mean().detach().item()
         metrics["offpolicy/sample_importance_weight/std"] = sample_ratio.std().detach().item()

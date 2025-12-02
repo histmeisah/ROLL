@@ -176,8 +176,9 @@ class StepEnvManager(TrajEnvManager):
         max_new_tokens = min(self.env_config["max_tokens_per_step"], self.worker_config.generating_args.max_new_tokens)
         generation_config = self.worker_config.generating_args.to_dict()
 
-        generation_config["max_new_tokens"] = min(max_new_tokens,
-                                                  max(self.pipeline_config.sequence_length - lm_input.batch['input_ids'].shape[1] - max_new_tokens, 1))
+        # Fixed bug: removed duplicate subtraction of max_new_tokens
+        remaining_space = self.pipeline_config.sequence_length - lm_input.batch['input_ids'].shape[1]
+        generation_config["max_new_tokens"] = min(max_new_tokens, max(remaining_space, 1))
         if generation_config["max_new_tokens"] <= 1:
             self.logger.warning(f"sequence_length = {self.pipeline_config.sequence_length} input_ids length = {lm_input.batch['input_ids'].shape[1]},"
                                 f"maybe you should increase the response_length")
@@ -271,6 +272,11 @@ class StepEnvManager(TrajEnvManager):
                     "frames": np.array([self.rollout_cache.frames], dtype=object),
                     "state_hash": np.array([compute_object_hash(history["state"])], dtype=object),
                     "step": np.array([step], dtype=object),
+                    # Episode termination signals (following Stable-Baselines3/Tianshou convention)
+                    # done=True only on the LAST step of the episode
+                    "done": np.array([step == len(self.rollout_cache.history) - 1], dtype=object),
+                    "terminated": np.array([self.rollout_cache.terminated if step == len(self.rollout_cache.history) - 1 else False], dtype=object),
+                    "truncated": np.array([self.rollout_cache.truncated if step == len(self.rollout_cache.history) - 1 else False], dtype=object),
                 }
             ))
 

@@ -5,10 +5,10 @@
 
 import re
 import requests
-import logging
 from typing import Dict, Any, Callable, List
+from roll.utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def parse_action_content(action: str, config) -> Dict[str, Any]:

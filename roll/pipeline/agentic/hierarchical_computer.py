@@ -79,7 +79,8 @@ class StepLevelComputer:
     def compute_step_advantages(
         self,
         env_rewards: torch.Tensor,
-        step_values: torch.Tensor
+        step_values: torch.Tensor,
+        dones: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute step-level advantages and returns.
@@ -87,31 +88,41 @@ class StepLevelComputer:
         Args:
             env_rewards: [batch_size] environment rewards for each step
             step_values: [batch_size] step-level values
+            dones: [batch_size] done flags (1.0 if episode ends, 0.0 otherwise)
+                   Required for proper GAE/N-step computation with variable-length episodes
 
         Returns:
             advantages: [batch_size] step-level advantages
             returns: [batch_size] step-level returns
         """
         if self.config.step_level_estimator == "gae":
-            return self.compute_gae(env_rewards, step_values)
+            return self.compute_gae(env_rewards, step_values, dones)
         elif self.config.step_level_estimator == "nstep":
-            return self.compute_nstep_returns(env_rewards, step_values)
+            return self.compute_nstep_returns(env_rewards, step_values, dones)
         elif self.config.step_level_estimator == "monte_carlo":
-            return self.compute_monte_carlo(env_rewards, step_values)
+            return self.compute_monte_carlo(env_rewards, step_values, dones)
         else:
             raise ValueError(f"Unknown step_level_estimator: {self.config.step_level_estimator}")
 
     def compute_gae(
         self,
         rewards: torch.Tensor,
-        values: torch.Tensor
+        values: torch.Tensor,
+        dones: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Generalized Advantage Estimation at step-level.
 
+        Following Stable-Baselines3/Tianshou convention:
+        - Uses done mask to properly handle episode boundaries
+        - next_non_terminal = 1.0 - done[t] zeroes out bootstrap at episode end
+        - Supports variable-length episodes naturally
+
         Args:
             rewards: [batch_size] step rewards
             values: [batch_size] step values
+            dones: [batch_size] done flags (1.0 if episode ends at this step, 0.0 otherwise)
+                   If None, assumes last step is terminal (legacy behavior)
 
         Returns:
             advantages: [batch_size]
@@ -124,27 +135,41 @@ class StepLevelComputer:
         gamma = self.config.step_gamma
         lambda_ = self.config.step_lambda
 
+        # If no dones provided, create a default (only last step is terminal)
+        if dones is None:
+            dones = torch.zeros_like(rewards)
+            dones[-1] = 1.0
+
         # Compute GAE from last to first
+        # Following Stable-Baselines3 convention:
+        # next_non_terminal = 1.0 - done[t]
+        # This zeroes out the bootstrap value at episode boundaries
         for t in reversed(range(batch_size)):
             if t < batch_size - 1:
                 nextvalue = values[t + 1]
+                # At episode end (done[t]=1), next_non_terminal=0, so bootstrap is zeroed
+                next_non_terminal = 1.0 - dones[t]
             else:
-                nextvalue = 0.0  # Terminal state
+                nextvalue = 0.0
+                next_non_terminal = 0.0  # Last step in batch, no bootstrap
 
-            # TD error
-            delta = rewards[t] + gamma * nextvalue - values[t]
+            # TD error: δ_t = r_t + γ * V(s_{t+1}) * (1 - done_t) - V(s_t)
+            delta = rewards[t] + gamma * nextvalue * next_non_terminal - values[t]
 
-            # GAE accumulation
-            lastgaelam = delta + gamma * lambda_ * lastgaelam
+            # GAE accumulation: A_t = δ_t + γ * λ * A_{t+1} * (1 - done_t)
+            # When done[t]=1, GAE resets (lastgaelam contribution is zeroed)
+            lastgaelam = delta + gamma * lambda_ * next_non_terminal * lastgaelam
             advantages[t] = lastgaelam
 
         returns = advantages + values
 
         if self.config.debug_mode:
+            num_episodes = int(dones.sum().item()) if dones is not None else 1
             logger.debug(
                 f"Step-level GAE computed: "
                 f"adv_mean={advantages.mean():.4f}, "
-                f"ret_mean={returns.mean():.4f}"
+                f"ret_mean={returns.mean():.4f}, "
+                f"num_episode_ends={num_episodes}"
             )
 
         return advantages, returns
@@ -152,14 +177,22 @@ class StepLevelComputer:
     def compute_nstep_returns(
         self,
         rewards: torch.Tensor,
-        values: torch.Tensor
+        values: torch.Tensor,
+        dones: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute N-step returns with bootstrap at step-level.
 
+        Following Stable-Baselines3/Tianshou convention:
+        - Uses done mask to properly handle episode boundaries
+        - Stops accumulation when hitting a done flag
+        - Supports variable-length episodes naturally
+
         Args:
             rewards: [batch_size] step rewards
             values: [batch_size] step values
+            dones: [batch_size] done flags (1.0 if episode ends, 0.0 otherwise)
+                   If None, assumes last step is terminal
 
         Returns:
             advantages: [batch_size]
@@ -171,30 +204,49 @@ class StepLevelComputer:
         gamma = self.config.step_gamma
         n_steps = self.config.step_n_steps
 
+        # If no dones provided, create a default (only last step is terminal)
+        if dones is None:
+            dones = torch.zeros_like(rewards)
+            dones[-1] = 1.0
+
         for t in range(batch_size):
             # Compute n-step return starting from t
             n_step_return = 0.0
             discount = 1.0
+            hit_terminal = False
 
-            # Accumulate discounted rewards
+            # Accumulate discounted rewards, stopping at episode boundaries
             for k in range(min(n_steps, batch_size - t)):
                 n_step_return += discount * rewards[t + k]
+
+                # Check if this step is terminal (episode ends here)
+                if dones[t + k] > 0.5:  # done flag is set
+                    hit_terminal = True
+                    break
+
                 discount *= gamma
 
-            # Add bootstrap value if not terminal
-            if self.config.use_step_bootstrap and t + n_steps < batch_size:
+            # Add bootstrap value if:
+            # 1. We haven't hit a terminal state
+            # 2. We have steps remaining for bootstrap
+            # 3. Bootstrap is enabled
+            if (not hit_terminal and
+                self.config.use_step_bootstrap and
+                t + n_steps < batch_size):
                 bootstrap_value = values[t + n_steps]
-                n_step_return += discount * bootstrap_value
+                n_step_return += discount * gamma * bootstrap_value
 
             returns[t] = n_step_return
 
         advantages = returns - values
 
         if self.config.debug_mode:
+            num_episodes = int(dones.sum().item()) if dones is not None else 1
             logger.debug(
                 f"Step-level n-step returns computed: "
                 f"n_steps={n_steps}, "
-                f"ret_mean={returns.mean():.4f}"
+                f"ret_mean={returns.mean():.4f}, "
+                f"num_episode_ends={num_episodes}"
             )
 
         return advantages, returns
@@ -202,14 +254,21 @@ class StepLevelComputer:
     def compute_monte_carlo(
         self,
         rewards: torch.Tensor,
-        values: torch.Tensor
+        values: torch.Tensor,
+        dones: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Monte Carlo returns at step-level.
 
+        Following Stable-Baselines3/Tianshou convention:
+        - Uses done mask to reset return accumulation at episode boundaries
+        - Supports variable-length episodes naturally
+
         Args:
             rewards: [batch_size] step rewards
             values: [batch_size] step values
+            dones: [batch_size] done flags (1.0 if episode ends, 0.0 otherwise)
+                   If None, assumes last step is terminal
 
         Returns:
             advantages: [batch_size]
@@ -220,13 +279,30 @@ class StepLevelComputer:
 
         gamma = self.config.step_gamma
 
+        # If no dones provided, create a default (only last step is terminal)
+        if dones is None:
+            dones = torch.zeros_like(rewards)
+            dones[-1] = 1.0
+
         # Compute cumulative returns from last to first
+        # Reset cumulative_return when we hit an episode boundary (done=1)
         cumulative_return = 0.0
         for t in reversed(range(batch_size)):
-            cumulative_return = rewards[t] + gamma * cumulative_return
+            # At episode end, next step's return shouldn't contribute
+            # next_non_terminal zeroes the future contribution
+            next_non_terminal = 1.0 - dones[t]
+            cumulative_return = rewards[t] + gamma * cumulative_return * next_non_terminal
             returns[t] = cumulative_return
 
         advantages = returns - values
+
+        if self.config.debug_mode:
+            num_episodes = int(dones.sum().item()) if dones is not None else 1
+            logger.debug(
+                f"Step-level Monte Carlo returns computed: "
+                f"ret_mean={returns.mean():.4f}, "
+                f"num_episode_ends={num_episodes}"
+            )
 
         return advantages, returns
 
@@ -496,16 +572,34 @@ class HierarchicalAdvantageComputer:
         env_rewards: torch.Tensor,
         token_values: torch.Tensor,
         response_masks: torch.Tensor,
-        original_token_rewards: Optional[torch.Tensor] = None
+        original_token_rewards: Optional[torch.Tensor] = None,
+        episode_boundaries: Optional[List[int]] = None,
+        steps_per_episode: Optional[int] = None,
+        dones: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Main entry point: Compute hierarchical advantages.
+
+        Following Stable-Baselines3/Tianshou convention:
+        - Uses done mask to properly handle episode boundaries
+        - Supports variable-length episodes naturally
+        - Falls back to episode_boundaries for backward compatibility
 
         Args:
             env_rewards: [batch_size] environment rewards for each step
             token_values: [batch_size, seq_len] critic values for tokens
             response_masks: [batch_size, seq_len] valid token masks
             original_token_rewards: [batch_size, seq_len] optional, for mixing
+            episode_boundaries: List of starting indices for each episode in the batch.
+                              (Deprecated: prefer using dones tensor)
+                              Example: [0, 4, 8, 12] means:
+                              - Episode 0: indices [0,1,2,3]
+                              - Episode 1: indices [4,5,6,7]
+                              - Episode 2: indices [8,9,10,11]
+            steps_per_episode: Number of consecutive steps per episode (deprecated, use dones)
+            dones: [batch_size] done flags (1.0 if episode ends, 0.0 otherwise)
+                   PREFERRED: This is the standard way to handle episode boundaries
+                   following Stable-Baselines3/Tianshou convention.
 
         Returns:
             Dictionary containing:
@@ -517,6 +611,26 @@ class HierarchicalAdvantageComputer:
             - metrics: dict of metrics
         """
         metrics = {}
+        batch_size = env_rewards.size(0)
+
+        # Validate episode structure for step-level estimators that need temporal continuity
+        requires_episode_structure = self.config.step_level_estimator in ["gae", "nstep"]
+
+        # Prefer dones tensor over episode_boundaries
+        has_episode_info = dones is not None or episode_boundaries is not None
+
+        if requires_episode_structure and not has_episode_info:
+            logger.error(
+                f"Episode structure is REQUIRED for step_level_estimator='{self.config.step_level_estimator}' "
+                f"to compute correct bootstrap values. "
+                f"Got dones={dones is not None}, episode_boundaries={episode_boundaries is not None}. "
+                f"This will cause training instability and IS ratio explosion!"
+            )
+            raise ValueError(
+                f"Hierarchical RL with {self.config.step_level_estimator} requires either dones tensor or episode_boundaries. "
+                f"Ensure done signal is present in batch (for fresh batch) or use "
+                f"replay_buffer.sample_episodes_for_hierarchical() (for replay batch)."
+            )
 
         # Step 1: Extract step-level values from token values
         step_values = self.step_computer.extract_step_values(
@@ -525,10 +639,82 @@ class HierarchicalAdvantageComputer:
         )
 
         # Step 2: Compute step-level advantages and returns
-        step_advantages, step_returns = self.step_computer.compute_step_advantages(
-            env_rewards=env_rewards,
-            step_values=step_values
-        )
+        # PREFERRED: Use dones tensor directly (Stable-Baselines3/Tianshou style)
+        # FALLBACK: Use episode_boundaries (legacy, for backward compatibility)
+        if dones is not None:
+            # Modern approach: Use dones tensor directly
+            # This handles variable-length episodes naturally
+            step_advantages, step_returns = self.step_computer.compute_step_advantages(
+                env_rewards=env_rewards,
+                step_values=step_values,
+                dones=dones
+            )
+
+            num_episodes = int(dones.sum().item())
+            logger.debug(
+                f"Computed step-level advantages using dones tensor: "
+                f"{num_episodes} episode ends in batch of {batch_size} steps, "
+                f"estimator={self.config.step_level_estimator}"
+            )
+            metrics["hierarchical/num_episodes"] = num_episodes
+
+        elif episode_boundaries is not None:
+            # Legacy approach: Use episode_boundaries
+            # This requires fixed-length episodes
+            logger.warning(
+                f"Using legacy episode_boundaries instead of dones tensor. "
+                f"Consider using dones for better variable-length episode support."
+            )
+            num_episodes = len(episode_boundaries)
+            step_advantages = torch.zeros_like(env_rewards)
+            step_returns = torch.zeros_like(env_rewards)
+
+            for ep_idx in range(num_episodes):
+                start_idx = episode_boundaries[ep_idx]
+                # Determine end_idx: either next episode's start or end of batch
+                if ep_idx + 1 < num_episodes:
+                    end_idx = episode_boundaries[ep_idx + 1]
+                else:
+                    end_idx = batch_size
+
+                # Extract this episode's data
+                ep_env_rewards = env_rewards[start_idx:end_idx]
+                ep_step_values = step_values[start_idx:end_idx]
+
+                # Create dones for this episode (only last step is done)
+                ep_dones = torch.zeros_like(ep_env_rewards)
+                ep_dones[-1] = 1.0
+
+                # Compute advantages for this episode independently
+                ep_advantages, ep_returns = self.step_computer.compute_step_advantages(
+                    env_rewards=ep_env_rewards,
+                    step_values=ep_step_values,
+                    dones=ep_dones
+                )
+
+                # Place results back into full batch
+                step_advantages[start_idx:end_idx] = ep_advantages
+                step_returns[start_idx:end_idx] = ep_returns
+
+            actual_steps_per_ep = steps_per_episode if steps_per_episode else "variable"
+            logger.debug(
+                f"Computed step-level advantages for {num_episodes} episodes "
+                f"({actual_steps_per_ep} steps/episode) using {self.config.step_level_estimator}"
+            )
+            metrics["hierarchical/num_episodes"] = num_episodes
+            metrics["hierarchical/steps_per_episode"] = steps_per_episode
+
+        else:
+            # No episode info: Compute over entire batch (only OK for monte_carlo)
+            logger.warning(
+                f"Computing step-level advantages without episode structure! "
+                f"This is INCORRECT for {self.config.step_level_estimator} and will cause training issues."
+            )
+            step_advantages, step_returns = self.step_computer.compute_step_advantages(
+                env_rewards=env_rewards,
+                step_values=step_values,
+                dones=None  # Will create default (only last step is terminal)
+            )
 
         # Step 3: Assign step returns to tokens as intrinsic rewards
         intrinsic_rewards = self.token_computer.assign_rewards_to_tokens(
@@ -561,6 +747,7 @@ class HierarchicalAdvantageComputer:
                 intrinsic_rewards=intrinsic_rewards,
                 env_rewards=env_rewards
             ))
+            # Note: episode metrics are already added in the dones/episode_boundaries branches above
 
         return {
             "step_values": step_values,

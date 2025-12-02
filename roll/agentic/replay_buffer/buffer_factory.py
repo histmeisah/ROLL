@@ -5,7 +5,6 @@ Provides factory functions to create appropriate replay buffers
 based on environment manager type and configuration.
 """
 
-import logging
 from typing import Union, Dict, Any, Optional
 from functools import partial
 
@@ -13,8 +12,9 @@ from .base_buffer import BaseReplayBuffer
 from .trajectory_buffer import TrajectoryReplayBuffer
 from .step_buffer import StepReplayBuffer
 from .priority_functions import PRIORITY_FUNCTIONS, get_priority_function
+from roll.utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 
 def create_replay_buffer(
@@ -23,61 +23,31 @@ def create_replay_buffer(
     batch_size: int = 128,
     seed: int = 42,
     priority_function: str = "uniform",
-    priority_exponent: float = 1.0,
-    priority_kwargs: Optional[Dict[str, Any]] = None,
+    priority_exponent: float = 0.6,
     enable_nstep: bool = False,
     n_step: int = 5,
     gamma: float = 0.99,
+    enable_age_decay: bool = False,
     age_decay: float = 1000.0,
-    use_advantage_priority: bool = False,
+    eviction_strategy: str = "fifo",
     **kwargs
 ) -> BaseReplayBuffer:
     """
-    Factory function to create the appropriate replay buffer type with priority support.
+    Factory function to create replay buffer with priority support.
 
     Args:
-        manager_type: Type of environment manager ("trajectory" or "step")
-        capacity: Buffer capacity (trajectories for trajectory buffer, steps for step buffer)
+        manager_type: "trajectory" or "step"
+        capacity: Buffer capacity
         batch_size: Default sampling batch size
-        seed: Random seed for reproducibility
-        priority_function: Name of priority function ("uniform", "reward", "recency", "combined", etc.)
-        priority_exponent: Priority exponent for weighted sampling (alpha in PER)
-        priority_kwargs: Additional kwargs for priority function (e.g., alpha for recency)
-        **kwargs: Additional arguments (ignored, for compatibility)
+        seed: Random seed
+        priority_function: Priority function name (uniform/lifo/fifo/reward/advantage/td_error/recency)
+        priority_exponent: Priority exponent (alpha in PER), 0=uniform, 1=full prioritization
+        enable_age_decay: Whether to enable age-based freshness weighting (default False for standard PER)
+        age_decay: Age decay constant for freshness weighting (only used if enable_age_decay=True)
+        eviction_strategy: "fifo" (default) or "smart"
 
     Returns:
-        Appropriate replay buffer instance (NumPy-based with priority support)
-
-    Raises:
-        ValueError: If manager_type is not supported
-
-    Examples:
-        # Default uniform priority
-        buffer = create_replay_buffer("trajectory", capacity=10000)
-
-        # Reward-based priority
-        buffer = create_replay_buffer(
-            "trajectory",
-            capacity=10000,
-            priority_function="reward",
-            priority_exponent=0.6
-        )
-
-        # Recency-based priority with custom decay
-        buffer = create_replay_buffer(
-            "trajectory",
-            capacity=10000,
-            priority_function="recency",
-            priority_kwargs={"alpha": 0.001}
-        )
-
-        # Combined priority
-        buffer = create_replay_buffer(
-            "trajectory",
-            capacity=10000,
-            priority_function="combined",
-            priority_kwargs={"reward_weight": 0.7, "recency_weight": 0.3}
-        )
+        Appropriate replay buffer instance
     """
     manager_type = manager_type.lower()
 
@@ -88,16 +58,11 @@ def create_replay_buffer(
         logger.warning(f"{e}. Falling back to uniform priority.")
         priority_fn = get_priority_function("uniform")
 
-    # Create partial function if kwargs provided
-    if priority_kwargs:
-        priority_fn = partial(priority_fn, **priority_kwargs)
-
-    # Use NumPy-based implementation (memory-efficient, proven stable)
     if manager_type == "trajectory":
         logger.info(
             f"Creating TrajectoryReplayBuffer: capacity={capacity}, "
             f"priority_fn={priority_function}, priority_exponent={priority_exponent}, "
-            f"age_decay={age_decay}, use_advantage_priority={use_advantage_priority}"
+            f"enable_age_decay={enable_age_decay}, age_decay={age_decay}, eviction={eviction_strategy}"
         )
         return TrajectoryReplayBuffer(
             capacity=capacity,
@@ -105,16 +70,16 @@ def create_replay_buffer(
             seed=seed,
             priority_fn=priority_fn,
             priority_exponent=priority_exponent,
-            priority_kwargs=priority_kwargs or {},
+            enable_age_decay=enable_age_decay,
             age_decay=age_decay,
-            use_advantage_priority=use_advantage_priority
+            eviction_strategy=eviction_strategy
         )
     elif manager_type == "step":
         logger.info(
             f"Creating StepReplayBuffer: capacity={capacity}, "
             f"priority_fn={priority_function}, priority_exponent={priority_exponent}, "
             f"enable_nstep={enable_nstep}, n_step={n_step}, gamma={gamma}, "
-            f"age_decay={age_decay}, use_advantage_priority={use_advantage_priority}"
+            f"enable_age_decay={enable_age_decay}, age_decay={age_decay}"
         )
         return StepReplayBuffer(
             capacity=capacity,
@@ -122,18 +87,14 @@ def create_replay_buffer(
             seed=seed,
             priority_fn=priority_fn,
             priority_exponent=priority_exponent,
-            priority_kwargs=priority_kwargs or {},
             enable_nstep=enable_nstep,
             n_step=n_step,
             gamma=gamma,
+            enable_age_decay=enable_age_decay,
             age_decay=age_decay,
-            use_advantage_priority=use_advantage_priority
         )
     else:
-        raise ValueError(
-            f"Unsupported manager_type: {manager_type}. "
-            f"Supported types: 'trajectory', 'step'"
-        )
+        raise ValueError(f"Unsupported manager_type: {manager_type}. Use 'trajectory' or 'step'.")
 
 
 def detect_manager_type_from_config(pipeline_config) -> str:

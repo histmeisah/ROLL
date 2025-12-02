@@ -178,19 +178,20 @@ def filter_offpolicy_samples(
 
     batch_size = current_log_probs.shape[0]
 
-    # Compute importance sampling ratio: exp(current - behavior)
+    # Compute importance sampling ratio using geometric mean (consistent with ROLL's seq mode)
+    # Formula: ratio = exp(mean(log_ratio)) instead of mean(exp(log_ratio))
     with torch.no_grad():
         log_ratio = current_log_probs - behavior_log_probs
 
         # Mask out non-response tokens
         log_ratio = log_ratio * response_mask
 
-        # Compute per-token ratio
-        ratio = torch.exp(log_ratio)
-
-        # Compute per-sample ratio (mean over valid response tokens)
+        # Compute per-sample ratio using geometric mean (ROLL seq mode):
+        # 1. First compute mean of log_ratio (in log space)
+        # 2. Then exp to get the ratio
         valid_tokens = response_mask.sum(dim=1).clamp(min=1)  # Avoid division by zero
-        per_sample_ratio = (ratio * response_mask).sum(dim=1) / valid_tokens
+        masked_log_ratio = (log_ratio * response_mask).sum(dim=1) / valid_tokens
+        per_sample_ratio = torch.exp(masked_log_ratio)
 
         # Filter based on ratio threshold
         valid_mask = per_sample_ratio <= ratio_clip_max
@@ -255,10 +256,18 @@ def slice_dataproto(data: DataProto, indices: torch.Tensor) -> DataProto:
     sliced_non_tensor = {}
     if data.non_tensor_batch is not None:
         for key, value in data.non_tensor_batch.items():
-            if isinstance(value, (list, tuple)):
+            if isinstance(value, np.ndarray):
+                # Handle numpy arrays (the standard format for non_tensor_batch in ROLL)
+                sliced_values = value[indices]
+                # Ensure the result is still a numpy array with dtype=object
+                if not isinstance(sliced_values, np.ndarray):
+                    sliced_non_tensor[key] = np.array([sliced_values], dtype=object)
+                else:
+                    sliced_non_tensor[key] = sliced_values
+            elif isinstance(value, (list, tuple)):
                 sliced_non_tensor[key] = [value[i] for i in indices]
             else:
-                # Keep as is if not a sequence
+                # Keep as is if not a sequence (scalars, etc.)
                 sliced_non_tensor[key] = value
 
     # Create new DataProto with sliced data
@@ -340,8 +349,11 @@ def concatenate_dataprotos(data_list: List[DataProto]) -> DataProto:
             if isinstance(values_to_concat[0], np.ndarray):
                 concat_non_tensor[key] = np.concatenate(values_to_concat, axis=0)
             else:
-                # Lists/tuples already extended
-                concat_non_tensor[key] = values_to_concat
+                # Lists/tuples already extended - convert to np.ndarray with dtype=object
+                # to maintain consistency with ROLL's DataProto format
+                result_array = np.empty(len(values_to_concat), dtype=object)
+                result_array[:] = values_to_concat
+                concat_non_tensor[key] = result_array
 
     # Create concatenated DataProto with TensorDict
     concat_batch = TensorDict(concat_batch_dict, batch_size=[total_batch_size]) if concat_batch_dict else None
@@ -442,10 +454,8 @@ def filter_replay_batch_with_mini_batches(
             sample_method=getattr(rb_cfg, 'sample_method', 'uniform'),
             candidates_per_group=getattr(rb_cfg, 'candidates_per_group', 1),
             group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
-            compute_importance_weights=getattr(rb_cfg.priority, 'use_importance_weights', False)
-                if hasattr(rb_cfg, 'priority') else False,
-            importance_weight_beta=getattr(rb_cfg.priority, 'importance_beta', 0.4)
-                if hasattr(rb_cfg, 'priority') else 0.4,
+            compute_importance_weights=getattr(rb_cfg, 'importance_sampling_correction', False),
+            importance_weight_beta=getattr(rb_cfg, 'importance_beta', 0.4),
         )
 
         # Handle sampling result
@@ -545,10 +555,8 @@ def filter_replay_batch_with_mini_batches(
             sample_method=getattr(rb_cfg, 'sample_method', 'uniform'),
             candidates_per_group=getattr(rb_cfg, 'candidates_per_group', 1),
             group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
-            compute_importance_weights=getattr(rb_cfg.priority, 'use_importance_weights', False)
-                if hasattr(rb_cfg, 'priority') else False,
-            importance_weight_beta=getattr(rb_cfg.priority, 'importance_beta', 0.4)
-                if hasattr(rb_cfg, 'priority') else 0.4,
+            compute_importance_weights=getattr(rb_cfg, 'importance_sampling_correction', False),
+            importance_weight_beta=getattr(rb_cfg, 'importance_beta', 0.4),
         )
 
         stats = {
