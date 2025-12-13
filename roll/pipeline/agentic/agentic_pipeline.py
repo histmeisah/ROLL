@@ -80,12 +80,18 @@ class AgenticPipeline(BasePipeline):
             resource_manager=self.resource_manager,
             worker_config=self.pipeline_config.actor_infer,
         )
-        self.reference: Any = Cluster(
-            name=self.pipeline_config.reference.name,
-            worker_cls=self.pipeline_config.reference.worker_cls,
-            resource_manager=self.resource_manager,
-            worker_config=self.pipeline_config.reference,
-        )
+        # Only create reference model if KL penalty is enabled (init_kl_coef > 0)
+        self.use_reference = self.pipeline_config.init_kl_coef > 0.0
+        if self.use_reference:
+            self.reference: Any = Cluster(
+                name=self.pipeline_config.reference.name,
+                worker_cls=self.pipeline_config.reference.worker_cls,
+                resource_manager=self.resource_manager,
+                worker_config=self.pipeline_config.reference,
+            )
+        else:
+            self.reference = None
+            logger.info("Skipping reference model creation (init_kl_coef=0.0)")
         if self.pipeline_config.adv_estimator == "gae":
             self.critic: Any = Cluster(
                 name=self.pipeline_config.critic.name,
@@ -129,7 +135,8 @@ class AgenticPipeline(BasePipeline):
 
         self.actor_infer.initialize(pipeline_config=self.pipeline_config, blocking=True)
 
-        refs.extend(self.reference.initialize(pipeline_config=self.pipeline_config, blocking=True))
+        if self.use_reference:
+            refs.extend(self.reference.initialize(pipeline_config=self.pipeline_config, blocking=True))
         self.set_model_update_pair(
             src_cluster=self.actor_train,
             tgt_cluster=self.actor_infer,
@@ -261,21 +268,23 @@ class AgenticPipeline(BasePipeline):
 
                 # 当启用 replay 时，下方 off-policy 训练路径会对采样批次重新计算 log_probs/adv。
                 # 为避免重复计算，这里仅在 off-policy 关闭时计算。
-                with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
-                    # Use behavior scope from offpolicy_monitor config
-                    batch.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
-                    ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(batch, blocking=False)
-                    ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
-                    ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
-                    # CRITICAL FIX: Preserve non_tensor_batch during union operation
-                    # This ensures state_hash and other metadata are not lost
-                    preserved_non_tensor_batch = batch.non_tensor_batch
-                    batch = batch.union(ref_log_probs)
-                    batch.non_tensor_batch = preserved_non_tensor_batch
-                    avg_ref_log_prob = masked_mean(batch.batch["ref_log_probs"], batch.batch["response_mask"][:, 1:])
-                    metrics.update(reduce_metrics(ref_log_probs.meta_info.pop("metrics", {})))
-                    metrics.update({"critic/ref_log_prob/mean": avg_ref_log_prob.item()})
-                metrics["time/ref_log_probs_values_reward"] = cal_timer.last
+                # Only compute ref_log_probs if reference model is enabled (KL penalty > 0)
+                if self.use_reference:
+                    with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
+                        # Use behavior scope from offpolicy_monitor config
+                        batch.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
+                        ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(batch, blocking=False)
+                        ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
+                        ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
+                        # CRITICAL FIX: Preserve non_tensor_batch during union operation
+                        # This ensures state_hash and other metadata are not lost
+                        preserved_non_tensor_batch = batch.non_tensor_batch
+                        batch = batch.union(ref_log_probs)
+                        batch.non_tensor_batch = preserved_non_tensor_batch
+                        avg_ref_log_prob = masked_mean(batch.batch["ref_log_probs"], batch.batch["response_mask"][:, 1:])
+                        metrics.update(reduce_metrics(ref_log_probs.meta_info.pop("metrics", {})))
+                        metrics.update({"critic/ref_log_prob/mean": avg_ref_log_prob.item()})
+                    metrics["time/ref_log_probs_values_reward"] = cal_timer.last
 
                 with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
                     # ✨ OPTIMIZATION: For fresh batches, reuse behavior_log_probs as old_log_probs
@@ -643,10 +652,11 @@ class AgenticPipeline(BasePipeline):
 
                             # Compute ref/old log_probs and advantages for replay mb
                             mb.meta_info["old_prob_mode"] = self.pipeline_config.offpolicy_monitor.behavior_scope
-                            ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(mb, blocking=False)
-                            ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
-                            ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
-                            mb = mb.union(ref_log_probs)
+                            if self.use_reference:
+                                ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(mb, blocking=False)
+                                ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
+                                ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
+                                mb = mb.union(ref_log_probs)
 
                             mb.meta_info["is_offload_states"] = False
                             # Only compute old_log_probs if not already provided (fallback to actor_train for stability)
@@ -812,6 +822,9 @@ class AgenticPipeline(BasePipeline):
 
             self.do_checkpoint(global_step=global_step)
 
+            # Hook for subclasses to add custom metrics before logging
+            metrics = self._prepare_metrics_for_logging(metrics, global_step)
+
             self.tracker.log(values=metrics, step=global_step)
 
             if global_step % self.pipeline_config.logging_steps == 0:
@@ -865,6 +878,22 @@ class AgenticPipeline(BasePipeline):
         ])
         logger.info("pipeline complete!")
 
+    def _prepare_metrics_for_logging(self, metrics: dict, global_step: int) -> dict:
+        """
+        Hook for subclasses to add custom metrics before logging.
+
+        Override this method in subclasses to add additional metrics
+        (e.g., bandit statistics) before they are logged to wandb/tensorboard.
+
+        Args:
+            metrics: Current metrics dictionary
+            global_step: Current training step
+
+        Returns:
+            Updated metrics dictionary
+        """
+        return metrics
+
     def val(self, global_step):
         batch = DataProto()
         metrics = {}
@@ -911,7 +940,7 @@ class AgenticPipeline(BasePipeline):
         """
         actor_train_train_bsz = self.pipeline_config.actor_train.training_args.per_device_train_batch_size * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps * self.actor_train.dp_size
         actor_train_infer_bsz = self.pipeline_config.actor_train.infer_batch_size * self.actor_train.dp_size
-        ref_infer_bsz = self.pipeline_config.reference.infer_batch_size * self.reference.dp_size
+        ref_infer_bsz = self.pipeline_config.reference.infer_batch_size * self.reference.dp_size if self.use_reference else 1
         critic_train_bsz = 1
         critic_infer_bsz = 1
         if self.pipeline_config.adv_estimator == "gae":

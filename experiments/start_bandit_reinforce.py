@@ -160,9 +160,9 @@ def main(cfg: DictConfig):
         num_episodes=cfg.training.num_episodes,
         batch_size=cfg.training.batch_size,
         learning_rate=cfg.bandit.learning_rate,
-        neural_ucb_buffer_size=cfg.bandit.buffer_size,
-        neural_ucb_update_freq=cfg.bandit.update_freq,
-        neural_ucb_reg_param=cfg.bandit.reg_param,
+        bandit_buffer_size=cfg.bandit.buffer_size,
+        bandit_update_freq=cfg.bandit.update_freq,
+        bandit_reg_param=cfg.bandit.reg_param,
         log_interval=cfg.training.log_interval,
         checkpoint_interval=cfg.training.checkpoint_interval,
     )

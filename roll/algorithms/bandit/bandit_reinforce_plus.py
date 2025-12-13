@@ -3,7 +3,7 @@ Bandit-REINFORCE++: Dual-layer optimization framework combining
 contextual bandits for prompt selection with REINFORCE++ for LLM training.
 
 This implementation is designed for mathematical reasoning tasks where:
-- Outer loop: NeuralUCB selects optimal prompts
+- Outer loop: NeuralLinearUCB selects optimal prompts
 - Inner loop: REINFORCE++ trains the LLM with selected prompts
 """
 
@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import logging
 
-from .neural_ucb import NeuralUCB
+from .neural_linear_ucb import NeuralLinearUCB
 from .prompt_loader import PromptTemplate, load_preset, PromptLoader
 from .prompt_monitor import PromptMonitor
 from roll.utils.logging import get_logger
@@ -25,7 +25,7 @@ class BanditReinforcePlusPlus:
     """
     Bandit-REINFORCE++ algorithm for LLM mathematical reasoning.
 
-    Combines contextual bandit (NeuralUCB) for prompt selection with
+    Combines contextual bandit (NeuralLinearUCB) for prompt selection with
     REINFORCE++ for policy optimization.
     """
 
@@ -35,7 +35,7 @@ class BanditReinforcePlusPlus:
         context_dim: int = 768,  # Dimension of problem embeddings
         hidden_dims: List[int] = [256, 128],
         exploration_param: float = 1.0,
-        neural_ucb_kwargs: Optional[Dict] = None,
+        bandit_kwargs: Optional[Dict] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         seed: int = 42,
         enable_monitoring: bool = True,
@@ -47,9 +47,9 @@ class BanditReinforcePlusPlus:
         Args:
             prompt_templates: List of prompt templates to choose from
             context_dim: Dimension of problem embeddings (context)
-            hidden_dims: Hidden dimensions for NeuralUCB network
+            hidden_dims: Hidden dimensions for NeuralLinearUCB network
             exploration_param: Exploration parameter (alpha)
-            neural_ucb_kwargs: Additional kwargs for NeuralUCB
+            bandit_kwargs: Additional kwargs for NeuralLinearUCB
             device: Device for computation
             seed: Random seed
             enable_monitoring: Enable prompt performance monitoring
@@ -60,9 +60,9 @@ class BanditReinforcePlusPlus:
         self.context_dim = context_dim
         self.device = device
 
-        # Initialize NeuralUCB for prompt selection
-        ucb_kwargs = neural_ucb_kwargs or {}
-        self.bandit = NeuralUCB(
+        # Initialize NeuralLinearUCB for prompt selection
+        ucb_kwargs = bandit_kwargs or {}
+        self.bandit = NeuralLinearUCB(
             n_arms=self.n_prompts,
             context_dim=context_dim,
             hidden_dims=hidden_dims,
@@ -96,7 +96,7 @@ class BanditReinforcePlusPlus:
 
     def select_prompt(self, problem_embedding: np.ndarray) -> Tuple[int, PromptTemplate]:
         """
-        Select a prompt template using NeuralUCB.
+        Select a prompt template using NeuralLinearUCB.
 
         Args:
             problem_embedding: Embedding of the problem (context), shape (context_dim,)
@@ -155,7 +155,7 @@ class BanditReinforcePlusPlus:
         """
         Run one episode of Bandit-REINFORCE++.
 
-        1. Select prompt using NeuralUCB
+        1. Select prompt using NeuralLinearUCB
         2. Generate trajectories with selected prompt
         3. Compute rewards
         4. Update policy with REINFORCE++
@@ -173,7 +173,7 @@ class BanditReinforcePlusPlus:
         """
         self.episode_count += 1
 
-        # Step 1: Select prompt using NeuralUCB
+        # Step 1: Select prompt using NeuralLinearUCB
         prompt_idx, prompt_template = self.select_prompt(problem_embedding)
         formatted_prompt = prompt_template.format(problem)
 
@@ -354,7 +354,7 @@ def create_bandit_reinforce_from_preset(
     context_dim: int = 768,
     hidden_dims: List[int] = [256, 128],
     exploration_param: float = 1.0,
-    neural_ucb_kwargs: Optional[Dict] = None,
+    bandit_kwargs: Optional[Dict] = None,
     config_path: Optional[str] = None,
     **kwargs
 ) -> BanditReinforcePlusPlus:
@@ -364,9 +364,9 @@ def create_bandit_reinforce_from_preset(
     Args:
         preset_name: Name of the preset to use (from YAML config)
         context_dim: Dimension of problem embeddings
-        hidden_dims: Hidden dimensions for NeuralUCB
+        hidden_dims: Hidden dimensions for NeuralLinearUCB
         exploration_param: Exploration parameter
-        neural_ucb_kwargs: Additional kwargs for NeuralUCB
+        bandit_kwargs: Additional kwargs for NeuralLinearUCB
         config_path: Optional path to custom prompt config file
         **kwargs: Additional kwargs for BanditReinforcePlusPlus
 
@@ -405,7 +405,7 @@ def create_bandit_reinforce_from_preset(
         context_dim=context_dim,
         hidden_dims=hidden_dims,
         exploration_param=exploration_param,
-        neural_ucb_kwargs=neural_ucb_kwargs,
+        bandit_kwargs=bandit_kwargs,
         **kwargs
     )
 

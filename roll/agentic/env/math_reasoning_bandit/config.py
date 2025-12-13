@@ -7,6 +7,10 @@ from typing import Optional, List
 from roll.agentic.env.base import BaseEnvConfig
 
 
+# Default bandit actor name for Ray Named Actor pattern
+DEFAULT_BANDIT_ACTOR_NAME = "bandit_actor_global"
+
+
 @dataclass
 class MathReasoningBanditConfig(BaseEnvConfig):
     """Configuration for Math Reasoning Bandit environment."""
@@ -40,7 +44,14 @@ class MathReasoningBanditConfig(BaseEnvConfig):
     # Instruction template
     env_instruction: str = "Solve the following mathematical problem step by step and provide the final answer."
 
-    # Bandit-related (will be set by pipeline)
-    bandit_actor: Optional[object] = None  # Ray actor handle
-    prompt_templates: Optional[List] = None  # PromptTemplate list
-    problem_encoder: Optional[object] = None  # SentenceTransformer or similar
+    # Bandit configuration - for loading prompts and encoder in distributed workers
+    bandit_actor_name: str = DEFAULT_BANDIT_ACTOR_NAME  # Ray Named Actor name
+    prompt_config_path: Optional[str] = None  # Path to prompt YAML config
+    preset_name: str = "diverse_5"  # Prompt preset name
+    encoder_model: Optional[str] = None  # SentenceTransformer model name/path
+    context_dim: int = 768  # Embedding dimension
+
+    # Bandit-related (will be set by pipeline or loaded dynamically)
+    bandit_actor: Optional[object] = None  # Ray actor handle (not serializable)
+    prompt_templates: Optional[List] = None  # PromptTemplate list (not serializable)
+    problem_encoder: Optional[object] = None  # SentenceTransformer (not serializable)

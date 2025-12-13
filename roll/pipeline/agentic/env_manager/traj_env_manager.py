@@ -378,7 +378,13 @@ class TrajEnvManager(BaseEnvManager):
                     custom_metric[k] = []
                 custom_metric[k].append(float(v))
 
+        # Skip categorical metrics that shouldn't be averaged (e.g., prompt_idx)
+        skip_average_metrics = {'prompt_idx', 'prompt_name'}
+
         for k, v in custom_metric.items():
+            if k in skip_average_metrics:
+                # For categorical metrics, just skip (proper stats are in BanditActor)
+                continue
             env_metric[k] = np.sum(v) / len(self.rollout_cache.history)
 
         env_metric = {f"env/{rollout_cache.tag}/{k}": v for k, v in env_metric.items()}

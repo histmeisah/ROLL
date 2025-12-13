@@ -1,5 +1,5 @@
 """
-Bandit-Agentic Pipeline: AgenticPipeline with integrated NeuralUCB prompt selection.
+Bandit-Agentic Pipeline: AgenticPipeline with integrated NeuralLinearUCB prompt selection.
 
 This pipeline extends AgenticPipeline to:
 1. Initialize a centralized BanditActor for prompt selection
@@ -109,7 +109,7 @@ class BanditAgenticPipeline(AgenticPipeline):
             context_dim=context_dim,
             hidden_dims=bandit_cfg.get("hidden_dims", [256, 128]),
             exploration_param=bandit_cfg.get("exploration_param", 1.0),
-            neural_ucb_kwargs={
+            bandit_kwargs={
                 "learning_rate": bandit_cfg.get("learning_rate", 0.001),
                 "reg_param": bandit_cfg.get("reg_param", 1.0),
                 "buffer_size": bandit_cfg.get("buffer_size", 10000),
@@ -171,24 +171,29 @@ class BanditAgenticPipeline(AgenticPipeline):
         # Call parent run
         super().run()
 
-    def log_metrics_impl(self, metrics: dict, global_step: int):
+    def _prepare_metrics_for_logging(self, metrics: dict, global_step: int) -> dict:
         """
-        Log metrics including bandit statistics.
+        Add bandit statistics to metrics before logging to wandb.
+
+        This method is called by AgenticPipeline before self.tracker.log().
 
         Args:
-            metrics: Metrics dictionary
+            metrics: Current metrics dictionary
             global_step: Current training step
-        """
-        # Call parent log method
-        super().log_metrics_impl(metrics, global_step)
 
+        Returns:
+            Updated metrics dictionary with bandit statistics
+        """
         # Add bandit metrics if available
         if self.bandit_actor is not None:
             try:
                 bandit_metrics = ray.get(self.bandit_actor.get_monitor_metrics.remote())
                 metrics.update(bandit_metrics)
+                logger.debug(f"Added {len(bandit_metrics)} bandit metrics to wandb logging")
             except Exception as e:
                 logger.warning(f"Failed to get bandit metrics: {e}")
+
+        return metrics
 
     def save_checkpoint_impl(self, global_step: int, checkpoint_dir: str):
         """

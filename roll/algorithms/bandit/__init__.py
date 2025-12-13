@@ -1,11 +1,14 @@
 """
 Contextual Bandit algorithms for ROLL framework.
 
-This module implements NeuralUCB and other contextual bandit algorithms
+This module implements NeuralLinearUCB and other contextual bandit algorithms
 for prompt selection in LLM training, particularly for mathematical reasoning tasks.
+
+Based on: "Neural Contextual Bandits with Deep Representation and Shallow Exploration"
+(Xu et al., ICLR 2022)
 """
 
-from .neural_ucb import NeuralUCB
+from .neural_linear_ucb import NeuralLinearUCB
 from .base_bandit import BaseContextualBandit
 from .bandit_reinforce_plus import (
     BanditReinforcePlusPlus,
@@ -23,7 +26,7 @@ from .prompt_monitor import PromptMonitor, PromptStats, get_wandb_metrics
 
 __all__ = [
     "BaseContextualBandit",
-    "NeuralUCB",
+    "NeuralLinearUCB",
     "BanditReinforcePlusPlus",
     "create_bandit_reinforce_from_preset",
     "create_bandit_reinforce_from_names",

@@ -13,6 +13,9 @@ seed: 42
 # Bandit Configuration
 # ============================================================================
 bandit_config:
+  # Ray Named Actor name (used for cross-worker communication)
+  bandit_actor_name: "bandit_actor_global"
+
   # Prompt configuration
   prompt_config_path: "configs/prompts/math_reasoning_prompts.yaml"
   preset_name: "diverse_5"  # Use 5 diverse prompts
@@ -185,8 +188,12 @@ custom_envs:
       numerical_tolerance: 0.001
       enable_partial_matching: true
 
-      # Note: bandit_actor, prompt_templates, problem_encoder
-      # will be injected by BanditAgenticPipeline
+      # Bandit settings (for distributed workers to load components)
+      bandit_actor_name: ${bandit_config.bandit_actor_name}
+      prompt_config_path: ${bandit_config.prompt_config_path}
+      preset_name: ${bandit_config.preset_name}
+      encoder_model: ${bandit_config.encoder_model}
+      context_dim: ${bandit_config.context_dim}
 
 # ============================================================================
 # Logging and Checkpointing

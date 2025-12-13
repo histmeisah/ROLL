@@ -39,10 +39,10 @@ class BanditRLConfig:
     batch_size: int = 32
     learning_rate: float = 1e-4
 
-    # NeuralUCB specific
-    neural_ucb_buffer_size: int = 10000
-    neural_ucb_update_freq: int = 10
-    neural_ucb_reg_param: float = 1.0
+    # NeuralLinearUCB specific
+    bandit_buffer_size: int = 10000
+    bandit_update_freq: int = 10
+    bandit_reg_param: float = 1.0
 
     # Logging
     log_interval: int = 10
@@ -66,10 +66,10 @@ class BanditRLPipeline(BasePipeline):
         self.prompt_templates = self._init_prompt_templates()
 
         # Initialize Bandit-REINFORCE++
-        neural_ucb_kwargs = {
-            "buffer_size": config.neural_ucb_buffer_size,
-            "update_freq": config.neural_ucb_update_freq,
-            "reg_param": config.neural_ucb_reg_param,
+        bandit_kwargs = {
+            "buffer_size": config.bandit_buffer_size,
+            "update_freq": config.bandit_update_freq,
+            "reg_param": config.bandit_reg_param,
             "learning_rate": config.learning_rate,
         }
 
@@ -78,7 +78,7 @@ class BanditRLPipeline(BasePipeline):
             context_dim=config.context_dim,
             hidden_dims=config.hidden_dims,
             exploration_param=config.exploration_param,
-            neural_ucb_kwargs=neural_ucb_kwargs,
+            bandit_kwargs=bandit_kwargs,
         )
 
         # Initialize problem encoder (for getting embeddings)

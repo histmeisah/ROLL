@@ -331,7 +331,8 @@ class VllmStrategy(InferenceStrategy):
         self.model.broadcast_bucket(src_pp_rank, meta_infos, bucket_size)
 
     def update_parameter(self, model_update_name, parameter_name, weight, ranks_in_worker, is_lora=False):
-        self.model.update_parameter(parameter_name, weight, ranks_in_worker, is_lora)
+        # Note: Llm084/Llm0100 don't support is_lora parameter, so we don't pass it
+        self.model.update_parameter(parameter_name, weight, ranks_in_worker)
 
     def update_parameter_in_bucket(self, model_update_name, meta_infos, buffer, ranks_in_worker):
         self.model.update_parameter_in_bucket(meta_infos, buffer, ranks_in_worker)

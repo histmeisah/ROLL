@@ -1,8 +1,8 @@
 """
-Test for BanditActor and NeuralUCB.
+Test for BanditActor and NeuralLinearUCB.
 
 This test validates:
-1. NeuralUCB arm selection
+1. NeuralLinearUCB arm selection
 2. Bandit update and learning
 3. Ray actor functionality
 4. Monitoring and statistics
@@ -16,20 +16,20 @@ import pickle
 import numpy as np
 import torch
 
-from roll.algorithms.bandit.neural_ucb import NeuralUCB
+from roll.algorithms.bandit.neural_linear_ucb import NeuralLinearUCB
 from roll.algorithms.bandit.bandit_actor import BanditActor
 
 
-def test_neural_ucb_local():
-    """Test NeuralUCB locally (without Ray)."""
+def test_neural_linear_ucb_local():
+    """Test NeuralLinearUCB locally (without Ray)."""
     print("\n" + "=" * 80)
-    print("Test 1: NeuralUCB Local")
+    print("Test 1: NeuralLinearUCB Local")
     print("=" * 80)
 
-    # Create NeuralUCB
+    # Create NeuralLinearUCB
     n_arms = 5
     context_dim = 10
-    bandit = NeuralUCB(
+    bandit = NeuralLinearUCB(
         n_arms=n_arms,
         context_dim=context_dim,
         hidden_dims=[16, 8],
@@ -42,7 +42,7 @@ def test_neural_ucb_local():
         device="cpu",
         seed=42,
     )
-    print(f"✓ NeuralUCB created with {n_arms} arms")
+    print(f"✓ NeuralLinearUCB created with {n_arms} arms")
 
     # Test selection
     context = np.random.randn(context_dim).astype(np.float32)
@@ -75,7 +75,7 @@ def test_neural_ucb_local():
     best_arm = np.argmax(stats['mean_rewards'])
     print(f"  Best arm: {best_arm}")
 
-    print("\n✅ NeuralUCB local test passed!")
+    print("\n✅ NeuralLinearUCB local test passed!")
 
 
 def test_bandit_actor_ray():
@@ -100,7 +100,7 @@ def test_bandit_actor_ray():
             context_dim=context_dim,
             hidden_dims=[256, 128],
             exploration_param=1.0,
-            neural_ucb_kwargs={
+            bandit_kwargs={
                 "learning_rate": 0.001,
                 "reg_param": 1.0,
                 "buffer_size": 1000,
@@ -186,7 +186,7 @@ def test_convergence():
     context_dim = 10
     true_best_arm = 2  # Ground truth best arm
 
-    bandit = NeuralUCB(
+    bandit = NeuralLinearUCB(
         n_arms=n_arms,
         context_dim=context_dim,
         hidden_dims=[32, 16],
@@ -247,7 +247,7 @@ if __name__ == "__main__":
     print("Bandit Algorithm Test Suite")
     print("=" * 80)
 
-    test_neural_ucb_local()
+    test_neural_linear_ucb_local()
     test_bandit_actor_ray()
     test_convergence()
 

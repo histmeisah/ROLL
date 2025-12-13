@@ -1,8 +1,16 @@
 """
-NeuralUCB: Contextual Bandits with Neural Network-Based Exploration
+Neural-Linear UCB: Contextual Bandits with Deep Representation and Shallow Exploration
 
-Based on the paper: "Neural Contextual Bandits with UCB-based Exploration"
-Zhou et al., ICML 2020
+Based on the paper: "Neural Contextual Bandits with Deep Representation and Shallow Exploration"
+Xu et al., ICLR 2022 (arXiv:2012.01780)
+
+Key idea:
+- Deep Representation: Use last hidden layer features φ(x) as context representation
+- Shallow Exploration: Apply UCB exploration only in the feature space
+
+Related work:
+- "Neural Contextual Bandits with UCB-based Exploration" (Zhou et al., ICML 2020)
+  uses gradient-based features instead, which is more expensive computationally.
 """
 
 import numpy as np
@@ -17,9 +25,10 @@ from .base_bandit import BaseContextualBandit
 
 class NeuralNetwork(nn.Module):
     """
-    Neural network for reward prediction in NeuralUCB.
+    Neural network for reward prediction in Neural-Linear UCB.
 
     Uses a simple MLP architecture with ReLU activations.
+    The last hidden layer output is used as feature representation.
     """
 
     def __init__(
@@ -62,12 +71,20 @@ class NeuralNetwork(nn.Module):
         return x
 
 
-class NeuralUCB(BaseContextualBandit):
+class NeuralLinearUCB(BaseContextualBandit):
     """
-    NeuralUCB algorithm for contextual bandits.
+    Neural-Linear UCB algorithm for contextual bandits.
 
-    Uses a neural network to predict rewards and constructs UCB bounds
-    based on the neural network's hidden representations.
+    Based on "Neural Contextual Bandits with Deep Representation and Shallow Exploration"
+    (Xu et al., ICLR 2022).
+
+    Algorithm:
+    1. Deep Representation: Extract features φ(x) from the last hidden layer
+    2. Shallow Exploration: Compute UCB = μ(x) + α * sqrt(φᵀ A⁻¹ φ)
+       where A⁻¹ is updated incrementally using Sherman-Morrison formula
+
+    This achieves Õ(√T) regret with much lower computational cost than
+    gradient-based NeuralUCB (Zhou et al., ICML 2020).
     """
 
     def __init__(
@@ -78,6 +95,7 @@ class NeuralUCB(BaseContextualBandit):
         exploration_param: float = 1.0,
         learning_rate: float = 1e-3,
         reg_param: float = 1.0,
+        l2_weight: float = 0.01,
         buffer_size: int = 10000,
         batch_size: int = 32,
         update_freq: int = 10,
@@ -85,15 +103,21 @@ class NeuralUCB(BaseContextualBandit):
         seed: int = 42,
     ):
         """
-        Initialize NeuralUCB.
+        Initialize NeuralLinearUCB.
 
         Args:
             n_arms: Number of arms (prompt templates)
             context_dim: Dimension of context features
             hidden_dims: Hidden layer dimensions for the neural network
-            exploration_param: Exploration parameter (controls UCB width)
+            exploration_param: Exploration parameter α (controls UCB width)
+                UCB = μ(x) + α * sqrt(φᵀ A⁻¹ φ)
             learning_rate: Learning rate for neural network training
-            reg_param: Regularization parameter (lambda in ridge regression)
+            reg_param: Ridge regression regularization λ for UCB matrix
+                A = λI + Σ φ(x)φ(x)ᵀ, ensures A is invertible
+                Typical value: 1.0
+            l2_weight: L2 regularization weight for neural network training
+                loss = MSE + l2_weight * ||θ||²
+                Typical value: 0.01 (much smaller than reg_param!)
             buffer_size: Size of experience replay buffer
             batch_size: Batch size for neural network training
             update_freq: Frequency of neural network updates
@@ -104,7 +128,8 @@ class NeuralUCB(BaseContextualBandit):
 
         self.hidden_dims = hidden_dims
         self.learning_rate = learning_rate
-        self.reg_param = reg_param
+        self.reg_param = reg_param  # λ for UCB matrix: A = λI + Σφφᵀ
+        self.l2_weight = l2_weight  # L2 regularization for NN training
         self.buffer_size = buffer_size
         self.batch_size = batch_size
         self.update_freq = update_freq
@@ -125,7 +150,10 @@ class NeuralUCB(BaseContextualBandit):
         self.feature_dim = hidden_dims[-1]
 
         # Inverse covariance matrices for each arm (for UCB computation)
-        # A_i = lambda * I + sum(phi(x) * phi(x)^T) where phi is NN features
+        # Ridge regression: A = λI + Σ φ(x)φ(x)ᵀ
+        # Initial: A = λI, so A⁻¹ = I/λ
+        # reg_param (λ) ensures A is invertible and controls regularization strength
+        # Typical value: λ = 1.0
         self.A_inv = [
             torch.eye(self.feature_dim, device=device) / reg_param
             for _ in range(n_arms)
@@ -136,7 +164,7 @@ class NeuralUCB(BaseContextualBandit):
 
     def select_arm(self, context: np.ndarray) -> int:
         """
-        Select an arm using NeuralUCB strategy.
+        Select an arm using Neural-Linear UCB strategy.
 
         UCB_i = mu_i + alpha * sqrt(phi^T * A_i^{-1} * phi)
         where mu_i is the predicted reward and phi is the neural network features.
@@ -184,7 +212,7 @@ class NeuralUCB(BaseContextualBandit):
 
     def update(self, arm: int, context: np.ndarray, reward: float) -> None:
         """
-        Update NeuralUCB with observed reward.
+        Update bandit with observed reward.
 
         1. Store experience in replay buffer
         2. Update neural network periodically
@@ -261,11 +289,14 @@ class NeuralUCB(BaseContextualBandit):
             predictions = network(contexts)
             loss = F.mse_loss(predictions, rewards)
 
-            # Add L2 regularization
-            l2_reg = 0
-            for param in network.parameters():
-                l2_reg += torch.sum(param ** 2)
-            loss = loss + self.reg_param * l2_reg
+            # Add L2 regularization (weight decay)
+            # Note: l2_weight is separate from reg_param (UCB ridge regression λ)
+            # Typical l2_weight ~ 0.01, while reg_param ~ 1.0
+            if self.l2_weight > 0:
+                l2_reg = 0
+                for param in network.parameters():
+                    l2_reg += torch.sum(param ** 2)
+                loss = loss + self.l2_weight * l2_reg
 
             # Backward pass
             optimizer.zero_grad()
@@ -273,7 +304,7 @@ class NeuralUCB(BaseContextualBandit):
             optimizer.step()
 
     def reset(self) -> None:
-        """Reset NeuralUCB to initial state."""
+        """Reset bandit to initial state."""
         super().reset()
 
         # Reset networks

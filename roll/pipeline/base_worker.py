@@ -323,7 +323,6 @@ class ActorWorker(Worker):
         """
 
         response_mask = data.batch["response_mask"][:, 1:].long()
-        ref_log_probs = data.batch["ref_log_probs"]
         old_log_probs = data.batch["old_log_probs"]
         advantages = data.batch["advantages"]
 
@@ -342,9 +341,14 @@ class ActorWorker(Worker):
 
         pg_loss = agg_loss(loss_mat=pg_loss, loss_mask=response_mask, loss_agg_mode=self.pipeline_config.loss_agg_mode)
 
-        kl_loss = compute_approx_kl(log_probs=log_probs, log_probs_base=ref_log_probs, action_mask=response_mask,
-                                    kl_penalty="k3")
-        kl_loss = agg_loss(loss_mat=kl_loss, loss_mask=response_mask, loss_agg_mode=self.pipeline_config.loss_agg_mode)
+        # Only compute KL loss if init_kl_coef > 0 (reference model is enabled)
+        if self.pipeline_config.init_kl_coef > 0:
+            ref_log_probs = data.batch["ref_log_probs"]
+            kl_loss = compute_approx_kl(log_probs=log_probs, log_probs_base=ref_log_probs, action_mask=response_mask,
+                                        kl_penalty="k3")
+            kl_loss = agg_loss(loss_mat=kl_loss, loss_mask=response_mask, loss_agg_mode=self.pipeline_config.loss_agg_mode)
+        else:
+            kl_loss = torch.tensor(0.0, device=log_probs.device)
 
         approxkl = compute_approx_kl(
             log_probs=log_probs, log_probs_base=old_log_probs, action_mask=response_mask, kl_penalty="mse"

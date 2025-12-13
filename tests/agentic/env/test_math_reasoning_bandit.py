@@ -90,7 +90,7 @@ def test_environment_with_bandit():
             context_dim=384,
             hidden_dims=[256, 128],
             exploration_param=1.0,
-            neural_ucb_kwargs={
+            bandit_kwargs={
                 "learning_rate": 0.001,
                 "reg_param": 1.0,
                 "buffer_size": 1000,
