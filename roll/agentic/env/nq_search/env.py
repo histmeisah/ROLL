@@ -50,6 +50,10 @@ class NQSearchEnv(BaseEnv):
         self.step_count = 0
         self.search_call_count = 0
         self.render_cache = None
+
+        # Goal-Conditioned RL: 存储当前问题，确保每个step都能访问
+        self.current_question = None
+        self.system_prompt = None
         
     def _load_dataset(self):
         """加载并过滤数据集"""
@@ -76,10 +80,15 @@ class NQSearchEnv(BaseEnv):
 
         # 从 prompt 创建初始观察
         # NQ数据集格式: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
-        system_prompt = self.current_question_data["prompt"][0]["content"]
-        user_question = self.current_question_data["prompt"][1]["content"]
+        self.system_prompt = self.current_question_data["prompt"][0]["content"]
+        self.current_question = self.current_question_data["prompt"][1]["content"]
 
-        initial_obs = f"{system_prompt}\n\nQuestion: {user_question}"
+        # Goal-Conditioned: 初始observation包含系统提示和问题
+        # 使用空的state_info表示这是初始状态，等待第一次动作
+        initial_obs = self._build_observation(
+            state_info="Please analyze the question and decide whether to search for information or provide an answer.",
+            include_system_prompt=True
+        )
         self.render_cache = initial_obs
 
         return initial_obs, {}
@@ -101,7 +110,10 @@ class NQSearchEnv(BaseEnv):
         if not action_info["is_valid"]:
             # 无效动作处理
             reward = 0.0 if self.config.use_outcome_reward_only else self.config.invalid_action_penalty
-            obs = "Invalid action format. Please use proper <think>, <search>, or <answer> tags."
+            # Goal-Conditioned: 即使无效动作，也要包含Goal
+            obs = self._build_observation(
+                "Invalid action format. Please use proper <think>, <search>, or <answer> tags."
+            )
             terminated = False
             truncated = False
             metrics = {
@@ -120,7 +132,10 @@ class NQSearchEnv(BaseEnv):
         # 检查是否提供了答案 - 这将终止回合
         if action_info["answer"]:
             reward, success, score, reward_info = self._compute_final_reward(action_info["answer"])
-            obs = f"Final answer submitted: {action_info['answer']}"
+            # Goal-Conditioned: 终止时也包含Goal（虽然episode结束，但保持一致性）
+            obs = self._build_observation(
+                f"Final answer submitted: {action_info['answer']}"
+            )
             terminated = True
             truncated = False
             metrics = {
@@ -144,7 +159,10 @@ class NQSearchEnv(BaseEnv):
         if action_info["search_query"]:
             # 检查是否超过最大搜索次数
             if self.search_call_count >= self.config.max_search_calls:
-                obs = "<information>\nError: Maximum search calls exceeded. Please provide your final answer.\n</information>"
+                # Goal-Conditioned: 超出搜索次数时也包含Goal
+                obs = self._build_observation(
+                    "<information>\nError: Maximum search calls exceeded. Please provide your final answer.\n</information>"
+                )
                 reward = 0.0 if self.config.use_outcome_reward_only else self.config.invalid_action_penalty
                 terminated = True
                 truncated = False
@@ -166,13 +184,17 @@ class NQSearchEnv(BaseEnv):
             else:
                 # 执行检索
                 search_result = self._execute_search(action_info["search_query"])
-                obs = f"<information>\n{search_result}\n</information>"
+                # Goal-Conditioned: 搜索结果observation包含Goal
+                obs = self._build_observation(
+                    f"<information>\n{search_result}\n</information>"
+                )
                 reward = 0.0 if self.config.use_outcome_reward_only else self.config.step_penalty
                 terminated = False
                 truncated = False
         else:
             # 只有思考，没有搜索或答案
-            obs = "Continue with your reasoning..."
+            # Goal-Conditioned: 继续推理时也包含Goal
+            obs = self._build_observation("Continue with your reasoning...")
             reward = 0.0 if self.config.use_outcome_reward_only else self.config.step_penalty
             terminated = False
             truncated = False
@@ -202,6 +224,25 @@ class NQSearchEnv(BaseEnv):
     def _parse_action(self, action: str) -> Dict[str, Any]:
         """解析动作内容"""
         return parse_action_content(action, self.config)
+
+    def _build_observation(self, state_info: str, include_system_prompt: bool = True) -> str:
+        """构建包含Goal的observation
+
+        Goal-Conditioned RL设计：每个step的observation都应该包含Goal（原始问题），
+        确保无论是Step-Level还是Trajectory-Level训练，模型都能清楚地知道要解决什么问题。
+
+        Args:
+            state_info: 当前状态信息（搜索结果、错误信息等）
+            include_system_prompt: 是否包含系统提示（任务说明）
+
+        Returns:
+            包含Goal和状态信息的完整observation
+        """
+        # 格式：[系统提示] + Goal（问题）+ 当前状态
+        if include_system_prompt and self.system_prompt:
+            return f"{self.system_prompt}\n\nQuestion: {self.current_question}\n\n{state_info}"
+        else:
+            return f"Question: {self.current_question}\n\n{state_info}"
 
     def _execute_search(self, query: str) -> str:
         """执行搜索并返回结果
@@ -317,12 +358,13 @@ if __name__ == "__main__":
     # 独立运行示例
     import sys
     import os
+    import logging
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../..'))
     sys.path.insert(0, project_root)
 
     logging.basicConfig(level=logging.INFO)
-    
-    print("NQ Search Environment Demo")
+
+    print("NQ Search Environment Demo (Goal-Conditioned)")
     print("=" * 80)
 
     config = NQSearchEnvConfig(
@@ -335,15 +377,21 @@ if __name__ == "__main__":
 
     # 重置并获取初始问题
     obs0, info = env.reset(seed=42)
-    print(f"\nInitial observation:\n{obs0[:300]}...\n")
+    print(f"\n[Step 0] Initial observation (包含Goal):")
+    print("-" * 40)
+    print(f"{obs0[:500]}...")
+    print("-" * 40)
 
     # 搜索动作
     action0 = '''<think>I need to search for information about this question.</think>
 <search>nobel prize physics first winner</search>'''
 
-    print(f"Action 0: {action0}\n")
+    print(f"\n[Action 0]: {action0}\n")
     obs1, reward1, terminated1, truncated1, info1 = env.step(action0)
-    print(f"Observation 1:\n{obs1[:300]}...")
+    print(f"[Step 1] Observation (注意：每个step都包含Goal!):")
+    print("-" * 40)
+    print(f"{obs1[:600]}...")
+    print("-" * 40)
     print(f"Reward: {reward1}, Terminated: {terminated1}\n")
 
     # 答案动作
@@ -351,11 +399,18 @@ if __name__ == "__main__":
         action1 = '''<think>Based on the search results, I can provide an answer.</think>
 <answer>Wilhelm Conrad Röntgen</answer>'''
 
-        print(f"Action 1: {action1}\n")
+        print(f"[Action 1]: {action1}\n")
         obs2, reward2, terminated2, truncated2, info2 = env.step(action1)
-        print(f"Observation 2: {obs2}")
+        print(f"[Step 2] Final observation (终止时也包含Goal):")
+        print("-" * 40)
+        print(f"{obs2[:400]}...")
+        print("-" * 40)
         print(f"Final reward: {reward2}, Success: {info2.get('success', False)}")
         print(f"Score: {info2.get('score', 0.0)}")
 
-    print("\nDemo completed.")
+    print("\n" + "=" * 80)
+    print("Goal-Conditioned设计验证完成!")
+    print("每个step的observation都包含了原始问题(Goal)，")
+    print("确保Step-Level和Trajectory-Level训练都能正确学习。")
+    print("=" * 80)
 

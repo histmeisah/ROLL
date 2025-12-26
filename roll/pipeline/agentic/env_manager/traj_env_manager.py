@@ -149,7 +149,21 @@ class TrajEnvManager(BaseEnvManager):
                 self.logger.debug(f"group_id: {self.env_config['group_id']} env_id: {self.env_config['env_id']} episode_id: {self.episode_id} start_step {start_step} gen_stats: {log_stats}")
                 log_stats = {"generate_time": [], "step_time": [], "current_step": []}
 
-                rollout: DataProto = self.formulate_rollouts(rollout_cache)
+                rollout: Optional[DataProto] = self.formulate_rollouts(rollout_cache)
+
+                # Skip invalid trajectories (e.g., no valid assistant response tokens)
+                if rollout is None:
+                    self.logger.warning(
+                        f"[SKIP_TRAJ] env_id={self.env_config['env_id']}, episode_id={self.episode_id}: "
+                        f"Invalid trajectory returned None, resetting and continuing..."
+                    )
+                    # Reset and continue to next episode without putting to queue
+                    if not self.running or (is_sync_training and self.episode_id >= self.worker_config.max_traj_per_env):
+                        self.rollout_cache = None
+                        break
+                    rollout_cache = self.reset()
+                    continue
+
                 traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
                 traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
                 rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id] * rollout.batch.batch_size[0], dtype=object)
@@ -285,9 +299,13 @@ class TrajEnvManager(BaseEnvManager):
                 user_content = self.reward_template.format(reward=content['reward'])
         return messages
 
-    def formulate_rollouts(self, rollout_cache: RolloutCache):
+    def formulate_rollouts(self, rollout_cache: RolloutCache) -> Optional[DataProto]:
         """
+        Formulate rollout data into DataProto format for training.
 
+        Returns:
+            DataProto with training data, or None if the trajectory is invalid
+            (e.g., no valid assistant response tokens).
         """
         if 'state' in rollout_cache.history[-1]:
             rollout_cache.history.pop(-1)
@@ -313,6 +331,18 @@ class TrajEnvManager(BaseEnvManager):
         response_masks = [item for items in response_masks_list for item in items]
 
         response_mask = torch.tensor(response_masks, dtype=torch.bool).unsqueeze(0)
+
+        # Defensive check: skip trajectories with no valid assistant response tokens
+        if 1 not in response_masks:
+            self.logger.warning(
+                f"[SKIP_INVALID_TRAJ] env_id={self.env_config['env_id']}, "
+                f"group_id={self.env_config['group_id']}, episode_id={self.episode_id}: "
+                f"No valid assistant response tokens (response_masks all zeros). "
+                f"num_messages={len(messages)}, token_len={len(token_ids)}, "
+                f"assistant_msgs={sum(1 for m in messages if m.get('role') == 'assistant')}, "
+                f"episode_score={episode_score:.3f}. Skipping this trajectory."
+            )
+            return None
 
         first_response_idx = response_masks.index(1)
         last_response_idx = len(response_masks) - 1 - response_masks[::-1].index(1)
