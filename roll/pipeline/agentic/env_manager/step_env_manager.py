@@ -3,6 +3,7 @@ from threading import Lock
 from typing import Dict, List, Optional
 
 import numpy as np
+import ray
 import torch
 from tensordict import TensorDict
 from transformers import PreTrainedTokenizer
@@ -49,7 +50,7 @@ class StepEnvManager(TrajEnvManager):
         # EnvManager states
         self.rollout_cache: Optional[RolloutCache] = None
         self.group_seed = None
-        self.episode_id = 0
+        self.episode_id = None
         self.current_step = -1
         self.running = False
         self.use_thread_lock = self.env_config.get("use_thread_lock", False) # 避免同时执行大量cpu操作, 可以通过env_config配置
@@ -81,7 +82,15 @@ class StepEnvManager(TrajEnvManager):
             available_actions=self.env.get_all_actions()
         )
 
-    def reset(self) -> RolloutCache:
+    def reset(self) -> Optional[RolloutCache]:
+        """Reset environment for next episode. Returns None if no more episodes available."""
+        # Request episode_id from central GroupQueue (replaces local self.episode_id += 1)
+        self.episode_id = ray.get(self.output_queue.get_episode_id.remote(
+            self.env_config['group_id'], self.env_config['env_id']))
+        if self.episode_id is None:
+            assert not self.running
+            return None
+
         self.rollout_cache = RolloutCache(env_id=self.env_config['env_id'],
                                           group_id=self.env_config['group_id'],
                                           tag=self.env_config['tag'])
@@ -96,7 +105,6 @@ class StepEnvManager(TrajEnvManager):
             "actions_left": self.env.config.max_steps - self.rollout_cache.step,
             "observation": None     # agent input string
         })
-        self.episode_id += 1
         return self.rollout_cache
 
     def step(self, llm_output: DataProto):
@@ -201,9 +209,13 @@ class StepEnvManager(TrajEnvManager):
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
         return lm_output
 
-    def formulate_rollouts(self, rollout_cache: RolloutCache):
+    def formulate_rollouts(self, rollout_cache: RolloutCache) -> Optional[DataProto]:
         """
         Construct step-wise training samples from the collected trajectory.
+
+        Returns:
+            DataProto with training data, or None if all samples are invalid
+            (e.g., no valid assistant response tokens).
         """
         if 'state' in rollout_cache.history[-1]:
             rollout_cache.history.pop(-1)
@@ -224,6 +236,15 @@ class StepEnvManager(TrajEnvManager):
             response_masks_list = token_ids_to_assistant_mask(messages=messages, input_ids_list=token_ids_split, tokenizer=self.tokenizer)
             response_masks = [item for items in response_masks_list for item in items]
             response_mask = torch.tensor(response_masks, dtype=torch.bool).unsqueeze(0)
+
+            # Handle case where no response tokens are marked (all zeros)
+            if 1 not in response_masks:
+                self.logger.warning(
+                    f"No response tokens marked for step {step} in env {rollout_cache.env_id}. "
+                    f"LLM response: {history['llm_response'][:100]}... Skipping this sample."
+                )
+                continue
+
             first_response_idx = response_masks.index(1)
             last_response_idx = len(response_masks) - 1 - response_masks[::-1].index(1)
             prompt_masks = [1] * first_response_idx + [0] * (len(token_ids) - first_response_idx)
@@ -279,6 +300,14 @@ class StepEnvManager(TrajEnvManager):
                     "truncated": np.array([self.rollout_cache.truncated if step == len(self.rollout_cache.history) - 1 else False], dtype=object),
                 }
             ))
+
+        # Handle case where all samples were skipped (no valid training data)
+        if not samples:
+            self.logger.warning(
+                f"All samples skipped for env {rollout_cache.env_id}, group {rollout_cache.group_id}. "
+                "No valid training data collected."
+            )
+            return None
 
         batch: DataProto = DataProto.concat(samples)
 

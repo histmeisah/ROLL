@@ -55,7 +55,7 @@ class TrajEnvManager(BaseEnvManager):
         # EnvManager states
         self.rollout_cache: Optional[RolloutCache] = None
         self.group_seed = None
-        self.episode_id = 0
+        self.episode_id = None
         self.current_step = -1
         self.running = False
         self.use_thread_lock = self.env_config.get("use_thread_lock", False) # 避免同时执行大量cpu操作, 可以通过env_config配置
@@ -107,9 +107,9 @@ class TrajEnvManager(BaseEnvManager):
     def run_rollout_loop(self, data: DataProto):
         """
         1. Each time run_rollout_loop is called,
-           it will continuously play episodes until it receives a command that data collection is complete.
+           it will continuously play episodes until the central GroupQueue
+           signals no more episodes (get_episode_id returns None) or running is set to False.
            The seed needs to be reset to ensure consistency across all groups.
-           episode_id is reset to 0.
 
         Seed update logic:
            group_seed = base_seed + group_id
@@ -121,18 +121,16 @@ class TrajEnvManager(BaseEnvManager):
         assert "seed" in data.meta_info
         current_step = data.meta_info.get("current_step", None)
         self.running = True
-        is_sync_training: bool = current_step is not None
-        if is_sync_training:
+        if current_step is not None:
             self.current_step = current_step
         assert self.current_step >= 0
-        self.episode_id = 0
         self.group_seed = data.meta_info['seed'] + self.env_config['group_seed']
-        rollout_cache: RolloutCache = self.reset()
+        rollout_cache: Optional[RolloutCache] = self.reset()
         start_step = self.current_step
 
         log_stats = {"generate_time": [], "step_time": [], "current_step": []}
 
-        while self.running:
+        while self.running and rollout_cache is not None:
 
             with Timer(name="generate", logger=None) as generate_timer:
                 lm_output: DataProto = self.make_decision(rollout_cache)
@@ -151,34 +149,41 @@ class TrajEnvManager(BaseEnvManager):
 
                 rollout: Optional[DataProto] = self.formulate_rollouts(rollout_cache)
 
-                # Skip invalid trajectories (e.g., no valid assistant response tokens)
                 if rollout is None:
+                    # Put None to keep group synchronized (all group members must put)
                     self.logger.warning(
                         f"[SKIP_TRAJ] env_id={self.env_config['env_id']}, episode_id={self.episode_id}: "
-                        f"Invalid trajectory returned None, resetting and continuing..."
+                        f"Invalid trajectory returned None, putting None to queue and continuing..."
                     )
-                    # Reset and continue to next episode without putting to queue
-                    if not self.running or (is_sync_training and self.episode_id >= self.worker_config.max_traj_per_env):
-                        self.rollout_cache = None
-                        break
-                    rollout_cache = self.reset()
-                    continue
-
-                traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
-                traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
-                rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id] * rollout.batch.batch_size[0], dtype=object)
-                rollout.non_tensor_batch["traj_id"] = np.array([traj_id] * rollout.batch.batch_size[0], dtype=object)
-                ray.get(self.output_queue.put.remote(self.env_config['group_id'], self.episode_id, start_step, rollout))
-
-                if not self.running or (is_sync_training and self.episode_id >= self.worker_config.max_traj_per_env):
-                    self.rollout_cache: Optional[RolloutCache] = None
-                    self.logger.debug(
-                        f"env_id: {self.env_config['env_id']} max_traj_per_env {self.worker_config.max_traj_per_env} reached, stopping rollout loop")
-                    break
+                    ray.get(self.output_queue.put.remote(
+                        self.env_config['group_id'], self.episode_id,
+                        start_step, None, self.env_config['env_id']))
+                else:
+                    traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
+                    traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
+                    rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id] * rollout.batch.batch_size[0], dtype=object)
+                    rollout.non_tensor_batch["traj_id"] = np.array([traj_id] * rollout.batch.batch_size[0], dtype=object)
+                    ray.get(self.output_queue.put.remote(
+                        self.env_config['group_id'], self.episode_id,
+                        start_step, rollout, self.env_config['env_id']))
 
                 rollout_cache = self.reset()
+                start_step = self.current_step
 
-    def reset(self) -> RolloutCache:
+        # Signal exit to queue (ignored if groups already cleared by shutdown)
+        ray.get(self.output_queue.put.remote(
+            self.env_config['group_id'], self.episode_id,
+            start_step, None, self.env_config['env_id']))
+
+    def reset(self) -> Optional[RolloutCache]:
+        """Reset environment for next episode. Returns None if no more episodes available."""
+        # Request episode_id from central GroupQueue (replaces local self.episode_id += 1)
+        self.episode_id = ray.get(self.output_queue.get_episode_id.remote(
+            self.env_config['group_id'], self.env_config['env_id']))
+        if self.episode_id is None:
+            assert not self.running
+            return None
+
         self.rollout_cache = RolloutCache(env_id=self.env_config['env_id'],
                                           group_id=self.env_config['group_id'],
                                           tag=self.env_config['tag'])
@@ -192,7 +197,6 @@ class TrajEnvManager(BaseEnvManager):
             "state": next_state,
             "actions_left": self.env.config.max_steps - self.rollout_cache.step,
         })
-        self.episode_id += 1
         return self.rollout_cache
 
     def step(self, llm_output: DataProto):
@@ -249,12 +253,14 @@ class TrajEnvManager(BaseEnvManager):
             "position_ids": position_ids,
         }, batch_size=input_ids.shape[0])
 
-        max_new_tokens = min(self.env_config["max_tokens_per_step"], self.worker_config.generating_args.max_new_tokens)
+        # Cap max_new_tokens to remaining space: sequence_length - current_input_length
+        # Ported from newest ROLL to prevent over-generation that causes sequence overflow.
+        max_new_tokens = min(self.env_config["max_tokens_per_step"],
+                             self.worker_config.generating_args.max_new_tokens,
+                             self.pipeline_config.sequence_length - lm_input.batch['input_ids'].shape[1])
         generation_config = self.worker_config.generating_args.to_dict()
-
-        generation_config["max_new_tokens"] = min(max_new_tokens,
-                                                  max(self.pipeline_config.sequence_length - lm_input.batch['input_ids'].shape[1] - max_new_tokens, 1))
-        if generation_config["max_new_tokens"] <= 1:
+        generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
+        if max_new_tokens <= 1:
             self.logger.warning(f"sequence_length = {self.pipeline_config.sequence_length} input_ids length = {lm_input.batch['input_ids'].shape[1]},"
                                 f"maybe you should increase the response_length")
             return DataProto(meta_info={"stop_reason": GenerateStopReason.MAX_LENGTH})

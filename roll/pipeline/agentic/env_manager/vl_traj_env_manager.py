@@ -64,7 +64,7 @@ class VLTrajEnvManager(TrajEnvManager):
         # EnvManager states
         self.rollout_cache: Optional[RolloutCache] = None
         self.group_seed = None
-        self.episode_id = 0
+        self.episode_id = None
         self.current_step = -1
         self.running = False
         self.use_thread_lock = self.env_config.get("use_thread_lock", False) # 避免同时执行大量cpu操作, 可以通过env_config配置
@@ -137,13 +137,29 @@ class VLTrajEnvManager(TrajEnvManager):
         inputs = self.collator(features)
         lm_input: DataProto = DataProto.from_single_dict(inputs)
 
-        max_new_tokens = min(self.env_config["max_tokens_per_step"], self.worker_config.generating_args.max_new_tokens)
-        generation_config = self.worker_config.generating_args.to_dict()
+        # Early termination: if input already exceeds sequence_length, stop episode.
+        # This prevents formulate_rollouts() from truncating image tokens via pad_to_length,
+        # which would cause "Image features and image tokens do not match" in Qwen2.5-VL.
+        input_ids = lm_input.batch['input_ids']
+        if input_ids.shape[1] >= self.pipeline_config.sequence_length:
+            self.logger.warning(
+                f"Input length ({input_ids.shape[1]}) >= "
+                f"sequence_length ({self.pipeline_config.sequence_length}), stopping episode to preserve image token alignment"
+            )
+            return DataProto(meta_info={"stop_reason": GenerateStopReason.MAX_LENGTH})
 
-        generation_config["max_new_tokens"] = min(max_new_tokens,
-                                                  max(self.pipeline_config.sequence_length - lm_input.batch['input_ids'].shape[1] - max_new_tokens, 1))
-        if generation_config["max_new_tokens"] <= 1:
-            self.logger.warning(f"sequence_length = {self.pipeline_config.sequence_length} input_ids length = {lm_input.batch['input_ids'].shape[1]},"
+        # Cap max_new_tokens to remaining space: sequence_length - current_input_length
+        # This prevents generation from producing sequences that exceed sequence_length,
+        # avoiding image token truncation in formulate_rollouts().
+        # Ported from newest ROLL: uses (seq_length - input_length) instead of old formula
+        # which double-subtracted max_new_tokens and was overly conservative.
+        max_new_tokens = min(self.env_config["max_tokens_per_step"],
+                             self.worker_config.generating_args.max_new_tokens,
+                             self.pipeline_config.sequence_length - input_ids.shape[1])
+        generation_config = self.worker_config.generating_args.to_dict()
+        generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
+        if max_new_tokens <= 1:
+            self.logger.warning(f"sequence_length = {self.pipeline_config.sequence_length} input_ids length = {input_ids.shape[1]},"
                                 f"maybe you should increase the response_length")
             return DataProto(meta_info={"stop_reason": GenerateStopReason.MAX_LENGTH})
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
@@ -221,7 +237,13 @@ class VLTrajEnvManager(TrajEnvManager):
 
         messages = self.format_messages(history)
 
-        messages_text = self.processor.apply_chat_template(messages)
+        # Use tokenizer (not processor) to avoid image token count mismatch.
+        # processor.apply_chat_template may parse base64 image URLs to determine image
+        # dimensions for computing vision token counts, but our base64 data comes from
+        # raw numpy bytes (not valid JPEG), causing incorrect image_pad token counts.
+        # tokenizer.apply_chat_template simply inserts fixed <|image_pad|> placeholders,
+        # letting the collator/processor handle actual image processing with PIL images.
+        messages_text = self.tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
 
         images = []
         for message in messages:
@@ -244,6 +266,14 @@ class VLTrajEnvManager(TrajEnvManager):
 
         response_mask = torch.tensor(response_masks, dtype=torch.bool).unsqueeze(0)
 
+        if 1 not in response_masks:
+            self.logger.warning(
+                f"[SKIP_VL_TRAJ] env_id={self.env_config['env_id']}: "
+                f"No assistant response tokens in response_masks. "
+                f"Skipping trajectory (model may have generated empty response)."
+            )
+            return None
+
         first_response_idx = response_masks.index(1)
         last_response_idx = len(response_masks) - 1 - response_masks[::-1].index(1)
         prompt_masks = [1] * first_response_idx + [0] * (len(token_ids) - first_response_idx)
@@ -254,6 +284,20 @@ class VLTrajEnvManager(TrajEnvManager):
         input_ids = inputs.input_ids[:, :last_response_idx+1]
         attention_mask = inputs.attention_mask[:, :last_response_idx+1]
         position_ids = inputs.position_ids[:, :, :last_response_idx+1]
+
+        # Safety check: if sequence exceeds sequence_length, pad_to_length would truncate
+        # through image token regions, causing "Image features and image tokens do not match".
+        # Skip the trajectory instead of crashing.
+        actual_length = input_ids.shape[1]
+        if actual_length > self.pipeline_config.sequence_length:
+            self.logger.warning(
+                f"[SKIP_VL_TRAJ] env_id={self.env_config['env_id']}: "
+                f"Rollout sequence length ({actual_length}) exceeds "
+                f"sequence_length ({self.pipeline_config.sequence_length}). "
+                f"Skipping trajectory to avoid image token mismatch from truncation."
+            )
+            return None
+
         lm_input: DataProto = DataProto.from_single_dict(inputs)
         response_length = response_mask.sum(dim=-1).float().mean().item()
         input_ids = pad_to_length(input_ids, length=self.pipeline_config.sequence_length, pad_value=self.tokenizer.pad_token_id)
@@ -281,6 +325,74 @@ class VLTrajEnvManager(TrajEnvManager):
             "step_scores": np.array([scores], dtype=object),
             "episode_scores": np.array([episode_score], dtype=object),
         })
+
+        # Defensive check: verify image token / pixel_values alignment.
+        # After truncation (to last_response_idx+1) and pad_to_length, the number of
+        # <|image_pad|> tokens in input_ids must match the merged feature count that
+        # the vision encoder will produce from pixel_values. A mismatch causes
+        # "Image features and image tokens do not match" crash in model forward.
+        # If mismatched, trim pixel_values from the end to align; skip if untrimable.
+        if "multi_modal_inputs" in lm_input.non_tensor_batch:
+            mm_array = lm_input.non_tensor_batch["multi_modal_inputs"]
+            if len(mm_array) > 0 and isinstance(mm_array[0], dict):
+                mm_dict = mm_array[0]
+                if "pixel_values" in mm_dict and "image_grid_thw" in mm_dict:
+                    image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+                    n_image_tokens = (input_ids[0] == image_token_id).sum().item()
+                    pixel_values = mm_dict["pixel_values"]
+                    grid_thw = mm_dict["image_grid_thw"]
+
+                    # Compute expected merged features per image.
+                    # Qwen2.5-VL: spatial_merge_size=2, so 4 raw patches → 1 merged token.
+                    merge_size = getattr(
+                        getattr(self.processor, 'image_processor', None),
+                        'merge_size', 2
+                    )
+                    merge_factor = merge_size * merge_size
+                    patches_per_image = [
+                        (grid_thw[i, 0] * grid_thw[i, 1] * grid_thw[i, 2]).item()
+                        for i in range(grid_thw.shape[0])
+                    ]
+                    merged_per_image = [p // merge_factor for p in patches_per_image]
+                    total_expected_features = sum(merged_per_image)
+
+                    if n_image_tokens != total_expected_features:
+                        self.logger.warning(
+                            f"[VL_ALIGN_FIX] env_id={self.env_config['env_id']}: "
+                            f"image_pad_tokens={n_image_tokens} != "
+                            f"expected_features={total_expected_features} "
+                            f"(images={grid_thw.shape[0]}, merge_factor={merge_factor}). "
+                            f"Attempting to trim pixel_values."
+                        )
+                        # Trim images from the end until features <= available tokens
+                        cumulative_tokens = 0
+                        keep_images = 0
+                        keep_patches = 0
+                        for i, (patches, merged) in enumerate(zip(patches_per_image, merged_per_image)):
+                            if cumulative_tokens + merged <= n_image_tokens:
+                                cumulative_tokens += merged
+                                keep_images = i + 1
+                                keep_patches += patches
+                            else:
+                                break
+
+                        if keep_images == 0 or cumulative_tokens != n_image_tokens:
+                            # Cannot perfectly align (partial image tokens remain) — skip
+                            self.logger.warning(
+                                f"[VL_ALIGN_FIX] Cannot align by trimming: "
+                                f"keep_images={keep_images}, aligned_tokens={cumulative_tokens}, "
+                                f"target_tokens={n_image_tokens}. Skipping trajectory."
+                            )
+                            return None
+
+                        # Apply trim to pixel_values and image_grid_thw
+                        mm_dict["pixel_values"] = pixel_values[:keep_patches]
+                        mm_dict["image_grid_thw"] = grid_thw[:keep_images]
+                        lm_input.non_tensor_batch["multi_modal_inputs"][0] = mm_dict
+                        self.logger.info(
+                            f"[VL_ALIGN_FIX] Trimmed: kept {keep_images}/{grid_thw.shape[0]} images "
+                            f"({keep_patches} patches, {cumulative_tokens} merged features)"
+                        )
 
         env_metric = {
             'success': float(self.rollout_cache.history[-1]['metrics'].get('success', episode_score > 0)),
