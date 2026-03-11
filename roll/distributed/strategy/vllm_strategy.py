@@ -356,8 +356,13 @@ def gather_outputs_to_pad_tensor(request_outputs: List["RequestOutput"], pad_tok
 
 
 def create_sampling_params_for_vllm(gen_kwargs):
-    # enable engine logprobs when user selects engine compute path
-    want_engine_logprobs = gen_kwargs.get("old_prob_compute", "trainer") == "engine"
+    # Enable engine logprobs when:
+    # 1. old_prob_compute="engine" (legacy path), OR
+    # 2. use_engine_logprobs=True (replay buffer needs true pi_mu)
+    want_engine_logprobs = (
+        gen_kwargs.get("old_prob_compute", "trainer") == "engine"
+        or gen_kwargs.get("use_engine_logprobs", False)
+    )
     logprobs_flag = 1 if want_engine_logprobs else 0
     if gen_kwargs["num_beams"] > 1:
         return SamplingParams(

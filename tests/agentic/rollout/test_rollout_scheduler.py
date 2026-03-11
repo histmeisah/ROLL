@@ -40,59 +40,55 @@ async def async_test_GroupQueueManager(rollout_batch_size, async_generation_rati
         "train"
     )
 
-    current_step = 0
-    stoped_threads = 0
-
     def run_rollout_loop(thread_id, group_id, output_queue):
-        nonlocal stoped_threads
+        """Simulate a single env manager's rollout loop for one step."""
         if TEST_EXCEPTION:
             raise Exception("test exception")
 
-        for i in range(10):
+        while True:
             # Get episode_id from central queue (replaces local episode_id tracking)
             episode_id = ray.get(output_queue.get_episode_id.remote(group_id, thread_id))
             if episode_id is None:
-                break  # No more episodes available
-            rollout = current_step
+                break  # Shutdown signaled, no more episodes available
+            rollout = f"rollout_{thread_id}_{episode_id}"
             ray.get(output_queue.put.remote(group_id, episode_id, 0, rollout, thread_id))
-        stoped_threads += 1
 
-    async def rollout():
-        nonlocal current_step
-        try:
-            for i in range(10):
-                current_step = i
-                # Create groups for this step (central episode_id allocation)
-                await env_output_queue.advance_step.remote(current_step)
+    for step in range(10):
+        # Each step: advance -> start threads -> get_batch -> shutdown -> clear
+        # This mirrors production: _start_env_manager -> get_batch -> _stop_env_manager
+        await env_output_queue.advance_step.remote(step)
+
+        with ThreadPoolExecutor(max_workers=env_num) as pool:
+            loop = asyncio.get_event_loop()
+            try:
+                if TEST_EXCEPTION:
+                    assert 2 < env_num
+                    thread_futures = asyncio.gather(
+                        *[loop.run_in_executor(pool, run_rollout_loop, i, i // env_manager_config.group_size, env_output_queue) for i in range(2)]
+                    )
+                else:
+                    thread_futures = asyncio.gather(
+                        *[loop.run_in_executor(pool, run_rollout_loop, i, i // env_manager_config.group_size, env_output_queue) for i in range(env_num)]
+                    )
+
                 batch = await env_output_queue.get_batch.remote(rollout_batch_size)
-                print(f"batch on step({current_step}): len={len(batch)}")
-                # Shutdown and clear for next step (sync training pattern)
-                env_output_queue.shutdown.remote()
-                await env_output_queue.clear.remote(rollout_batch_size)
-                await asyncio.sleep(0.1)
-        except Exception as e:
-            sys.exit(f"ERROR rollout get exception: {e}")
+                print(f"batch on step({step}): len={len(batch)}")
+                assert len(batch) == rollout_batch_size, f"Expected {rollout_batch_size}, got {len(batch)}"
 
-    rollout_task = asyncio.create_task(rollout())
+                # Shutdown signals all get_episode_id waiters to return None
+                await env_output_queue.shutdown.remote()
+                # Wait for all threads to finish (they break on None)
+                await thread_futures
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        loop = asyncio.get_event_loop()
-        try:
-            assert env_manager_config.world_size == 1
-            if TEST_EXCEPTION:
-                assert 2 < env_num
-                await asyncio.gather(
-                    *[loop.run_in_executor(pool, run_rollout_loop, i, i // env_manager_config.group_size, env_output_queue) for i in range(2)]
-                )
-            else:
-                await asyncio.gather(
-                    *[loop.run_in_executor(pool, run_rollout_loop, i, i // env_manager_config.group_size, env_output_queue) for i in range(env_num)]
-                )
-        except Exception as e:
-            ref = env_output_queue.put_exception.remote(e)
-            await asyncio.wrap_future(ref.future())
+            except Exception as e:
+                ref = env_output_queue.put_exception.remote(e)
+                await asyncio.wrap_future(ref.future())
+                raise
 
-    await rollout_task
+        # Clear for next step
+        await env_output_queue.clear.remote(rollout_batch_size)
+
+    print(f"  PASSED: batch_size={rollout_batch_size}, async_ratio={async_generation_ratio}")
 
 async def async_test_none_rollouts():
     """Test that None rollouts (from invalid trajectories) are filtered correctly."""
@@ -118,7 +114,7 @@ async def async_test_none_rollouts():
     )
 
     def run_env(env_id, output_queue):
-        for _ in range(2):
+        while True:
             episode_id = ray.get(output_queue.get_episode_id.remote(0, env_id))
             if episode_id is None:
                 break
@@ -126,25 +122,24 @@ async def async_test_none_rollouts():
             rollout = f"valid_rollout_{episode_id}" if env_id == 0 else None
             ray.get(output_queue.put.remote(0, episode_id, 0, rollout, env_id))
 
-    async def collect():
-        await env_output_queue.advance_step.remote(0)
-        batch_size = 2 * 2  # max_traj_per_env * group_size = 4
-        batch = await env_output_queue.get_batch.remote(batch_size)
-        # With 2 groups, each having 1 valid + 1 None, we get 2 valid rollouts
-        print(f"None rollout test: got {len(batch)} valid rollouts (expected 2)")
-        assert len(batch) == 2, f"Expected 2 valid rollouts, got {len(batch)}"
-        env_output_queue.shutdown.remote()
-        await env_output_queue.clear.remote()
-
-    collect_task = asyncio.create_task(collect())
+    await env_output_queue.advance_step.remote(0)
 
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=4) as pool:
-        await asyncio.gather(
+        thread_futures = asyncio.gather(
             *[loop.run_in_executor(pool, run_env, i, env_output_queue) for i in range(train_env_num)]
         )
 
-    await collect_task
+        batch_size = 2 * 2  # max_traj_per_env * group_size = 4
+        batch = await env_output_queue.get_batch.remote(batch_size)
+        # With 2 episodes each having 1 valid + 1 None, we get 2 valid rollouts
+        print(f"None rollout test: got {len(batch)} valid rollouts (expected 2)")
+        assert len(batch) == 2, f"Expected 2 valid rollouts, got {len(batch)}"
+
+        await env_output_queue.shutdown.remote()
+        await thread_futures
+
+    await env_output_queue.clear.remote()
     print("None rollout test PASSED")
 
 

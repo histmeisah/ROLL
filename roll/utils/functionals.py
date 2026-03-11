@@ -1078,3 +1078,152 @@ def separate_prompt_response(
     prompt_ids = torch.where(prompt_mask, input_ids, torch.full_like(input_ids, pad_id))
     response_ids = torch.where(response_mask_valid, input_ids, torch.full_like(input_ids, pad_id))
     return prompt_ids, response_ids
+
+
+def get_seqlen_balanced_partitions(
+    workload_lst: torch.Tensor, k_partitions: int, equal_size: bool = True
+) -> List[List[int]]:
+    """Karmarkar-Karp algorithm for balanced workload partitioning.
+
+    Partition indices into k groups such that the total workload in each group
+    is as balanced as possible.
+
+    Args:
+        workload_lst: 1-D tensor of workload values (e.g. token counts).
+        k_partitions: Number of partitions (typically dp_size).
+        equal_size: If True, enforce equal partition sizes (padding with dummy items).
+
+    Returns:
+        List of k lists, each containing indices assigned to that partition.
+    """
+    import heapq
+
+    n = len(workload_lst)
+
+    if equal_size:
+        # Pad to a multiple of k_partitions
+        remainder = n % k_partitions
+        if remainder != 0:
+            padding = k_partitions - remainder
+        else:
+            padding = 0
+        total = n + padding
+    else:
+        total = n
+        padding = 0
+
+    # Build a list of (workload, index) — use negative workload for max-heap via heapq (min-heap)
+    items = []
+    for i in range(n):
+        items.append((workload_lst[i].item() if torch.is_tensor(workload_lst[i]) else float(workload_lst[i]), i))
+    # Add dummy items with 0 workload for padding
+    for i in range(padding):
+        items.append((0.0, n + i))
+
+    # Sort items in descending order of workload
+    items.sort(key=lambda x: x[0], reverse=True)
+
+    # Greedy assignment: assign each item to the partition with smallest total workload
+    partition_workloads = [0.0] * k_partitions
+    partitions: List[List[int]] = [[] for _ in range(k_partitions)]
+    # Use a min-heap of (total_workload, partition_index)
+    heap = [(0.0, i) for i in range(k_partitions)]
+    heapq.heapify(heap)
+
+    for workload, idx in items:
+        min_load, min_partition = heapq.heappop(heap)
+        partitions[min_partition].append(idx)
+        heapq.heappush(heap, (min_load + workload, min_partition))
+
+    # Remove dummy indices
+    if padding > 0:
+        for p in range(k_partitions):
+            partitions[p] = [idx for idx in partitions[p] if idx < n]
+
+    return partitions
+
+
+def log_seqlen_unbalance(
+    global_seqlen_lst: torch.Tensor, global_partition_lst: List[List[int]], logging_prefix: str = "global_seqlen"
+) -> dict:
+    """Log metrics about sequence length imbalance across DP partitions."""
+    partition_totals = []
+    for partition in global_partition_lst:
+        total = sum(
+            global_seqlen_lst[i].item() if torch.is_tensor(global_seqlen_lst[i]) else float(global_seqlen_lst[i])
+            for i in partition
+        )
+        partition_totals.append(total)
+
+    max_total = max(partition_totals) if partition_totals else 0
+    min_total = min(partition_totals) if partition_totals else 0
+    mean_total = np.mean(partition_totals) if partition_totals else 0
+
+    metrics = {
+        f"{logging_prefix}/max_partition_tokens": max_total,
+        f"{logging_prefix}/min_partition_tokens": min_total,
+        f"{logging_prefix}/mean_partition_tokens": mean_total,
+        f"{logging_prefix}/imbalance_ratio": (max_total / mean_total - 1.0) if mean_total > 0 else 0.0,
+    }
+    return metrics
+
+
+def batch_balance(
+    batch: "DataProto", dp_size: int, minibatch_size: int = 0,
+    logging_prefix: str = "global_seqlen", keep_minibatch: bool = False,
+) -> tuple:
+    """Reorder the data on single controller such that each dp rank gets similar total tokens.
+
+    Args:
+        batch: Input DataProto batch.
+        dp_size: Number of data-parallel ranks.
+        minibatch_size: Mini-batch size (unused when keep_minibatch=False).
+        logging_prefix: Prefix for balance metric keys.
+        keep_minibatch: If True, balance within mini-batch boundaries.
+
+    Returns:
+        Tuple of (reordered batch, balance metrics dict).
+    """
+    attention_mask = batch.batch["attention_mask"]
+    batch_size = attention_mask.shape[0]
+    global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)
+
+    def calculate_workload(seq_len_list):
+        return 24576 * seq_len_list + seq_len_list * seq_len_list
+
+    workload_lst = calculate_workload(global_seqlen_lst)
+    world_size = dp_size
+
+    if keep_minibatch:
+        # Balance within each mini-batch group
+        global_partition_lst = []
+        for mb_start in range(0, batch_size, minibatch_size):
+            mb_end = min(mb_start + minibatch_size, batch_size)
+            mb_workloads = workload_lst[mb_start:mb_end]
+            mb_partitions = get_seqlen_balanced_partitions(
+                mb_workloads, k_partitions=world_size, equal_size=True
+            )
+            # Offset indices to global
+            for p in range(len(mb_partitions)):
+                mb_partitions[p] = [idx + mb_start for idx in mb_partitions[p]]
+            if not global_partition_lst:
+                global_partition_lst = mb_partitions
+            else:
+                for p in range(len(mb_partitions)):
+                    global_partition_lst[p].extend(mb_partitions[p])
+    else:
+        global_partition_lst = get_seqlen_balanced_partitions(
+            workload_lst, k_partitions=world_size, equal_size=True
+        )
+
+    # Zigzag reorder within each partition for better load balance across micro-batches
+    for idx, partition in enumerate(global_partition_lst):
+        partition.sort(key=lambda x: (workload_lst[x].item() if torch.is_tensor(workload_lst[x]) else float(workload_lst[x]), x))
+        ordered_partition = partition[::2] + partition[1::2][::-1]
+        global_partition_lst[idx] = ordered_partition
+
+    global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+    batch.reorder(global_idx)
+
+    balance_metrics = log_seqlen_unbalance(global_seqlen_lst, global_partition_lst, logging_prefix)
+    return batch, balance_metrics

@@ -219,8 +219,9 @@ class StepReplayBuffer(BaseReplayBuffer):
             )
 
             # Calculate priority for this step
+            # Pass age_decay as kwarg for reward_fresh and other age-aware priority functions
             try:
-                priority = self.priority_fn(step_entry, global_step)
+                priority = self.priority_fn(step_entry, global_step, age_decay=self.age_decay)
                 step_entry.priority = float(priority)
             except Exception as e:
                 logger.warning(f"Failed to calculate priority, using default 1.0: {e}")
@@ -365,7 +366,13 @@ class StepReplayBuffer(BaseReplayBuffer):
 
         batch_input_ids = torch.zeros((sample_size, max_seq_len), dtype=torch.long, device=target_device)
         batch_attention_mask = torch.zeros((sample_size, max_seq_len), dtype=torch.bool, device=target_device)
-        batch_position_ids = torch.zeros((sample_size, max_seq_len), dtype=torch.long, device=target_device)
+        # Detect VLM multi-dimensional position_ids (e.g., Qwen2.5-VL uses [3, seq_len] for 3D-RoPE)
+        first_position_ids = sampled_steps[0].position_ids
+        if first_position_ids.ndim > 1:
+            pos_id_dims = first_position_ids.shape[0]
+            batch_position_ids = torch.zeros((sample_size, pos_id_dims, max_seq_len), dtype=torch.long, device=target_device)
+        else:
+            batch_position_ids = torch.zeros((sample_size, max_seq_len), dtype=torch.long, device=target_device)
         batch_response_mask = torch.zeros((sample_size, max_seq_len), dtype=torch.bool, device=target_device)
         batch_prompt_mask = torch.zeros((sample_size, max_seq_len), dtype=torch.bool, device=target_device)
         batch_scores = torch.zeros((sample_size, max_seq_len), dtype=torch.float, device=target_device)
@@ -664,7 +671,13 @@ class StepReplayBuffer(BaseReplayBuffer):
         # Prepare tensors
         batch_input_ids = torch.zeros((total_samples, max_seq_len), dtype=torch.long, device=target_device)
         batch_attention_mask = torch.zeros((total_samples, max_seq_len), dtype=torch.bool, device=target_device)
-        batch_position_ids = torch.zeros((total_samples, max_seq_len), dtype=torch.long, device=target_device)
+        # Detect VLM multi-dimensional position_ids (e.g., Qwen2.5-VL uses [3, seq_len] for 3D-RoPE)
+        first_entry = buffer_list[all_indices[0]]
+        if first_entry.position_ids.ndim > 1:
+            pos_id_dims = first_entry.position_ids.shape[0]
+            batch_position_ids = torch.zeros((total_samples, pos_id_dims, max_seq_len), dtype=torch.long, device=target_device)
+        else:
+            batch_position_ids = torch.zeros((total_samples, max_seq_len), dtype=torch.long, device=target_device)
         batch_response_mask = torch.zeros((total_samples, max_seq_len), dtype=torch.bool, device=target_device)
         batch_prompt_mask = torch.zeros((total_samples, max_seq_len), dtype=torch.bool, device=target_device)
         batch_scores = torch.zeros((total_samples, max_seq_len), dtype=torch.float, device=target_device)
@@ -908,6 +921,82 @@ class StepReplayBuffer(BaseReplayBuffer):
         else:
             return buffer_list[idx].priority
 
+    def refresh_all_age_decay(self, current_global_step: int) -> int:
+        """
+        Refresh age decay for ALL samples in the buffer, updating segment tree.
+
+        This method should be called periodically (e.g., every training step) to ensure
+        that old samples have their priorities properly decayed based on their age.
+
+        Without this refresh, only sampled entries get their age decay updated via
+        update_priorities(), leaving unsampled old entries with stale (too high) priorities.
+
+        Time complexity: O(buffer_size)
+        Typical runtime: ~50-100ms for buffer_size=100,000
+
+        This method is designed to be called asynchronously during GPU training,
+        so the CPU overhead is hidden by GPU computation time.
+
+        Args:
+            current_global_step: Current training step for age calculation
+
+        Returns:
+            Number of samples refreshed
+
+        Example:
+            >>> # Call during GPU training (async)
+            >>> from concurrent.futures import ThreadPoolExecutor
+            >>> executor = ThreadPoolExecutor(max_workers=1)
+            >>> future = executor.submit(buffer.refresh_all_age_decay, global_step)
+            >>> # ... GPU training happens here ...
+            >>> refreshed_count = future.result()  # Wait before sampling
+        """
+        if not self.enable_age_decay:
+            logger.debug("Age decay not enabled, skipping refresh")
+            return 0
+
+        # Update current global step
+        self.current_global_step = current_global_step
+
+        buffer_list = list(self.steps)
+        buffer_size = len(buffer_list)
+
+        if buffer_size == 0:
+            return 0
+
+        refreshed_count = 0
+        max_age = 0
+        total_age = 0
+
+        for idx, entry in enumerate(buffer_list):
+            if entry is None:
+                continue
+
+            # Calculate current age and freshness
+            age = max(0, current_global_step - entry.global_step)
+            freshness_weight = np.exp(-age / self.age_decay)
+
+            # Calculate effective priority with age decay
+            effective_priority = max(entry.priority * freshness_weight, 1e-8)
+
+            # Update segment tree
+            priority_alpha = effective_priority ** self.priority_exponent
+            self._it_sum[idx] = priority_alpha
+            self._it_min[idx] = priority_alpha
+
+            refreshed_count += 1
+            max_age = max(max_age, age)
+            total_age += age
+
+        avg_age = total_age / refreshed_count if refreshed_count > 0 else 0
+
+        logger.debug(
+            f"[AGE_DECAY] Refreshed {refreshed_count} samples at step {current_global_step}. "
+            f"avg_age={avg_age:.1f}, max_age={max_age}, age_decay={self.age_decay}"
+        )
+
+        return refreshed_count
+
     @staticmethod
     def compute_advantage_priorities(batch: DataProto) -> np.ndarray:
         """
@@ -1021,6 +1110,9 @@ class StepReplayBuffer(BaseReplayBuffer):
                 "priority_fn": self.priority_fn.__name__,
                 "priority_exponent": self.priority_exponent,
                 "max_priority": self._max_priority,
+                # Age decay configuration - important for understanding sampling behavior
+                "enable_age_decay": self.enable_age_decay,
+                "age_decay": self.age_decay,
             })
 
         # Add episode index statistics

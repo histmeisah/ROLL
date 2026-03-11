@@ -205,6 +205,19 @@ class TrajEnvManager(BaseEnvManager):
             skip_special_tokens=True
         )
 
+        # Extract per-turn engine logprobs (true pi_mu) before environment step
+        _turn_logprobs = None
+        if "generation_log_probs" in llm_output.batch:
+            gen_lp = llm_output.batch["generation_log_probs"][0]  # [full_seq_len]
+            resp_mask = llm_output.batch.get("response_mask", None)
+            if resp_mask is not None:
+                _turn_logprobs = gen_lp[resp_mask[0].bool()].tolist()
+            else:
+                # Skip extraction when response_mask is unavailable —
+                # using gen_lp[gen_lp != 0] is unreliable (may miss 0.0 logprobs
+                # or include non-response positions)
+                self.logger.debug("[ENGINE_LP] response_mask not available, skipping logprobs extraction")
+
         next_state, reward, terminated, truncated, info = self.env.step(action=responses[0])
 
         self.rollout_cache.step += 1
@@ -219,12 +232,17 @@ class TrajEnvManager(BaseEnvManager):
         if not info['metrics'].get("action_is_valid", True):
             self.rollout_cache.history[-1]['penalty'] = self.worker_config.format_penalty
         self.rollout_cache.history[-1]['llm_response'] = responses[0]
-        
+
         # 记录解析后的动作信息（用于轨迹日志）
         self.rollout_cache.history[-1]['parsed_action'] = info.get('action', '')
-        
+
         if info is not None:
             self.rollout_cache.history[-1].update(info)
+
+        # Store engine logprobs for this turn (true pi_mu from VLLM)
+        # NOTE: Must be AFTER info.update() to prevent env info from overwriting response_logprobs
+        if _turn_logprobs is not None:
+            self.rollout_cache.history[-1]['response_logprobs'] = _turn_logprobs
 
         self.rollout_cache.history.append({
             "state": next_state,
@@ -260,6 +278,12 @@ class TrajEnvManager(BaseEnvManager):
                              self.pipeline_config.sequence_length - lm_input.batch['input_ids'].shape[1])
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
+        # Pass use_engine_logprobs flag so VLLM returns per-token logprobs for true pi_mu
+        # Only for train mode — val doesn't need logprobs and they cause concat shape issues
+        if (self.mode == "train"
+                and self.pipeline_config.replay.enabled
+                and self.pipeline_config.replay.use_engine_logprobs):
+            generation_config["use_engine_logprobs"] = True
         if max_new_tokens <= 1:
             self.logger.warning(f"sequence_length = {self.pipeline_config.sequence_length} input_ids length = {lm_input.batch['input_ids'].shape[1]},"
                                 f"maybe you should increase the response_length")
@@ -368,18 +392,60 @@ class TrajEnvManager(BaseEnvManager):
         response_mask = response_mask[:, :last_response_idx+1]
         prompt_mask = prompt_mask[:, :last_response_idx+1]
         score_tensor = score_tensor[:, :last_response_idx+1]
+
+        # Assemble engine logprobs (true pi_mu) from per-turn stored logprobs (train only)
+        engine_behavior_log_probs = None
+        completed_steps = [h for h in self.rollout_cache.history if 'reward' in h]
+        has_engine_logprobs = (
+            self.mode == "train"
+            and any('response_logprobs' in h for h in completed_steps)
+        )
+        if has_engine_logprobs:
+            # Build behavior_log_probs in next-token format: [1, seq_len-1]
+            # Position i holds logprob of token at position i+1
+            truncated_len = last_response_idx + 1
+            engine_behavior_log_probs = torch.zeros(1, truncated_len - 1, dtype=torch.float32)
+
+            # Iterate over messages and match assistant turns to completed steps
+            turn_idx = 0
+            token_offset = 0  # cumulative offset in the full token sequence
+            for msg_idx, seg_mask in enumerate(response_masks_list):
+                seg_len = len(seg_mask)
+                if messages[msg_idx]["role"].lower() == "assistant" and turn_idx < len(completed_steps):
+                    stored_lp = completed_steps[turn_idx].get('response_logprobs', None)
+                    if stored_lp is not None:
+                        # Find response token positions within this segment
+                        resp_positions = [j for j, m in enumerate(seg_mask) if m == 1]
+                        n_resp = len(resp_positions)
+                        n_stored = len(stored_lp)
+                        n_use = min(n_resp, n_stored)
+                        if n_resp != n_stored:
+                            self.logger.debug(
+                                f"[ENGINE_LP] Turn {turn_idx}: token count mismatch "
+                                f"(re-tokenized={n_resp}, engine={n_stored}), using {n_use}"
+                            )
+                        for j in range(n_use):
+                            # Next-token format: logprob for token at absolute position p
+                            # goes into index p-1 of the logprobs tensor
+                            abs_pos = token_offset + resp_positions[j]
+                            if abs_pos - 1 >= 0 and abs_pos - 1 < truncated_len - 1:
+                                engine_behavior_log_probs[0, abs_pos - 1] = stored_lp[j]
+                    turn_idx += 1
+                token_offset += seg_len
+
         lm_input = DataProto()
-        lm_input.batch = TensorDict(
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "penalty": torch.Tensor([episode_penalty]),
-                "response_mask": response_mask,
-                "prompt_mask": prompt_mask,
-                "scores": score_tensor,
-            },
-            batch_size=input_ids.shape[0])
+        batch_dict = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "penalty": torch.Tensor([episode_penalty]),
+            "response_mask": response_mask,
+            "prompt_mask": prompt_mask,
+            "scores": score_tensor,
+        }
+        if engine_behavior_log_probs is not None:
+            batch_dict["behavior_log_probs"] = engine_behavior_log_probs
+        lm_input.batch = TensorDict(batch_dict, batch_size=input_ids.shape[0])
 
         response_length = response_mask.sum(dim=-1).float().mean().item()
         lm_input.non_tensor_batch.update({

@@ -392,6 +392,14 @@ class RolloutScheduler:
                         )
                         data_proto.batch[field_name] = padded_tensor
 
+                # Pad next-token format fields (seq_len - 1) separately
+                if "behavior_log_probs" in data_proto.batch:
+                    data_proto.batch["behavior_log_probs"] = pad_to_length(
+                        data_proto.batch["behavior_log_probs"],
+                        length=self.sequence_length - 1,
+                        pad_value=0.0
+                    )
+
                 padded_batch.append(data_proto)
 
             except Exception as e:

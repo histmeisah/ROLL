@@ -18,6 +18,7 @@ from roll.models.model_providers import default_actor_model_provider, default_va
     default_reward_model_provider
 from roll.utils.checkpoint_manager import download_model
 from roll.utils.context_managers import state_offload_manger
+from roll.utils.dynamic_batching import make_mini_batch_iter_for_dynamic_batching
 from roll.utils.functionals import (
     append_to_dict,
     masked_mean,
@@ -25,6 +26,7 @@ from roll.utils.functionals import (
     postprocess_generate,
     GenerateRequestType,
     agg_loss,
+    reduce_metrics,
 )
 from roll.utils.offload_states import OffloadStateType
 
@@ -91,12 +93,19 @@ class ActorWorker(Worker):
             if need_collect_log_probs:
                 data.meta_info["need_collect_log_probs"] = True
 
-            dataloader = data.make_iterator(
-                mini_batch_size=backward_batch_size,
-                epochs=self.pipeline_config.ppo_epochs,
-                seed=self.pipeline_config.seed,
-                dataloader_kwargs={"shuffle": True},
-            )
+            if self.worker_config.use_dynamic_batching_in_train:
+                dataloader = make_mini_batch_iter_for_dynamic_batching(
+                    data=data,
+                    epochs=self.pipeline_config.ppo_epochs,
+                    ga_steps=self.worker_config.training_args.gradient_accumulation_steps,
+                )
+            else:
+                dataloader = data.make_iterator(
+                    mini_batch_size=backward_batch_size,
+                    epochs=self.pipeline_config.ppo_epochs,
+                    seed=self.pipeline_config.seed,
+                    dataloader_kwargs={"shuffle": True},
+                )
 
             for batch_idx, data in tqdm(
                 enumerate(dataloader),
@@ -108,6 +117,8 @@ class ActorWorker(Worker):
                     data.meta_info["need_collect_log_probs"] = True
 
                 pg_metrics = self.strategy.train_step(batch=data, loss_func=self.loss_func)
+                if self.worker_config.use_dynamic_batching_in_train:
+                    pg_metrics = reduce_metrics(pg_metrics)
                 append_to_dict(metrics, pg_metrics)
 
             metrics["actor/lr"] = self.strategy.scheduler.get_last_lr()[0]
@@ -322,12 +333,26 @@ class ActorWorker(Worker):
 
         ratio = (log_probs - old_log_probs).exp()
 
-        surr1 = ratio * advantages
-        surr2 = ratio.clamp(1 - self.pipeline_config.pg_clip, 1 + self.pipeline_config.pg_clip) * advantages
-        pg_loss = -torch.min(surr1, surr2)
-        if self.pipeline_config.dual_clip_loss:
-            dual_clip_loss = -torch.max(-pg_loss, (1 + self.pipeline_config.pg_clip * 2) * advantages)
-            pg_loss = torch.where(advantages < 0, dual_clip_loss, pg_loss)
+        # Check if using V-trace: use simple policy gradient instead of PPO clipped loss
+        # V-trace already handles off-policy correction via truncated importance sampling
+        # in the advantage computation, so we don't need PPO's ratio clipping here
+        use_vtrace_loss = getattr(self.pipeline_config, 'adv_estimator', 'gae') == 'vtrace'
+
+        if use_vtrace_loss:
+            # V-trace style policy gradient: L = -A * log π(a|s)
+            # The advantage already incorporates truncated importance sampling correction
+            pg_loss = -advantages * log_probs
+            # For metrics, we still track what PPO clipping would have been
+            surr1 = ratio * advantages
+            surr2 = ratio.clamp(1 - self.pipeline_config.pg_clip, 1 + self.pipeline_config.pg_clip) * advantages
+        else:
+            # Standard PPO clipped loss
+            surr1 = ratio * advantages
+            surr2 = ratio.clamp(1 - self.pipeline_config.pg_clip, 1 + self.pipeline_config.pg_clip) * advantages
+            pg_loss = -torch.min(surr1, surr2)
+            if self.pipeline_config.dual_clip_loss:
+                dual_clip_loss = -torch.max(-pg_loss, (1 + self.pipeline_config.pg_clip * 2) * advantages)
+                pg_loss = torch.where(advantages < 0, dual_clip_loss, pg_loss)
 
         # Apply PER importance sampling weights if available
         # This corrects the bias introduced by prioritized sampling

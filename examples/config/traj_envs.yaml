@@ -74,6 +74,32 @@ custom_env:
       action_pattern: ${action_pattern}
       max_steps: ${max_actions_per_traj}
       is_slippery: false
+  CliffWalking:
+    env_type: cliff_walking
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_no_think_format}
+    env_manager_cls: ${env_manager_cls}
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    reward_template: ${reward_template}
+    env_config:
+      env_instruction: "You are navigating the CliffWalking grid (4 rows x 12 columns). You start at the bottom-left corner and must reach the goal at the bottom-right corner. The bottom edge between start and goal is a cliff. Stepping on the cliff gives -100 reward and sends you back to start. Each normal step gives -1 reward. Reaching the goal ends the episode. The answer must be one of action in a turn, format is <answer>Right</answer>"
+      action_pattern: ${action_pattern}
+      max_steps: 200
+  CliffWalkingThink:
+    env_type: cliff_walking
+    max_tokens_per_step: ${max_tokens_per_step}
+    user_prompt_format: ${user_prompt_think_format}
+    env_manager_cls: ${env_manager_cls}
+    use_thread_lock: true
+    agent_system_template: ${agent_system_template}
+    agent_template: ${agent_template}
+    reward_template: ${reward_template}
+    env_config:
+      env_instruction: "You are navigating the CliffWalking grid (4 rows x 12 columns). You start at the bottom-left corner and must reach the goal at the bottom-right corner. The bottom edge between start and goal is a cliff. Stepping on the cliff gives -100 reward and sends you back to start. Each normal step gives -1 reward. Reaching the goal ends the episode. The answer must be one of action in a turn, format is <answer>Right</answer>"
+      action_pattern: ${think_action_pattern}
+      max_steps: 200
   FrozenLakeThink:
     env_type: frozen_lake
     max_tokens_per_step: ${max_tokens_per_step}

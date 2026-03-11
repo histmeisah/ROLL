@@ -22,8 +22,10 @@ from roll.pipeline.agentic.utils import (dump_rollout_render, compute_discounted
 from roll.pipeline.agentic.hierarchical_config import validate_hierarchical_config
 from roll.pipeline.agentic.hierarchical_computer import HierarchicalAdvantageComputer
 from roll.pipeline.base_pipeline import BasePipeline
+from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     apply_kl_penalty,
+    batch_balance,
     compute_advantage,
     reduce_metrics,
     masked_mean,
@@ -206,6 +208,86 @@ class AgenticPipeline(BasePipeline):
             self.replay_buffer = None
             # Keep tokenizer for logging/decoding and padding setup even when replay is disabled
 
+        # Initialize trajectory log file
+        self.trajectory_log_path = None
+        traj_log_cfg = self.pipeline_config.trajectory_log
+        if traj_log_cfg.enabled:
+            self.trajectory_log_path = os.path.join(
+                self.pipeline_config.logging_dir,
+                traj_log_cfg.filename
+            )
+            # Create directory if needed
+            os.makedirs(os.path.dirname(self.trajectory_log_path), exist_ok=True)
+            logger.info(f"Trajectory log enabled: save_ratio={traj_log_cfg.save_ratio}, "
+                       f"max_samples_per_step={traj_log_cfg.max_samples_per_step}, "
+                       f"path={self.trajectory_log_path}")
+
+        # Initialize ThreadPoolExecutor for async age decay refresh
+        # This allows refreshing all sample priorities during GPU training with zero additional latency
+        from concurrent.futures import ThreadPoolExecutor
+        self._age_decay_executor = None
+        self._age_decay_future = None
+
+        if rb_cfg.enabled and getattr(rb_cfg, 'enable_age_decay', False):
+            self._age_decay_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="age_decay_refresh"
+            )
+            refresh_interval = getattr(rb_cfg, 'refresh_interval', 1)
+            logger.info(
+                f"Async age decay refresh enabled: refresh_interval={refresh_interval}, "
+                f"age_decay={getattr(rb_cfg, 'age_decay', 1000.0)}"
+            )
+
+    def _async_refresh_age_decay(self, global_step: int) -> None:
+        """
+        Start async age decay refresh during GPU training.
+
+        This method submits the refresh task to a background thread, allowing it to
+        run in parallel with GPU training. The CPU overhead is thus hidden.
+
+        Args:
+            global_step: Current training step
+        """
+        if self._age_decay_executor is None:
+            return
+        if self.replay_buffer is None:
+            return
+
+        rb_cfg = self.pipeline_config.replay
+        refresh_interval = getattr(rb_cfg, 'refresh_interval', 1)
+
+        # Check refresh interval
+        if global_step % refresh_interval != 0:
+            return
+
+        # Wait for previous refresh to complete (if still running)
+        self._wait_age_decay_refresh()
+
+        # Submit new refresh task
+        self._age_decay_future = self._age_decay_executor.submit(
+            self.replay_buffer.refresh_all_age_decay,
+            global_step
+        )
+        logger.debug(f"[AGE_DECAY] Started async refresh at step {global_step}")
+
+    def _wait_age_decay_refresh(self) -> None:
+        """
+        Wait for age decay refresh to complete.
+
+        Should be called before sampling from replay buffer to ensure priorities are up-to-date.
+        """
+        if self._age_decay_future is None:
+            return
+
+        try:
+            result = self._age_decay_future.result(timeout=30.0)  # 30s timeout
+            logger.debug(f"[AGE_DECAY] Refresh completed, refreshed {result} samples")
+        except Exception as e:
+            logger.warning(f"[AGE_DECAY] Refresh failed or timed out: {e}")
+        finally:
+            self._age_decay_future = None
+
     @torch.no_grad()
     def run(self):
         # Calculate tokens-per-second system throughput
@@ -241,17 +323,18 @@ class AgenticPipeline(BasePipeline):
                 metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
                 batch.meta_info["global_step"] = global_step
 
-                # === NEW: Compute and attach behavior log probs if offpolicy monitoring enabled ===
-                if self.pipeline_config.offpolicy_monitor.enabled and self.pipeline_config.offpolicy_monitor.save_behavior_log_probs:
-                    with Timer(name="behavior_log_probs", logger=None) as behavior_timer:
-                        batch = self._compute_and_attach_behavior_log_probs(batch)
-                    metrics["time/behavior_log_probs"] = behavior_timer.last
-                    logger.debug("Computed behavior log probs for off-policy monitoring")
+                # Compute behavior log probs if needed and not already provided by engine
+                if "behavior_log_probs" not in batch.batch:
+                    # No engine logprobs available, compute via forward pass if monitoring enabled
+                    if self.pipeline_config.offpolicy_monitor.enabled and self.pipeline_config.offpolicy_monitor.save_behavior_log_probs:
+                        with Timer(name="behavior_log_probs", logger=None) as behavior_timer:
+                            batch = self._compute_and_attach_behavior_log_probs(batch)
+                        metrics["time/behavior_log_probs"] = behavior_timer.last
+                        logger.debug("Computed behavior log probs via forward pass (no engine logprobs)")
+                else:
+                    logger.debug("Skipping behavior_log_probs forward pass: engine logprobs already attached")
 
                 batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
-
-                # Note: Replay buffer storage moved to AFTER training (Line ~478)
-                # This ensures we store the log_probs computed during training, not pre-training behavior_log_probs
 
                 # ✅ PADDING HANDLED: Training data padding already applied in rollout_scheduler using pipeline's strategy
 
@@ -274,6 +357,24 @@ class AgenticPipeline(BasePipeline):
                 # 当启用 replay 时，下方 off-policy 训练路径会对采样批次重新计算 log_probs/adv。
                 # 为避免重复计算，这里仅在 off-policy 关闭时计算。
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
+                    # Balance workload across DP ranks for reference compute_log_probs
+                    _, ref_balance_metrics = batch_balance(
+                        batch, dp_size=self.reference.dp_size, minibatch_size=len(batch),
+                        logging_prefix="global_seqlen/reference",
+                    )
+                    metrics.update(ref_balance_metrics)
+
+                    # Dynamic batching: shard for reference compute_log_probs (infer config)
+                    if self.pipeline_config.reference.use_dynamic_batching_in_infer:
+                        batch, db_metrics = dynamic_batching_shard(
+                            batch,
+                            self.reference.dp_size,
+                            self.pipeline_config.reference.max_tokens_per_microbatch_in_infer,
+                            self.pipeline_config.reference.sequence_length_round_in_infer,
+                            log_prefix="reference/compute_log_probs",
+                        )
+                        metrics.update(db_metrics)
+
                     ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(batch, blocking=False)
                     ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
                     ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
@@ -293,6 +394,25 @@ class AgenticPipeline(BasePipeline):
                     from_replay_buffer = batch.meta_info.get("from_replay_buffer", False)
 
                     batch.meta_info["is_offload_states"] = False
+
+                    # Balance workload across DP ranks for actor_train compute_log_probs
+                    _, actor_balance_metrics = batch_balance(
+                        batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch),
+                        logging_prefix="global_seqlen/actor_train_infer",
+                    )
+                    metrics.update(actor_balance_metrics)
+
+                    # Dynamic batching: shard for actor_train compute_log_probs (infer config)
+                    if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
+                        batch, db_metrics = dynamic_batching_shard(
+                            batch,
+                            self.actor_train.dp_size,
+                            self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
+                            self.pipeline_config.actor_train.sequence_length_round_in_infer,
+                            log_prefix="actor_train/compute_log_probs",
+                        )
+                        metrics.update(db_metrics)
+
                     # Check if we can reuse behavior_log_probs as old_log_probs
                     if not from_replay_buffer and "behavior_log_probs" in batch.batch:
                         # ✨ Fresh batch with behavior_log_probs already computed
@@ -592,6 +712,29 @@ class AgenticPipeline(BasePipeline):
                             f"batch_size={batch.batch['input_ids'].shape[0] if batch.batch is not None else 'None'}"
                         )
 
+                    # Balance workload across DP ranks for actor_train train_step
+                    _, train_balance_metrics = batch_balance(
+                        batch, dp_size=self.actor_train.dp_size,
+                        minibatch_size=(
+                            self.actor_train.dp_size
+                            * self.pipeline_config.actor_train.training_args.per_device_train_batch_size
+                            * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps
+                        ),
+                        logging_prefix="global_seqlen/actor_train",
+                    )
+                    metrics.update(train_balance_metrics)
+
+                    # Dynamic batching: shard for actor_train train_step (train config)
+                    if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
+                        batch, db_metrics = dynamic_batching_shard(
+                            batch,
+                            self.actor_train.dp_size,
+                            self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
+                            self.pipeline_config.actor_train.sequence_length_round_in_train,
+                            log_prefix="actor_train/train_step",
+                        )
+                        metrics.update(db_metrics)
+
                     # ✨ Check if we need to collect log_probs for off-policy monitoring (fresh batch)
                     fresh_monitor_enabled = (self.pipeline_config.offpolicy_monitor.enabled and
                         self.pipeline_config.offpolicy_monitor.monitor_fresh_batch and
@@ -605,6 +748,11 @@ class AgenticPipeline(BasePipeline):
                         logger.debug(f"[DEBUG] Enabled log_probs collection for fresh batch at step {global_step}")
 
                     actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
+
+                    # ⭐ Start async age decay refresh during GPU training
+                    # This runs in parallel with GPU training, so CPU overhead is hidden
+                    if self.pipeline_config.replay.enabled:
+                        self._async_refresh_age_decay(global_step)
 
                     # ✨ DEBUG: Log ObjectRef details before materialize
                     logger.debug(
@@ -667,14 +815,25 @@ class AgenticPipeline(BasePipeline):
                     critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
                     metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
 
-                # ✨ CRITICAL FIX: Store fresh batch to replay buffer AFTER training
-                # This ensures we store the log_probs computed during training
+                # Store fresh batch to replay buffer AFTER training
                 if self.pipeline_config.replay.enabled and self.pipeline_config.critic_warmup <= global_step:
                     logger.info(f"[REPLAY DEBUG] Adding fresh batch to replay buffer at step {global_step}")
-                    # Attach training log_probs to batch before storing
-                    if actor_train_metrics.batch is not None and "log_probs" in actor_train_metrics.batch:
-                        batch.batch["behavior_log_probs"] = actor_train_metrics.batch["log_probs"]
-                        logger.debug("Attached training log_probs as behavior_log_probs for replay buffer storage")
+
+                    if self.pipeline_config.replay.use_engine_logprobs:
+                        # Engine logprobs mode: behavior_log_probs already set by
+                        # TrajEnvManager.formulate_rollouts() from VLLM engine output (true pi_mu).
+                        # Do NOT overwrite with post-training log_probs.
+                        if "behavior_log_probs" in batch.batch:
+                            logger.debug("Using engine logprobs as behavior_log_probs (true pi_mu)")
+                        else:
+                            # Fallback: engine logprobs not available, compute with actor_train
+                            logger.warning("use_engine_logprobs=True but no engine logprobs in batch, falling back to actor_train")
+                            batch = self._compute_and_attach_behavior_log_probs(batch)
+                    else:
+                        # Legacy mode: use post-training log_probs as behavior_log_probs
+                        if actor_train_metrics.batch is not None and "log_probs" in actor_train_metrics.batch:
+                            batch.batch["behavior_log_probs"] = actor_train_metrics.batch["log_probs"]
+                            logger.debug("Attached training log_probs as behavior_log_probs (legacy mode)")
 
                     # Store to replay buffer
                     self.store_fresh_data_to_replay_buffer(batch, global_step)
@@ -683,6 +842,10 @@ class AgenticPipeline(BasePipeline):
                 if self.pipeline_config.replay.enabled:
                     logger.info(f"[REPLAY DEBUG] Checking replay training at step {global_step}")
                     rb_cfg = self.pipeline_config.replay
+
+                    # ⭐ Wait for async age decay refresh to complete before sampling
+                    # This ensures sample priorities are up-to-date
+                    self._wait_age_decay_refresh()
 
                     # Only proceed when buffer ready
                     # Check if buffer has enough data for training
@@ -837,6 +1000,22 @@ class AgenticPipeline(BasePipeline):
                                 all_sampled_indices.append(sampled_indices)
                                 all_batches.append(mb)
 
+                            # Balance workload for replay reference compute_log_probs
+                            _, _ = batch_balance(
+                                mb, dp_size=self.reference.dp_size, minibatch_size=len(mb),
+                            )
+
+                            # Dynamic batching: shard for replay reference compute_log_probs (infer config)
+                            if self.pipeline_config.reference.use_dynamic_batching_in_infer:
+                                mb, db_metrics = dynamic_batching_shard(
+                                    mb,
+                                    self.reference.dp_size,
+                                    self.pipeline_config.reference.max_tokens_per_microbatch_in_infer,
+                                    self.pipeline_config.reference.sequence_length_round_in_infer,
+                                    log_prefix="reference/replay_compute_log_probs",
+                                )
+                                metrics.update(db_metrics)
+
                             # Compute ref/old log_probs and advantages for replay mb
                             ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(mb, blocking=False)
                             ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
@@ -845,6 +1024,23 @@ class AgenticPipeline(BasePipeline):
 
                             mb.meta_info["is_offload_states"] = False
                             mb.meta_info["global_step"] = global_step  # FIX: Add global_step for replay batch training
+
+                            # Balance workload for replay actor_train compute_log_probs
+                            _, _ = batch_balance(
+                                mb, dp_size=self.actor_train.dp_size, minibatch_size=len(mb),
+                            )
+
+                            # Dynamic batching: shard for replay actor_train compute_log_probs (infer config)
+                            if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
+                                mb, db_metrics = dynamic_batching_shard(
+                                    mb,
+                                    self.actor_train.dp_size,
+                                    self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
+                                    self.pipeline_config.actor_train.sequence_length_round_in_infer,
+                                    log_prefix="actor_train/replay_compute_log_probs",
+                                )
+                                metrics.update(db_metrics)
+
                             # Only compute old_log_probs if not already provided (fallback to actor_train for stability)
                             if "old_log_probs" not in mb.batch:
                                 behavior_old_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(mb, blocking=False)
@@ -961,6 +1157,27 @@ class AgenticPipeline(BasePipeline):
                             mb = self.adjust_batch(mb, mode=self.pipeline_config.batch_adjust_mode)
                             metrics.update(reduce_metrics(mb.meta_info.pop("metrics", {})))
 
+                            # Balance workload for replay actor_train train_step
+                            _, _ = batch_balance(
+                                mb, dp_size=self.actor_train.dp_size,
+                                minibatch_size=(
+                                    self.actor_train.dp_size
+                                    * self.pipeline_config.actor_train.training_args.per_device_train_batch_size
+                                    * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps
+                                ),
+                            )
+
+                            # Dynamic batching: shard for replay actor_train train_step (train config)
+                            if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
+                                mb, db_metrics = dynamic_batching_shard(
+                                    mb,
+                                    self.actor_train.dp_size,
+                                    self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
+                                    self.pipeline_config.actor_train.sequence_length_round_in_train,
+                                    log_prefix="actor_train/replay_train_step",
+                                )
+                                metrics.update(db_metrics)
+
                             # Training step
                             if self.pipeline_config.adv_estimator in ["gae", "vtrace"]:
                                 critic_refs = self.critic.train_step(mb, blocking=False)
@@ -1053,6 +1270,11 @@ class AgenticPipeline(BasePipeline):
                             "replay_buffer/train_steps": replay_train_count,  # Number of successful training steps (unified naming)
                             "replay_buffer/train_steps_target": rb_cfg.train_steps_per_env_step,  # Target training steps
                             "replay_buffer/replay_ratio": replay_train_count / max(1, rb_cfg.train_steps_per_env_step),  # Actual vs target ratio
+                            # Age decay configuration - critical for understanding priority behavior
+                            "replay_buffer/enable_age_decay": buffer_stats.get("enable_age_decay", False),
+                            "replay_buffer/age_decay": buffer_stats.get("age_decay", 1000.0),
+                            "replay_buffer/refresh_interval": getattr(rb_cfg, 'refresh_interval', 1),
+                            "replay_buffer/priority_fn": buffer_stats.get("priority_fn", "unknown"),
                         })
 
                         # Note: Off-policy monitoring is now done inside the replay training loop
@@ -1151,7 +1373,17 @@ class AgenticPipeline(BasePipeline):
 
                 log_res = []
                 batch_grouped = batch.group_by(keys="traj_id")
-                for group_name, group_batch in batch_grouped.items():
+
+                # Calculate how many samples to save based on save_ratio
+                traj_log_cfg = self.pipeline_config.trajectory_log
+                total_trajs = len(batch_grouped)
+                num_to_sample = max(1, int(total_trajs * traj_log_cfg.save_ratio))
+                num_to_sample = min(num_to_sample, traj_log_cfg.max_samples_per_step)
+
+                # Randomly sample trajectory groups
+                sampled_groups = random.sample(list(batch_grouped.items()), min(num_to_sample, total_trajs))
+
+                for group_name, group_batch in sampled_groups:
                     group_batch = group_batch.select_idxs(idxs=[random.choice(range(len(group_batch)))])
                     prompt_mask = group_batch.batch["prompt_mask"]
                     non_prompt_mask = torch.logical_not(group_batch.batch["prompt_mask"])
@@ -1166,20 +1398,39 @@ class AgenticPipeline(BasePipeline):
                     responses = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
                     episode_scores = group_batch.non_tensor_batch["episode_scores"].tolist()
                     penalties = group_batch.batch["penalty"].tolist()
-                    for prompt, prompt_id, response, response_id, episode_score, penalty in zip(
-                            prompts, prompt_ids, responses, response_ids, episode_scores, penalties
+
+                    # Get additional metadata if available
+                    tags = group_batch.non_tensor_batch.get("tags", [None])[0] if "tags" in group_batch.non_tensor_batch else None
+                    env_ids = group_batch.non_tensor_batch.get("env_ids", [None])[0] if "env_ids" in group_batch.non_tensor_batch else None
+
+                    for prompt, response, episode_score, penalty in zip(
+                            prompts, responses, episode_scores, penalties
                     ):
                         log_res.append(
                             {
+                                "global_step": global_step,
+                                "traj_id": group_name,
+                                "tag": str(tags) if tags is not None else None,
+                                "env_id": str(env_ids) if env_ids is not None else None,
                                 "prompt": prompt,
                                 "response": response,
                                 "episode_score": episode_score,
                                 "penalty": penalty,
                             }
                         )
-                    if len(log_res) >= 10:
-                        break
-                logger.info(json.dumps(log_res, ensure_ascii=False))
+
+                # Save to trajectory log file (JSONL format)
+                if self.trajectory_log_path and log_res:
+                    try:
+                        with open(self.trajectory_log_path, "a", encoding="utf-8") as f:
+                            for entry in log_res:
+                                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    except Exception as e:
+                        logger.warning(f"Failed to write trajectory log: {e}")
+
+                # Also log a few samples to console (keep original behavior)
+                console_samples = log_res[:10] if len(log_res) > 10 else log_res
+                logger.info(json.dumps(console_samples, ensure_ascii=False))
                 logger.info(json.dumps(metrics, ensure_ascii=False))
 
             logger.info(f"pipeline step {global_step} finished")

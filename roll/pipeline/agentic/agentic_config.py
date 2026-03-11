@@ -224,12 +224,14 @@ class ReplayConfig:
     #   - "advantage": Priority = |advantage|, updated after training
     #   - "td_error": Priority = |TD-error|, standard PER
     #   - "recency": Priority decays with age (no update needed)
+    #   - "reward_fresh": Priority = |reward| × exp(-age/age_decay), our custom PER extension
+    #                     Combines reward-based priority with age decay for LLM RL
     # ==========================================================================
     priority_function: str = field(
         default="uniform",
         metadata={
             "help": "Priority function for sampling. Determines both initial priority and update metric. "
-                    "Options: uniform, lifo, fifo, reward, advantage, td_error, recency."
+                    "Options: uniform, lifo, fifo, reward, advantage, td_error, recency, reward_fresh."
         }
     )
     priority_exponent: float = field(
@@ -265,10 +267,33 @@ class ReplayConfig:
                     "Smaller values = stronger preference for fresh samples."
         }
     )
+    refresh_interval: int = field(
+        default=1,
+        metadata={
+            "help": "Interval (in training steps) for refreshing age decay of ALL samples in the buffer. "
+                    "Only used when enable_age_decay=True. "
+                    "Set to 1 for every step (recommended with async refresh), "
+                    "or higher values (e.g., 5-10) to reduce CPU overhead. "
+                    "The refresh is performed asynchronously during GPU training, "
+                    "so setting to 1 typically has zero additional latency."
+        }
+    )
     eviction_strategy: Literal["fifo", "smart"] = field(
         default="fifo",
         metadata={
             "help": "Eviction strategy when buffer is full. 'fifo' (default) or 'smart'."
+        }
+    )
+
+    # Engine Logprobs Configuration
+    use_engine_logprobs: bool = field(
+        default=False,
+        metadata={
+            "help": "Capture log probabilities from the inference engine (VLLM) during generation "
+                    "and store as true behavior policy (pi_mu) in the replay buffer. "
+                    "When enabled, avoids an extra forward pass for computing behavior_log_probs "
+                    "and ensures the stored logprobs are from the actual generation policy, "
+                    "not the post-training policy. Requires VLLM with logprobs support."
         }
     )
 
@@ -316,6 +341,27 @@ class ReplayConfig:
                     "If None, defaults to target_batch_size // 2. "
                     "Set to 0 to always supplement when below target_batch_size."
         }
+    )
+
+
+@dataclass
+class TrajectoryLogConfig:
+    """Configuration for trajectory logging during training."""
+    enabled: bool = field(
+        default=True,
+        metadata={"help": "Enable trajectory logging to separate JSONL file."}
+    )
+    save_ratio: float = field(
+        default=0.1,
+        metadata={"help": "Ratio of trajectories to save (0.0-1.0). E.g., 0.1 = save 10% of trajectories."}
+    )
+    max_samples_per_step: int = field(
+        default=20,
+        metadata={"help": "Maximum number of trajectory samples to save per training step."}
+    )
+    filename: str = field(
+        default="trajectory_samples.jsonl",
+        metadata={"help": "Filename for trajectory log (will be saved in logging_dir)."}
     )
 
 
@@ -372,6 +418,10 @@ class AgenticConfig(BaseConfig):
     train_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     val_env_manager: EnvManagerConfig = field(default_factory=EnvManagerConfig)
     render_save_dir: str = field(default=None, metadata={"help": "Directory to save rendered frames."})
+    trajectory_log: TrajectoryLogConfig = field(
+        default_factory=TrajectoryLogConfig,
+        metadata={"help": "Trajectory logging configuration for debugging and analysis."}
+    )
     reward_normalization: RewardNormalizationConfig = field(
         default_factory=RewardNormalizationConfig, metadata={"help": "Reward normalization configuration."}
     )

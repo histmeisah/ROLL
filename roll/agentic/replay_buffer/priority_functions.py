@@ -78,6 +78,9 @@ def reward_priority(
         reward = float(entry.scores.sum())
 
     # Priority = |reward| + epsilon
+    # Using absolute value following classic PER convention (Schaul et al., 2016):
+    # both high-reward and high-penalty trajectories carry high learning signal.
+    # This also ensures correct behavior for all-negative reward environments (e.g., Cliff Walking).
     priority = abs(reward) + epsilon
     return float(priority)
 
@@ -272,6 +275,72 @@ def length_priority(
     return float(priority)
 
 
+def reward_fresh_priority(
+    entry: Union["TrajectoryEntry", "StepEntry"],
+    global_step: int,
+    epsilon: float = 1e-6,
+    age_decay: float = 500.0,
+    **kwargs
+) -> float:
+    """
+    Reward-Fresh priority - combines reward-based priority with age decay.
+
+    This is our custom extension of standard PER (Prioritized Experience Replay).
+    It addresses two key issues in off-policy LLM RL:
+    1. High-reward samples are more informative for learning
+    2. Fresher samples have less policy drift (closer to current policy)
+
+    Formula:
+        priority = (|reward| + epsilon) * exp(-age / age_decay)
+
+    This ensures:
+    - High-reward fresh samples get highest priority
+    - Old samples get deprioritized regardless of reward
+    - Zero-reward samples still have priority based on freshness
+
+    Args:
+        entry: Trajectory or step entry
+        global_step: Current global training step
+        epsilon: Small constant to ensure non-zero priority
+        age_decay: Decay constant for age weighting (default 500.0)
+            - Smaller values = faster decay (stronger preference for fresh samples)
+            - age_decay=500: samples half-life ~346 steps
+            - age_decay=1000: samples half-life ~693 steps
+        **kwargs: Additional arguments (ignored)
+
+    Returns:
+        Priority based on |reward| * freshness_weight + epsilon
+
+    Reference:
+        - Fedus et al., "Revisiting Fundamentals of Experience Replay", ICML 2020
+        - Schaul et al., "Prioritized Experience Replay", ICLR 2016
+    """
+    # Calculate reward component
+    if hasattr(entry, 'episode_length'):  # TrajectoryEntry
+        # Get the last valid score (episode reward)
+        mask = entry.attention_mask.astype(bool)
+        valid_scores = entry.scores[mask]
+        if len(valid_scores) > 0:
+            reward = float(valid_scores[-1])
+        else:
+            reward = 0.0
+    else:  # StepEntry
+        reward = float(entry.scores.sum())
+
+    # Using absolute value following classic PER convention (Schaul et al., 2016):
+    # both high-reward and high-penalty trajectories carry high learning signal.
+    reward_component = abs(reward) + epsilon
+
+    # Calculate age decay component
+    age = max(0, global_step - entry.stored_at_step)
+    freshness_weight = np.exp(-age / age_decay)
+
+    # Combined priority: reward * freshness
+    priority = reward_component * freshness_weight
+
+    return float(priority)
+
+
 # Special marker functions for deterministic sampling
 # These are not actual priority functions but sampling strategies
 def lifo_priority(entry, global_step, **kwargs) -> float:
@@ -314,6 +383,7 @@ PRIORITY_FUNCTIONS = {
     "advantage": advantage_priority,     # Priority based on |advantage| (requires computation)
     "td_error": td_error_priority,       # Priority based on |TD-error| (standard PER)
     "length": length_priority,           # Priority based on sequence length
+    "reward_fresh": reward_fresh_priority,  # Reward × age_decay (our custom PER extension)
 }
 
 # Mapping: priority_function -> update_metric
@@ -331,6 +401,7 @@ PRIORITY_UPDATE_METRIC = {
     "advantage": "advantage",
     "td_error": "td_error",
     "combined": "reward",  # Only reward part needs update, recency auto-decays
+    "reward_fresh": "reward",  # Reward part needs update, age decay is automatic
 }
 
 

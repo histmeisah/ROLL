@@ -101,10 +101,18 @@ def token_ids_to_assistant_mask(messages: List[Dict], input_ids_list: List[List]
         if message["role"].lower() in ["assistant"]:
             assistant_token_ids = []
             assistant_mask = []
-            token_id_without_format = tokenizer.encode(message["content"])
+            # Use add_special_tokens=False to avoid BOS/EOS tokens that may not be in token_ids
+            token_id_without_format = tokenizer.encode(message["content"], add_special_tokens=False)
             first_assistant_idx = len(token_ids)
             if len(token_id_without_format) > 0:
-                first_assistant_idx = token_ids.index(token_id_without_format[0])
+                try:
+                    first_assistant_idx = token_ids.index(token_id_without_format[0])
+                except ValueError:
+                    # If first token not found, try to find any matching token
+                    for tid in token_id_without_format:
+                        if tid in token_ids:
+                            first_assistant_idx = token_ids.index(tid)
+                            break
             assistant_token_ids.extend(token_ids[: first_assistant_idx])
             assistant_mask.extend([0] * first_assistant_idx)
             after_eos_token_id = False

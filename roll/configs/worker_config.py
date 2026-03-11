@@ -87,6 +87,53 @@ class WorkerConfig:
         metadata={"help": "system environment variables for this worker."}
     )
 
+    # Dynamic batching configs
+    use_dynamic_batching_in_train: bool = field(
+        default=False,
+        metadata={
+            "help": "Dynamic batching is a feature designed to group sequences of similar lengths into batches, "
+            "minimizing padding and improving computational and memory efficiency."
+        },
+    )
+    max_tokens_per_microbatch_in_train: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Set the maximum number of tokens for each micro-batch during training. "
+                "This config must be set when using dynamic batching. "
+                "Recommended value: sequence_length * 2 * micro_batch_size."
+            )
+        },
+    )
+    sequence_length_round_in_train: int = field(
+        default=4,
+        metadata={
+            "help": "The value to round up to when truncating the sequence length. "
+            "Note: This config must be set when using dynamic batching."
+        },
+    )
+    use_dynamic_batching_in_infer: bool = field(
+        default=False,
+        metadata={
+            "help": "Dynamic batching is a feature designed to group sequences of similar lengths into batches, "
+            "minimizing padding and improving computational and memory efficiency."
+        },
+    )
+    max_tokens_per_microbatch_in_infer: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Set the maximum number of tokens for each micro-batch. "
+            "Note: This config must be set when using dynamic batching."
+        },
+    )
+    sequence_length_round_in_infer: int = field(
+        default=4,
+        metadata={
+            "help": "The value to round up to when truncating the sequence length. "
+            "Note: This config must be set when using dynamic batching."
+        },
+    )
+
     def __post_init__(self):
 
         if self.strategy_args is not None:

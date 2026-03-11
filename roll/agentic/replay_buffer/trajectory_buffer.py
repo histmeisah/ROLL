@@ -186,8 +186,9 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
             )
 
             # Calculate priority for this trajectory
+            # Pass age_decay as kwarg for reward_fresh and other age-aware priority functions
             try:
-                priority = self.priority_fn(trajectory, global_step)
+                priority = self.priority_fn(trajectory, global_step, age_decay=self.age_decay)
                 trajectory.priority = float(priority)
             except Exception as e:
                 logger.warning(f"Failed to calculate priority, using default 1.0: {e}")
@@ -406,7 +407,14 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
         
         batch_input_ids = torch.zeros((sample_size, max_seq_len), dtype=torch.long, device=target_device)
         batch_attention_mask = torch.zeros((sample_size, max_seq_len), dtype=torch.bool, device=target_device)
-        batch_position_ids = torch.zeros((sample_size, max_seq_len), dtype=torch.long, device=target_device)
+        # Detect VLM multi-dimensional position_ids (e.g., Qwen2.5-VL uses [3, seq_len] for 3D-RoPE)
+        first_position_ids = sampled_trajectories[0].position_ids
+        if first_position_ids.ndim > 1:
+            # VLM: position_ids shape is [num_dims, seq_len], e.g. [3, seq_len]
+            pos_id_dims = first_position_ids.shape[0]
+            batch_position_ids = torch.zeros((sample_size, pos_id_dims, max_seq_len), dtype=torch.long, device=target_device)
+        else:
+            batch_position_ids = torch.zeros((sample_size, max_seq_len), dtype=torch.long, device=target_device)
         batch_response_mask = torch.zeros((sample_size, max_seq_len), dtype=torch.bool, device=target_device)
         batch_prompt_mask = torch.zeros((sample_size, max_seq_len), dtype=torch.bool, device=target_device)
         batch_scores = torch.zeros((sample_size, max_seq_len), dtype=torch.float, device=target_device)
@@ -687,6 +695,80 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
 
         return priority
 
+    def refresh_all_age_decay(self, current_global_step: int) -> int:
+        """
+        Refresh age decay for ALL trajectories in the buffer, updating segment tree.
+
+        This method should be called periodically (e.g., every training step) to ensure
+        that old trajectories have their priorities properly decayed based on their age.
+
+        Without this refresh, only sampled entries get their age decay updated via
+        update_priorities(), leaving unsampled old entries with stale (too high) priorities.
+
+        Time complexity: O(capacity)
+        Typical runtime: ~50-100ms for capacity=100,000
+
+        This method is designed to be called asynchronously during GPU training,
+        so the CPU overhead is hidden by GPU computation time.
+
+        Args:
+            current_global_step: Current training step for age calculation
+
+        Returns:
+            Number of trajectories refreshed
+
+        Example:
+            >>> # Call during GPU training (async)
+            >>> from concurrent.futures import ThreadPoolExecutor
+            >>> executor = ThreadPoolExecutor(max_workers=1)
+            >>> future = executor.submit(buffer.refresh_all_age_decay, global_step)
+            >>> # ... GPU training happens here ...
+            >>> refreshed_count = future.result()  # Wait before sampling
+        """
+        if not self.enable_age_decay:
+            logger.debug("Age decay not enabled, skipping refresh")
+            return 0
+
+        # Update current global step
+        self.current_global_step = current_global_step
+
+        refreshed_count = 0
+        max_age = 0
+        total_age = 0
+
+        for idx in range(self.capacity):
+            if not self.valid_mask[idx]:
+                continue
+
+            trajectory = self.trajectories[idx]
+            if trajectory is None:
+                continue
+
+            # Calculate current age and freshness
+            age = max(0, current_global_step - trajectory.global_step)
+            freshness_weight = np.exp(-age / self.age_decay)
+
+            # Calculate effective priority with age decay
+            effective_priority = max(trajectory.priority * freshness_weight, 1e-8)
+
+            # Update segment tree
+            priority_alpha = effective_priority ** self.priority_exponent
+            self._it_sum[idx] = priority_alpha
+            self._it_min[idx] = priority_alpha
+
+            refreshed_count += 1
+            max_age = max(max_age, age)
+            total_age += age
+
+        avg_age = total_age / refreshed_count if refreshed_count > 0 else 0
+
+        logger.debug(
+            f"[AGE_DECAY] Refreshed {refreshed_count} trajectories at step {current_global_step}. "
+            f"avg_age={avg_age:.1f}, max_age={max_age}, age_decay={self.age_decay}"
+        )
+
+        return refreshed_count
+
     @staticmethod
     def compute_advantage_priorities(batch: DataProto) -> np.ndarray:
         """
@@ -809,6 +891,9 @@ class TrajectoryReplayBuffer(BaseReplayBuffer):
                 "priority_fn": self.priority_fn.__name__,
                 "priority_exponent": self.priority_exponent,
                 "max_priority": self._max_priority,
+                # Age decay configuration - important for understanding sampling behavior
+                "enable_age_decay": self.enable_age_decay,
+                "age_decay": self.age_decay,
             })
 
             # Age distribution statistics (only for valid slots)
