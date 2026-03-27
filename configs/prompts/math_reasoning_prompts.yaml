@@ -1,0 +1,271 @@
+# Mathematical Reasoning Prompt Templates
+# Based on research: CoT, Plan-and-Solve, Self-Consistency, APE
+
+# Prompt template structure:
+# - name: unique identifier
+# - template: prompt text with {problem} placeholder
+# - description: what this prompt does
+# - category: type of prompting strategy
+# - paper_reference: source paper (optional)
+# - expected_performance: anticipated effectiveness (optional)
+
+prompts:
+  # ============================================================================
+  # Zero-Shot Chain-of-Thought (CoT) Prompts
+  # ============================================================================
+  - name: zero_shot_cot_classic
+    template: "{problem}\n\nLet's think step by step."
+    description: "Classic zero-shot CoT trigger phrase"
+    category: zero_shot_cot
+    paper_reference: "Kojima et al., 2022"
+    expected_performance: "baseline_cot"
+
+  - name: zero_shot_cot_ape
+    template: "{problem}\n\nLet's work this out in a step by step way to be sure we have the right answer."
+    description: "APE-discovered optimal zero-shot CoT prompt"
+    category: zero_shot_cot
+    paper_reference: "Zhou et al., 2022 (APE)"
+    expected_performance: "best_zero_shot"
+
+  - name: zero_shot_cot_careful
+    template: "{problem}\n\nLet's think carefully step by step."
+    description: "Emphasis on careful reasoning"
+    category: zero_shot_cot
+    expected_performance: "similar_to_classic"
+
+  - name: zero_shot_cot_solve
+    template: "{problem}\n\nLet's solve this step by step."
+    description: "Action-oriented step-by-step prompt"
+    category: zero_shot_cot
+    expected_performance: "competitive"
+
+  # ============================================================================
+  # Plan-and-Solve Prompts
+  # ============================================================================
+  - name: plan_and_solve_basic
+    template: "{problem}\n\nLet's first understand the problem and devise a plan to solve it. Then, let's carry out the plan to solve the problem step by step."
+    description: "Basic Plan-and-Solve prompting"
+    category: plan_and_solve
+    paper_reference: "Wang et al., 2023"
+    expected_performance: "addresses_missing_steps"
+
+  - name: plan_and_solve_plus
+    template: "{problem}\n\nLet's first understand the problem, extract relevant variables and their corresponding numerals, and devise a complete plan. Then, let's carry out the plan, calculate intermediate results (pay attention to calculation and common sense), solve the problem step by step, and show the answer."
+    description: "Enhanced PS+ with detailed instructions"
+    category: plan_and_solve
+    paper_reference: "Wang et al., 2023 (PS+)"
+    expected_performance: "best_plan_solve"
+
+  - name: plan_execute_verify
+    template: "{problem}\n\nStep 1: Make a plan to solve this problem.\nStep 2: Execute the plan step by step.\nStep 3: Verify the solution is correct.\n\nLet's begin:"
+    description: "Structured plan-execute-verify approach"
+    category: plan_and_solve
+    expected_performance: "good_for_complex"
+
+  # ============================================================================
+  # Detailed Reasoning Prompts
+  # ============================================================================
+  - name: detailed_explanation
+    template: "{problem}\n\nProvide a detailed solution with clear explanations for each step:"
+    description: "Request for detailed explanations"
+    category: detailed_reasoning
+    expected_performance: "good_for_complex"
+
+  - name: show_work
+    template: "{problem}\n\nSolve this problem and show all your work:"
+    description: "Explicit request to show intermediate steps"
+    category: detailed_reasoning
+    expected_performance: "complete_solutions"
+
+  - name: reasoning_chain
+    template: "{problem}\n\nProvide your reasoning chain with clear intermediate steps and calculations:"
+    description: "Focus on explicit reasoning chain"
+    category: detailed_reasoning
+    expected_performance: "good_transparency"
+
+  # ============================================================================
+  # Verification and Self-Checking Prompts
+  # ============================================================================
+  - name: solve_and_verify
+    template: "{problem}\n\nSolve the problem step by step, then verify your answer is correct:"
+    description: "Encourages self-verification"
+    category: verification
+    paper_reference: "Self-consistency principle"
+    expected_performance: "reduces_errors"
+
+  - name: double_check
+    template: "{problem}\n\nSolve this problem carefully, and double-check your answer:"
+    description: "Emphasis on checking work"
+    category: verification
+    expected_performance: "good_for_calculation"
+
+  - name: reflect_and_solve
+    template: "{problem}\n\nThink through this problem step by step. After reaching an answer, reflect on whether it makes sense:"
+    description: "Metacognitive reflection prompt"
+    category: verification
+    expected_performance: "catches_semantic_errors"
+
+  # ============================================================================
+  # Structured Format Prompts
+  # ============================================================================
+  - name: structured_solution
+    template: "{problem}\n\nProvide your solution in this format:\n- Given: [State what is given]\n- Find: [State what needs to be found]\n- Solution: [Step-by-step solution]\n- Answer: [Final answer]"
+    description: "Highly structured solution format"
+    category: structured
+    expected_performance: "consistency_completeness"
+
+  - name: formal_proof
+    template: "{problem}\n\nProvide a formal mathematical solution with clear logical steps:"
+    description: "Formal mathematical approach"
+    category: structured
+    expected_performance: "good_for_theorems"
+
+  # ============================================================================
+  # Direct/Baseline Prompts
+  # ============================================================================
+  - name: direct_solve
+    template: "{problem}\n\nSolution:"
+    description: "Direct problem solving without scaffolding"
+    category: direct
+    expected_performance: "baseline"
+
+  - name: answer_directly
+    template: "{problem}\n\nAnswer:"
+    description: "Minimal prompt for direct answer"
+    category: direct
+    expected_performance: "weakest_baseline"
+
+  # ============================================================================
+  # Metacognitive Prompts
+  # ============================================================================
+  - name: think_aloud
+    template: "{problem}\n\nThink aloud as you solve this problem, explaining your reasoning at each step:"
+    description: "Encourages verbalization of thought process"
+    category: metacognitive
+    expected_performance: "good_transparency"
+
+  - name: analogical_reasoning
+    template: "{problem}\n\nThink about similar problems you've solved before, then apply that reasoning here:"
+    description: "Encourages analogical transfer"
+    category: metacognitive
+    expected_performance: "good_for_novel_types"
+
+
+# ============================================================================
+# Preset Configurations for Experiments
+# ============================================================================
+presets:
+  diverse_5:
+    description: "5 diverse prompts covering different strategies"
+    prompts:
+      - zero_shot_cot_ape
+      - plan_and_solve_plus
+      - solve_and_verify
+      - detailed_explanation
+      - direct_solve
+
+  cot_variants_5:
+    description: "5 variants of CoT prompting"
+    prompts:
+      - zero_shot_cot_classic
+      - zero_shot_cot_ape
+      - zero_shot_cot_careful
+      - zero_shot_cot_solve
+      - plan_and_solve_basic
+
+  research_backed_8:
+    description: "8 prompts with strong research backing"
+    prompts:
+      - zero_shot_cot_ape
+      - plan_and_solve_plus
+      - zero_shot_cot_classic
+      - plan_and_solve_basic
+      - solve_and_verify
+      - detailed_explanation
+      - structured_solution
+      - reflect_and_solve
+
+  high_performance_10:
+    description: "Top 10 prompts for maximum diversity"
+    prompts:
+      - zero_shot_cot_ape
+      - plan_and_solve_plus
+      - plan_execute_verify
+      - zero_shot_cot_classic
+      - solve_and_verify
+      - double_check
+      - detailed_explanation
+      - structured_solution
+      - think_aloud
+      - show_work
+
+  ablation_study:
+    description: "For comparing different prompt types"
+    prompts:
+      - answer_directly          # Baseline
+      - zero_shot_cot_classic   # CoT
+      - plan_and_solve_plus     # PS+
+      - solve_and_verify        # Verification
+
+  all_prompts_19:
+    description: "All 19 prompts for comprehensive testing"
+    prompts:
+      - zero_shot_cot_classic
+      - zero_shot_cot_ape
+      - zero_shot_cot_careful
+      - zero_shot_cot_solve
+      - plan_and_solve_basic
+      - plan_and_solve_plus
+      - plan_execute_verify
+      - detailed_explanation
+      - show_work
+      - reasoning_chain
+      - solve_and_verify
+      - double_check
+      - reflect_and_solve
+      - structured_solution
+      - formal_proof
+      - direct_solve
+      - answer_directly
+      - think_aloud
+      - analogical_reasoning
+
+
+# ============================================================================
+# Category Descriptions
+# ============================================================================
+categories:
+  zero_shot_cot:
+    name: "Zero-Shot Chain-of-Thought"
+    description: "Prompts that trigger step-by-step reasoning without examples"
+    key_papers:
+      - "Large Language Models are Zero-Shot Reasoners (Kojima et al., 2022)"
+      - "Automatic Prompt Engineer (Zhou et al., 2022)"
+
+  plan_and_solve:
+    name: "Plan-and-Solve"
+    description: "Two-stage prompts: first plan, then execute"
+    key_papers:
+      - "Plan-and-Solve Prompting (Wang et al., 2023)"
+
+  detailed_reasoning:
+    name: "Detailed Reasoning"
+    description: "Prompts requesting comprehensive explanations"
+
+  verification:
+    name: "Verification"
+    description: "Prompts that encourage self-checking and verification"
+    key_papers:
+      - "Self-Consistency Improves Chain of Thought (Wang et al., 2022)"
+
+  structured:
+    name: "Structured Format"
+    description: "Prompts with explicit output structure"
+
+  direct:
+    name: "Direct/Baseline"
+    description: "Minimal prompts without reasoning scaffolding"
+
+  metacognitive:
+    name: "Metacognitive"
+    description: "Prompts that encourage reflection and analogical thinking"

@@ -1,14 +1,12 @@
-ray<=2.46.0,>=2.40.0
+ray[default,cgraph]==2.48.0 # vllm required ray[default,cgraph]>=2.48.0
 numpy<2.0a0,>=1.25
 tensordict
-sympy==1.13.1
-transformers==4.51.2
+sympy
 modelscope
 datasets==3.1.0
 tqdm
 peft==0.12.0
 tyro>=0.5.7
-accelerate==0.34.2
 pydantic
 pytest
 loralib
@@ -17,20 +15,28 @@ isort
 jsonlines
 deprecated
 trl==0.9.6
-pyext
+# pyext
 dacite
 codetiming
 more_itertools
+pybase64
+sglang-router
 
 wandb
 swanlab
 
 math-verify
 openai
+langdetect
+nltk>=3.8
 
 gym
 gymnasium[toy-text]
 gym_sokoban
+
+# # for torch 280
+gem-llm==0.0.4
+mcp
 
 hydra-core
 omegaconf
