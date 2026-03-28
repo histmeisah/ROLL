@@ -5,7 +5,7 @@ This module provides pluggable priority functions for prioritized experience rep
 Each function takes a trajectory/step entry and returns a priority value.
 
 Usage:
-    from roll.agentic.replay_buffer.priority_functions import uniform_priority, reward_priority
+    from roll.pipeline.agentic.replay_buffer.priority_functions import uniform_priority, reward_priority
 
     buffer = TrajectoryReplayBuffer(
         capacity=10000,

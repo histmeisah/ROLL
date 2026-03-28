@@ -15,7 +15,7 @@ import torch
 from tensordict import TensorDict
 
 from roll.distributed.scheduler.protocol import DataProto
-from roll.agentic.replay_buffer.step_buffer import StepReplayBuffer
+from roll.pipeline.agentic.replay_buffer.step_buffer import StepReplayBuffer
 
 
 def create_test_batch(traj_id: str, steps: list, rewards: list, batch_size: int = None):

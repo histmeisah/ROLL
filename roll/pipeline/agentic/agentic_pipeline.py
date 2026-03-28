@@ -49,7 +49,7 @@ from roll.utils.offload_states import OffloadStateType
 
 # Optional imports for bandit/replay features
 try:
-    from roll.agentic.replay_buffer import (
+    from roll.pipeline.agentic.replay_buffer import (
         create_replay_buffer,
         detect_manager_type_from_config,
         BaseReplayBuffer
