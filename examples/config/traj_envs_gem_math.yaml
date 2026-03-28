@@ -1,0 +1,24 @@
+max_tokens_per_step: 2048
+max_actions_per_traj: 1
+
+env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+custom_env:
+  roll_math:
+    env_type: roll_math
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    env_config:
+      dataset_name: ""
+      split: train
+      question_key: prompt
+      answer_key: solution
+  roll_math_bandit:
+    env_type: roll_math_bandit
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    env_config:
+      dataset_name: ""
+      split: train
+      question_key: prompt
+      answer_key: solution
+      bandit_config: {}

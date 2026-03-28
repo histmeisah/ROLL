@@ -47,7 +47,7 @@ from .vlm_qa.config import VLMQAEnvConfig
 from .vlm_qa.env import VLMQAEnv
 
 # Math environment (AIME, MATH, GSM8K)
-from .math.config import MathEnvConfig
+from .math.config import MathEnvConfig, RollMathEnvConfig, RollMathBanditEnvConfig
 from .math.env import MathEnv
 
 logger = get_logger()
@@ -108,6 +108,9 @@ REGISTERED_ENV_CONFIGS = {
     "vlm_qa": VLMQAEnvConfig,
     # Math environment (AIME, MATH, GSM8K)
     "math": MathEnvConfig,
+    # gem-based math environments
+    "roll_math": RollMathEnvConfig,
+    "roll_math_bandit": RollMathBanditEnvConfig,
 }
 
 # Webshop environment disabled due to missing dependencies

@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 from roll.agentic.env.base import BaseEnvConfig
 
@@ -24,3 +24,26 @@ class MathEnvConfig(BaseEnvConfig):
     # Answer verification
     use_math_verify: bool = True         # Use math-verify library for robust checking
     verify_timeout: float = 5.0          # Timeout for answer verification (seconds)
+
+
+@dataclass
+class RollMathEnvConfig(BaseEnvConfig):
+    """Configuration for gem-based MathEnv (roll_math)."""
+
+    dataset_name: str = ""
+    split: str = "train"
+    question_key: str = "prompt"
+    answer_key: str = "solution"
+    max_steps: int = 1
+
+
+@dataclass
+class RollMathBanditEnvConfig(BaseEnvConfig):
+    """Configuration for gem-based MathBanditEnv (roll_math_bandit)."""
+
+    dataset_name: str = ""
+    split: str = "train"
+    question_key: str = "prompt"
+    answer_key: str = "solution"
+    bandit_config: Dict[str, Any] = field(default_factory=dict)
+    max_steps: int = 1
