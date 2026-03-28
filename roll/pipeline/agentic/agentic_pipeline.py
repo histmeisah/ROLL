@@ -1,8 +1,10 @@
 import json
+import os
 import os.path
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import ray
@@ -32,6 +34,9 @@ from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     RunningMoments,
     agg_loss,
+    apply_kl_penalty,
+    compute_advantage,
+    compute_clip_fraction,
     compute_token_reward,
     masked_mean,
     reduce_metrics,
@@ -41,6 +46,36 @@ from roll.utils.train_infer_corrections import apply_train_infer_correction_to_b
 from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
 from roll.utils.offload_states import OffloadStateType
+
+# Optional imports for bandit/replay features
+try:
+    from roll.agentic.replay_buffer import (
+        create_replay_buffer,
+        detect_manager_type_from_config,
+        BaseReplayBuffer
+    )
+except ImportError:
+    create_replay_buffer = None
+    detect_manager_type_from_config = None
+    BaseReplayBuffer = None
+
+try:
+    from roll.pipeline.agentic.offpolicy_monitor import (
+        compute_offpolicy_metrics,
+        validate_replay_batch_fields,
+        log_offpolicy_diagnostics
+    )
+except ImportError:
+    compute_offpolicy_metrics = None
+    validate_replay_batch_fields = None
+    log_offpolicy_diagnostics = None
+
+try:
+    from roll.pipeline.agentic.hierarchical_config import validate_hierarchical_config
+    from roll.pipeline.agentic.hierarchical_computer import HierarchicalAdvantageComputer
+except ImportError:
+    validate_hierarchical_config = None
+    HierarchicalAdvantageComputer = None
 
 
 logger = get_logger()
@@ -197,6 +232,85 @@ class AgenticPipeline(BasePipeline):
             self.set_checkpoint_clusters(self.actor_train)
 
         self.running = RunningMoments()
+
+        # Initialize hierarchical RL if enabled and available
+        self.hierarchical_computer = None
+        if (HierarchicalAdvantageComputer is not None
+                and hasattr(self.pipeline_config, 'hierarchical')
+                and getattr(self.pipeline_config.hierarchical, 'enabled', False)):
+            if validate_hierarchical_config is not None:
+                validate_hierarchical_config(
+                    self.pipeline_config.hierarchical,
+                    self.pipeline_config
+                )
+            self.hierarchical_computer = HierarchicalAdvantageComputer(
+                self.pipeline_config.hierarchical
+            )
+            logger.info(
+                f"Hierarchical RL enabled: "
+                f"step_estimator={self.pipeline_config.hierarchical.step_level_estimator}, "
+                f"token_estimator={self.pipeline_config.hierarchical.token_level_estimator}"
+            )
+
+        # Initialize replay buffer if enabled and available
+        self.replay_buffer: Optional[object] = None
+        self._priority_function = 'uniform'
+        if (create_replay_buffer is not None
+                and hasattr(self.pipeline_config, 'replay')
+                and getattr(self.pipeline_config.replay, 'enabled', False)):
+            rb_cfg = self.pipeline_config.replay
+            manager_type = detect_manager_type_from_config(self.pipeline_config)
+            batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
+            priority_function = getattr(rb_cfg, 'priority_function', 'uniform')
+            priority_exponent = getattr(rb_cfg, 'priority_exponent', 0.6)
+            self._priority_function = priority_function
+
+            logger.info(
+                f"Creating replay buffer: manager_type={manager_type}, capacity={rb_cfg.capacity}, "
+                f"priority_fn={priority_function}, priority_exponent={priority_exponent}"
+            )
+
+            self.replay_buffer = create_replay_buffer(
+                manager_type=manager_type,
+                capacity=rb_cfg.capacity,
+                batch_size=batch_size,
+                seed=self.pipeline_config.seed,
+                priority_function=priority_function,
+                priority_exponent=priority_exponent,
+                enable_nstep=getattr(rb_cfg, 'enable_nstep', False),
+                n_step=getattr(rb_cfg, 'n_step', 5),
+                gamma=getattr(rb_cfg, 'nstep_gamma', 0.99),
+                enable_age_decay=getattr(rb_cfg, 'enable_age_decay', False),
+                age_decay=getattr(rb_cfg, 'age_decay', 1000.0),
+                eviction_strategy=getattr(rb_cfg, 'eviction_strategy', 'fifo'),
+            )
+            logger.info(f"Successfully initialized replay buffer: {type(self.replay_buffer).__name__}")
+
+        # Initialize trajectory log file
+        self.trajectory_log_path = None
+        if hasattr(self.pipeline_config, 'trajectory_log'):
+            traj_log_cfg = self.pipeline_config.trajectory_log
+            if getattr(traj_log_cfg, 'enabled', False):
+                self.trajectory_log_path = os.path.join(
+                    self.pipeline_config.logging_dir,
+                    traj_log_cfg.filename
+                )
+                os.makedirs(os.path.dirname(self.trajectory_log_path), exist_ok=True)
+                logger.info(f"Trajectory log enabled: save_ratio={traj_log_cfg.save_ratio}, "
+                           f"max_samples_per_step={traj_log_cfg.max_samples_per_step}, "
+                           f"path={self.trajectory_log_path}")
+
+        # Initialize async age decay executor
+        self._age_decay_executor = None
+        self._age_decay_future = None
+        if (self.replay_buffer is not None
+                and hasattr(self.pipeline_config, 'replay')
+                and getattr(self.pipeline_config.replay, 'enable_age_decay', False)):
+            self._age_decay_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="age_decay_refresh"
+            )
+            logger.info("Async age decay refresh enabled")
 
         # Validate partial GPU mode configuration and set self.partial_gpu_mode
         if self.pipeline_config.partial_gpu_mode:
@@ -869,6 +983,79 @@ class AgenticPipeline(BasePipeline):
                 f"infer_devices={sorted(infer_devices_list)}, freed_gpus={sorted(freed_gpu_list)}, "
                 f"gpus_per_rank={gpus_per_dp_rank}"
             )
+
+    def _async_refresh_age_decay(self, global_step: int) -> None:
+        """Start async age decay refresh during GPU training."""
+        if self._age_decay_executor is None or self.replay_buffer is None:
+            return
+
+        rb_cfg = self.pipeline_config.replay
+        refresh_interval = getattr(rb_cfg, 'refresh_interval', 1)
+
+        if global_step % refresh_interval != 0:
+            return
+
+        self._wait_age_decay_refresh()
+
+        self._age_decay_future = self._age_decay_executor.submit(
+            self.replay_buffer.refresh_all_age_decay,
+            global_step
+        )
+        logger.debug(f"[AGE_DECAY] Started async refresh at step {global_step}")
+
+    def _wait_age_decay_refresh(self) -> None:
+        """Wait for age decay refresh to complete."""
+        if self._age_decay_future is None:
+            return
+
+        try:
+            result = self._age_decay_future.result(timeout=30.0)
+            logger.debug(f"[AGE_DECAY] Refresh completed, refreshed {result} samples")
+        except Exception as e:
+            logger.warning(f"[AGE_DECAY] Refresh failed or timed out: {e}")
+        finally:
+            self._age_decay_future = None
+
+    def _compute_and_attach_behavior_log_probs(self, batch: DataProto) -> DataProto:
+        """Compute and attach behavior policy log probs using actor_train.
+
+        This represents the policy that generated the data and is used for:
+        1. Replay buffer storage (for off-policy training)
+        2. Initial old_log_probs (for PPO on fresh batch)
+        """
+        try:
+            behavior_refs = self.actor_train.compute_log_probs(batch, blocking=False)
+            behavior = DataProto.materialize_concat(data_refs=behavior_refs)
+
+            if behavior.batch is not None and "log_probs" in behavior.batch:
+                batch.batch["behavior_log_probs"] = behavior.batch["log_probs"]
+                logger.debug("Computed behavior_log_probs using actor_train")
+            else:
+                logger.warning("Failed to compute behavior_log_probs: no log_probs in result")
+        except Exception as e:
+            logger.warning(f"Failed to compute behavior_log_probs: {e}")
+
+        return batch
+
+    def store_fresh_data_to_replay_buffer(self, fresh_batch: DataProto, global_step: int):
+        """Store fresh rollout data to replay buffer for future training."""
+        if self.replay_buffer is None:
+            return
+        try:
+            # Compute prompt_length if available
+            if "prompt_mask" in fresh_batch.batch:
+                fresh_batch.batch["prompt_length"] = fresh_batch.batch["prompt_mask"].sum(dim=1)
+
+            # Ensure behavior_log_probs are computed
+            if "behavior_log_probs" not in fresh_batch.batch:
+                logger.warning("behavior_log_probs not found in batch. Computing now for replay buffer storage.")
+                fresh_batch = self._compute_and_attach_behavior_log_probs(fresh_batch)
+
+            self.replay_buffer.push_from_dataproto(fresh_batch, global_step)
+            logger.debug(f"Stored fresh batch to replay buffer (buffer_type={self.replay_buffer.buffer_type})")
+        except Exception as e:
+            logger.error(f"Failed to store data in replay buffer: {e}")
+
 
 def get_episode_scores(batch: DataProto) -> torch.Tensor:
     batch_group_by_traj: Dict[str, DataProto] = batch.group_by(keys="traj_id")

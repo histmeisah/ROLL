@@ -52,6 +52,12 @@ class ActorWorker(BaseActorWorker):
         valid_samples = torch.any(final_response_mask > 0, dim=1).float()
         sample_weights = self.compute_sample_weights(data, response_mask)
 
+        # Combine with PER importance weights if available
+        # PER weights correct sampling bias, sample_weights are for difficulty/length weighting
+        per_importance_weights = data.batch.get("importance_weights", None)
+        if per_importance_weights is not None:
+            sample_weights = sample_weights * per_importance_weights
+
         kl_loss = compute_approx_kl(
             log_probs=log_probs, log_probs_base=ref_log_probs, action_mask=final_response_mask, kl_penalty="k3"
         )
@@ -163,6 +169,12 @@ class ActorWorker(BaseActorWorker):
             **loss_metric,
             **train_infer_metric,
         }
+
+        # Log PER importance weights statistics if available
+        if per_importance_weights is not None:
+            pg_metrics["actor/per_importance_weights_mean"] = per_importance_weights.mean().detach().item()
+            pg_metrics["actor/per_importance_weights_max"] = per_importance_weights.max().detach().item()
+            pg_metrics["actor/per_importance_weights_min"] = per_importance_weights.min().detach().item()
 
         return total_loss, pg_metrics
 

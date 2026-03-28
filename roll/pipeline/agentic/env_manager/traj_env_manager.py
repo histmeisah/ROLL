@@ -168,6 +168,16 @@ class TrajEnvManager(BaseEnvManager):
     def step(self, llm_output: DataProto):
         responses = self.tokenizer.batch_decode(llm_output.batch['responses'], skip_special_tokens=False)
 
+        # Extract per-turn engine logprobs (true pi_mu) before environment step
+        _turn_logprobs = None
+        if "generation_log_probs" in llm_output.batch:
+            gen_lp = llm_output.batch["generation_log_probs"][0]  # [full_seq_len]
+            resp_mask = llm_output.batch.get("response_mask", None)
+            if resp_mask is not None:
+                _turn_logprobs = gen_lp[resp_mask[0].bool()].tolist()
+            else:
+                self.logger.debug("[ENGINE_LP] response_mask not available, skipping logprobs extraction")
+
         with self.thread_lock, self.env_step_limiter:
             observation, reward, terminated, truncated, info = self.env.step(action=responses[0])
         suffix = info.pop("suffix", None)
@@ -183,6 +193,11 @@ class TrajEnvManager(BaseEnvManager):
         self.rollout_cache.history[-1]['llm_response'] = responses[0]
         if info is not None:
             self.rollout_cache.history[-1].update(info)
+
+        # Store engine logprobs for this turn (true pi_mu from VLLM)
+        # NOTE: Must be AFTER info.update() to prevent env info from overwriting response_logprobs
+        if _turn_logprobs is not None:
+            self.rollout_cache.history[-1]['response_logprobs'] = _turn_logprobs
 
         self.rollout_cache.history.append({
             "observation": observation,
@@ -208,6 +223,13 @@ class TrajEnvManager(BaseEnvManager):
                              self.pipeline_config.sequence_length-input_ids.shape[1])
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
+        # Pass use_engine_logprobs flag so VLLM returns per-token logprobs for true pi_mu
+        # Only for train mode - val doesn't need logprobs and they cause concat shape issues
+        if (self.mode == "train"
+                and hasattr(self.pipeline_config, 'replay')
+                and getattr(self.pipeline_config.replay, 'enabled', False)
+                and getattr(self.pipeline_config.replay, 'use_engine_logprobs', False)):
+            generation_config["use_engine_logprobs"] = True
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]
@@ -342,6 +364,39 @@ class TrajEnvManager(BaseEnvManager):
         prompt_mask = pad_to_length(prompt_mask, length=self.pipeline_config.sequence_length, pad_value=0)
         score_tensor = pad_to_length(score_tensor, length=self.pipeline_config.sequence_length, pad_value=0)
 
+        # Assemble engine logprobs (true pi_mu) from per-turn stored logprobs (train only)
+        engine_behavior_log_probs = None
+        completed_steps = [h for h in self.rollout_cache.history if 'reward' in h]
+        has_engine_logprobs = (
+            self.mode == "train"
+            and any('response_logprobs' in h for h in completed_steps)
+        )
+        if has_engine_logprobs:
+            # Build behavior_log_probs in next-token format: [1, seq_len-1]
+            seq_len = len(token_ids)
+            engine_behavior_log_probs = torch.zeros(1, seq_len - 1, dtype=torch.float32)
+
+            # Map response_logprobs to correct positions based on response_masks
+            turn_idx = 0
+            token_offset = 0
+            for h_idx, h_item in enumerate(self.rollout_cache.history):
+                prompt_len = len(h_item.get("prompt_ids", []))
+                response_len = len(h_item.get("response_ids", []))
+                if 'response_logprobs' in h_item:
+                    stored_lp = h_item['response_logprobs']
+                    resp_start = token_offset + prompt_len
+                    n_use = min(len(stored_lp), response_len)
+                    for j in range(n_use):
+                        abs_pos = resp_start + j
+                        if abs_pos - 1 >= 0 and abs_pos - 1 < seq_len - 1:
+                            engine_behavior_log_probs[0, abs_pos - 1] = stored_lp[j]
+                token_offset += prompt_len + response_len
+
+            # Pad to sequence_length - 1
+            engine_behavior_log_probs = pad_to_length(
+                engine_behavior_log_probs, length=self.pipeline_config.sequence_length - 1, pad_value=0
+            )
+
         lm_input.batch.update({
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -350,6 +405,8 @@ class TrajEnvManager(BaseEnvManager):
             "prompt_mask": prompt_mask,
             "scores": score_tensor,
         })
+        if engine_behavior_log_probs is not None:
+            lm_input.batch["behavior_log_probs"] = engine_behavior_log_probs
         if len(infer_logprobs):
             infer_logprobs = torch.tensor(infer_logprobs, dtype=torch.float).unsqueeze(0)
             infer_logprobs = pad_to_length(infer_logprobs, length=self.pipeline_config.sequence_length, pad_value=0)

@@ -1,0 +1,179 @@
+"""
+BanditAgenticPipeline: Agentic pipeline with bandit-based prompt selection.
+
+Creates BanditActor and EncoderActor as detached Ray Named Actors
+*before* super().__init__() so that environment workers can find them
+when they are created during pipeline initialization.
+"""
+
+import ray
+from typing import Any, Dict, List, Optional
+
+from roll.algorithms.bandit.bandit_actor import BanditActor
+from roll.algorithms.bandit.encoder_actor import EncoderActor, DEFAULT_ENCODER_ACTOR_NAME
+from roll.algorithms.bandit.prompt_loader import PromptLoader
+from roll.pipeline.agentic.agentic_config import AgenticConfig
+from roll.pipeline.agentic.agentic_pipeline import AgenticPipeline
+from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.logging import get_logger
+
+logger = get_logger()
+
+DEFAULT_BANDIT_ACTOR_NAME = "bandit_actor_global"
+
+
+class BanditAgenticPipeline(AgenticPipeline):
+    """
+    AgenticPipeline extended with Bandit REINFORCE++ prompt selection.
+
+    Initialization order:
+    1. Load prompt templates (PromptLoader)
+    2. Create EncoderActor (detached Named Actor)
+    3. Wait for encoder to be ready, get context_dim
+    4. Create BanditActor (detached Named Actor)
+    5. Call super().__init__() which creates environment workers
+    """
+
+    def __init__(self, pipeline_config: AgenticConfig):
+        bandit_cfg = pipeline_config.bandit_config or {}
+
+        # Load prompt templates
+        preset = bandit_cfg.get("preset", "diverse_5")
+        prompts_config_path = bandit_cfg.get("prompts_config_path", None)
+        loader = PromptLoader(config_path=prompts_config_path)
+        self.prompt_templates = loader.get_preset_prompts(preset)
+        self.prompt_names = [p.name for p in self.prompt_templates]
+        self.prompt_texts = [p.template for p in self.prompt_templates]
+        n_prompts = len(self.prompt_templates)
+        logger.info(f"[BanditPipeline] Loaded {n_prompts} prompts from preset '{preset}': {self.prompt_names}")
+
+        # Inject prompt_templates into env_config for all custom_envs that use roll_math_bandit
+        for tag, env_cfg in pipeline_config.custom_envs.items():
+            if env_cfg.get("env_type") == "roll_math_bandit":
+                if "env_config" not in env_cfg:
+                    env_cfg["env_config"] = {}
+                if "bandit_config" not in env_cfg["env_config"]:
+                    env_cfg["env_config"]["bandit_config"] = {}
+                env_cfg["env_config"]["bandit_config"]["prompt_templates"] = self.prompt_texts
+
+        # Also inject into already-generated env_configs (make_env_configs runs in __post_init__)
+        for env_mgr in [pipeline_config.train_env_manager, pipeline_config.val_env_manager]:
+            if not hasattr(env_mgr, "env_configs") or not env_mgr.env_configs:
+                continue
+            for worker_rank, worker_envs in env_mgr.env_configs.items():
+                for env_id, entry in worker_envs.items():
+                    if entry.get("env_class") == "roll_math_bandit":
+                        config = entry.get("config", {})
+                        if "bandit_config" not in config:
+                            config["bandit_config"] = {}
+                        config["bandit_config"]["prompt_templates"] = self.prompt_texts
+        logger.info(f"[BanditPipeline] Injected {n_prompts} prompt templates into env_configs")
+
+        # Create EncoderActor
+        encoder_model = bandit_cfg.get("encoder_model", "Qwen/Qwen3-VL-Embedding-2B")
+        encoder_device = bandit_cfg.get("encoder_device", "cpu")
+        encoder_type = bandit_cfg.get("encoder_type", "qwen3_vl")
+        embedding_dim = bandit_cfg.get("embedding_dim", None)
+        encoder_actor_name = bandit_cfg.get("encoder_actor_name", DEFAULT_ENCODER_ACTOR_NAME)
+
+        self._kill_existing_actor(encoder_actor_name)
+        self.encoder_actor = EncoderActor.options(
+            name=encoder_actor_name,
+            namespace=RAY_NAMESPACE,
+            lifetime="detached",
+        ).remote(
+            model_name_or_path=encoder_model,
+            device=encoder_device,
+            encoder_type=encoder_type,
+            embedding_dim=embedding_dim,
+        )
+        context_dim = ray.get(self.encoder_actor.get_context_dim.remote())
+        logger.info(
+            f"[BanditPipeline] EncoderActor created: type={encoder_type}, "
+            f"model={encoder_model}, context_dim={context_dim}"
+        )
+
+        # Create BanditActor
+        hidden_dims = bandit_cfg.get("hidden_dims", [256, 128])
+        exploration_param = bandit_cfg.get("exploration_param", 1.0)
+        bandit_actor_name = bandit_cfg.get("bandit_actor_name", DEFAULT_BANDIT_ACTOR_NAME)
+        bandit_kwargs = {
+            "learning_rate": bandit_cfg.get("learning_rate", 1e-3),
+            "reg_param": bandit_cfg.get("reg_param", 1.0),
+            "l2_weight": bandit_cfg.get("l2_weight", 0.01),
+            "buffer_size": bandit_cfg.get("buffer_size", 10000),
+            "batch_size": bandit_cfg.get("batch_size", 32),
+            "update_freq": bandit_cfg.get("update_freq", 10),
+        }
+
+        bandit_algorithm = bandit_cfg.get("bandit_algorithm", "ts")
+
+        self._kill_existing_actor(bandit_actor_name)
+        self.bandit_actor = BanditActor.options(
+            name=bandit_actor_name,
+            namespace=RAY_NAMESPACE,
+            lifetime="detached",
+        ).remote(
+            n_prompts=n_prompts,
+            context_dim=context_dim,
+            hidden_dims=hidden_dims,
+            exploration_param=exploration_param,
+            bandit_kwargs=bandit_kwargs,
+            prompt_names=self.prompt_names,
+            enable_monitoring=True,
+            device="cpu",
+            bandit_algorithm=bandit_algorithm,
+        )
+        logger.info(
+            f"[BanditPipeline] BanditActor created: algorithm={bandit_algorithm}, "
+            f"n_prompts={n_prompts}, exploration_param={exploration_param}, "
+            f"hidden_dims={hidden_dims}"
+        )
+
+        # Now safe to call super().__init__() which creates env workers
+        super().__init__(pipeline_config)
+
+        # Monkey-patch tracker.log to inject bandit metrics
+        self._original_tracker_log = None
+        if hasattr(self, 'tracker') and self.tracker is not None:
+            self._setup_bandit_logging()
+
+    def _kill_existing_actor(self, actor_name: str) -> None:
+        """Kill existing Ray actor if it exists."""
+        try:
+            existing = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
+            logger.info(f"[BanditPipeline] Killing existing actor: {actor_name}")
+            ray.kill(existing)
+        except ValueError:
+            pass
+
+    def _setup_bandit_logging(self) -> None:
+        """Monkey-patch tracker.log to inject bandit metrics."""
+        original_log = self.tracker.log
+
+        def patched_log(values: Dict[str, Any], step: Optional[int] = None, **kwargs):
+            # Fetch and inject bandit metrics
+            try:
+                bandit_metrics = ray.get(self.bandit_actor.get_monitor_metrics.remote())
+                values.update(bandit_metrics)
+            except Exception as e:
+                logger.debug(f"[BanditPipeline] Failed to fetch bandit metrics: {e}")
+            return original_log(values=values, step=step, **kwargs)
+
+        self._original_tracker_log = original_log
+        self.tracker.log = patched_log
+
+    def run(self):
+        """Run training with bandit summary at the end."""
+        try:
+            super().run()
+        finally:
+            self._print_bandit_summary()
+
+    def _print_bandit_summary(self) -> None:
+        """Print bandit performance summary."""
+        try:
+            summary = ray.get(self.bandit_actor.print_summary.remote())
+            logger.info(summary)
+        except Exception as e:
+            logger.warning(f"[BanditPipeline] Failed to print bandit summary: {e}")

@@ -10,6 +10,7 @@ from omegaconf import DictConfig
 
 from roll.configs.base_config import PPOConfig, RouterArguments
 from roll.configs.worker_config import WorkerConfig
+from roll.pipeline.agentic.hierarchical_config import HierarchicalRLConfig
 from roll.utils.logging import get_logger
 
 
@@ -110,6 +111,250 @@ class RewardNormalizationConfig:
 
 
 @dataclass
+class VTraceConfig:
+    """
+    Configuration for V-trace advantage estimation.
+    V-trace is an off-policy correction algorithm that uses truncated importance
+    sampling to handle the difference between behavior and target policies.
+    """
+    rho_bar: float = field(
+        default=1.0,
+        metadata={
+            "help": "Truncation threshold for importance sampling ratio rho. "
+                   "Default 1.0 means truncate to [0, 1]. Higher values allow more off-policy correction."
+        }
+    )
+    c_bar: float = field(
+        default=1.0,
+        metadata={
+            "help": "Truncation threshold for trace coefficient c. "
+                   "Default 1.0 means truncate to [0, 1]. Controls the speed of value function propagation."
+        }
+    )
+
+
+@dataclass
+class OffPolicyMonitorConfig:
+    """
+    Configuration for off-policy monitoring.
+    This is independent of replay buffer and can be used in various scenarios:
+    - Async training (policy drift between actor and trainer)
+    - Multiple gradient updates (policy changes during training)
+    - Replay buffer training (off-policy data)
+    - External data loading
+    """
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable off-policy monitoring for all training batches."}
+    )
+    save_behavior_log_probs: bool = field(
+        default=True,
+        metadata={"help": "Whether to compute and save behavior policy log probs after rollout."}
+    )
+    monitor_fresh_batch: bool = field(
+        default=True,
+        metadata={"help": "Whether to monitor off-policy metrics for fresh rollout batches."}
+    )
+    monitor_replay_batch: bool = field(
+        default=True,
+        metadata={"help": "Whether to monitor off-policy metrics for replay buffer batches."}
+    )
+    monitor_interval: int = field(
+        default=1,
+        metadata={"help": "Monitor every N training steps (1 = every step)."}
+    )
+
+
+@dataclass
+class ReplayConfig:
+    enabled: bool = field(default=False, metadata={"help": "Enable replay buffer for agentic training."})
+    capacity: int = field(default=1000000, metadata={"help": "Max number of step transitions stored in replay buffer."})
+    min_size: int = field(default=2000, metadata={"help": "Minimum step transitions before sampling is allowed."})
+    train_steps_per_env_step: int = field(default=1, metadata={"help": "Number of training steps per rollout step when replay is enabled."})
+
+    minibatch_size: int = field(default=128, metadata={"help": "Legacy compatibility. Use use_rollout_batch_size=True instead."})
+
+    use_rollout_batch_size: bool = field(
+        default=True,
+        metadata={"help": "Use rollout_batch_size for sampling instead of minibatch_size."}
+    )
+
+    storage_mode: Literal["hybrid", "text_only", "tokens_only"] = field(
+        default="hybrid",
+        metadata={"help": "Storage mode: 'hybrid' (text+tokens), 'text_only' (pure text), 'tokens_only' (pure tokens)"}
+    )
+
+    source_manager_type: str = field(
+        default="auto",
+        metadata={"help": "Source env_manager type: 'auto' (detect), 'trajectory' (TrajEnvManager), 'step' (StepEnvManager)"}
+    )
+
+    lazy_tokenization: bool = field(
+        default=False,
+        metadata={"help": "If True, tokenize only during sampling (memory efficient, but slower sampling)"}
+    )
+
+    replay_ratio: float = field(
+        default=0.5,
+        metadata={"help": "Ratio of replay data in each training batch (0.0-1.0)."}
+    )
+
+    sampling_mode: Literal["trajectory", "step"] = field(
+        default="trajectory",
+        metadata={"help": "Sampling mode for replay: 'trajectory' samples full episodes; 'step' samples per-step items"}
+    )
+    steps_per_episode: int = field(
+        default=1,
+        metadata={"help": "When sampling_mode='step', number of steps to sample per episode in one minibatch."}
+    )
+
+    sample_method: Literal["uniform", "fifo", "lifo"] = field(
+        default="uniform",
+        metadata={"help": "Sampling method: uniform (random), fifo (oldest first), lifo (newest first)."}
+    )
+
+    candidates_per_group: int = field(
+        default=1,
+        metadata={"help": "Number of candidates per group (K). Use K>1 for GRPO; K=1 for reinforce/GAE."}
+    )
+    group_sampling: Literal["uniform", "fifo", "lifo"] = field(
+        default="uniform",
+        metadata={"help": "Group selection strategy when candidates_per_group>1."}
+    )
+    min_groups: int = field(
+        default=0,
+        metadata={"help": "Warmup threshold in groups when using grouped sampling."}
+    )
+    train_from_replay_only: bool = field(
+        default=False,
+        metadata={"help": "If true, skip main on-policy update and train only from replay minibatches."}
+    )
+
+    enable_nstep: bool = field(
+        default=False,
+        metadata={"help": "Enable n-step returns computation for replay buffer."}
+    )
+    n_step: int = field(
+        default=5,
+        metadata={"help": "Number of steps for n-step returns (step-level, not token-level)."}
+    )
+    nstep_gamma: float = field(
+        default=0.99,
+        metadata={"help": "Discount factor for step-level n-step returns."}
+    )
+    use_nstep_in_advantage: bool = field(
+        default=False,
+        metadata={"help": "Whether to use n-step returns as outer-layer reward in advantage computation."}
+    )
+    use_bootstrap: bool = field(
+        default=False,
+        metadata={"help": "Whether to use critic values for bootstrapping in n-step returns."}
+    )
+
+    enable_gae: bool = field(
+        default=False,
+        metadata={"help": "Enable Generalized Advantage Estimation (GAE) for replay buffer."}
+    )
+    gae_lambda: float = field(
+        default=0.95,
+        metadata={"help": "GAE lambda parameter for exponential smoothing of TD errors."}
+    )
+    gae_horizon: int = field(
+        default=20,
+        metadata={"help": "Truncation horizon for GAE computation (limits lookback)."}
+    )
+
+    priority_function: str = field(
+        default="uniform",
+        metadata={
+            "help": "Priority function for sampling. Options: uniform, lifo, fifo, reward, advantage, td_error, recency, reward_fresh."
+        }
+    )
+    priority_exponent: float = field(
+        default=0.6,
+        metadata={"help": "Priority exponent (alpha in PER). 0.0 = uniform, 1.0 = full prioritization."}
+    )
+    importance_sampling_correction: bool = field(
+        default=False,
+        metadata={"help": "Apply importance sampling correction to compensate for non-uniform sampling bias."}
+    )
+    importance_beta: float = field(
+        default=0.4,
+        metadata={"help": "Importance sampling exponent (beta in PER). Should anneal from 0.4 to 1.0."}
+    )
+    enable_age_decay: bool = field(
+        default=False,
+        metadata={"help": "Enable age-based freshness weighting."}
+    )
+    age_decay: float = field(
+        default=1000.0,
+        metadata={"help": "Age decay constant for freshness weighting."}
+    )
+    refresh_interval: int = field(
+        default=1,
+        metadata={"help": "Interval (in training steps) for refreshing age decay of ALL samples in the buffer."}
+    )
+    eviction_strategy: Literal["fifo", "smart"] = field(
+        default="fifo",
+        metadata={"help": "Eviction strategy when buffer is full. 'fifo' (default) or 'smart'."}
+    )
+
+    use_engine_logprobs: bool = field(
+        default=False,
+        metadata={
+            "help": "Capture log probabilities from the inference engine during generation "
+                    "and store as true behavior policy in the replay buffer."
+        }
+    )
+
+    enable_offpolicy_filter: bool = field(
+        default=False,
+        metadata={"help": "Enable off-policy filtering based on importance sampling ratio."}
+    )
+    ratio_clip_max: Optional[float] = field(
+        default=3.0,
+        metadata={"help": "Maximum allowed importance sampling ratio for filtering."}
+    )
+    filter_mini_batch_size: int = field(
+        default=32,
+        metadata={"help": "Mini-batch size for filtering forward passes."}
+    )
+    filter_max_attempts: int = field(
+        default=20,
+        metadata={"help": "Maximum number of mini-batches to sample during filtering."}
+    )
+    filter_oversample_ratio: float = field(
+        default=1.5,
+        metadata={"help": "[DEPRECATED] Oversample ratio for filtering."}
+    )
+    filter_min_acceptable_batch: Optional[int] = field(
+        default=None,
+        metadata={"help": "Minimum acceptable batch size after filtering before supplementing with unfiltered samples."}
+    )
+
+
+@dataclass
+class TrajectoryLogConfig:
+    """Configuration for trajectory logging during training."""
+    enabled: bool = field(
+        default=True,
+        metadata={"help": "Enable trajectory logging to separate JSONL file."}
+    )
+    save_ratio: float = field(
+        default=0.1,
+        metadata={"help": "Ratio of trajectories to save (0.0-1.0)."}
+    )
+    max_samples_per_step: int = field(
+        default=20,
+        metadata={"help": "Maximum number of trajectory samples to save per training step."}
+    )
+    filename: str = field(
+        default="trajectory_samples.jsonl",
+        metadata={"help": "Filename for trajectory log (will be saved in logging_dir)."}
+    )
+
+
+@dataclass
 class LLMProxyConfig:
     proxy_type: str = field(default="policy", metadata={"help": "llm proxy type: [policy, openai, random]."})
     proxy_config: Dict = field(default_factory=dict, metadata={"help": "llm proxy config."})
@@ -195,6 +440,24 @@ class AgenticConfig(PPOConfig):
     )
     env_monitor: EnvMonitorConfig = field(
         default_factory=EnvMonitorConfig, metadata={"help": "Environment monitoring configuration."}
+    )
+    trajectory_log: TrajectoryLogConfig = field(
+        default_factory=TrajectoryLogConfig,
+        metadata={"help": "Trajectory logging configuration for debugging and analysis."}
+    )
+    offpolicy_monitor: OffPolicyMonitorConfig = field(
+        default_factory=OffPolicyMonitorConfig,
+        metadata={"help": "Off-policy monitoring configuration (independent of replay buffer)."}
+    )
+    replay: ReplayConfig = field(default_factory=ReplayConfig, metadata={"help": "Replay buffer configuration."})
+    vtrace: VTraceConfig = field(default_factory=VTraceConfig, metadata={"help": "V-trace configuration for off-policy correction."})
+    hierarchical: HierarchicalRLConfig = field(
+        default_factory=HierarchicalRLConfig,
+        metadata={"help": "Hierarchical RL configuration (only for StepEnvManager)."}
+    )
+    bandit_config: Dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"help": "Bandit configuration for adaptive prompt selection."}
     )
     dirty_data_mask: bool = field(default=False, metadata={"help": "if dirty data mask is True, will mask dirty data"})
     open_feedback_turn: bool = field(default=False, metadata={"help": "open feedback turn"})

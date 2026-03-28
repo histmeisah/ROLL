@@ -404,6 +404,14 @@ def gather_outputs_to_pad_tensor(request_outputs: List["RequestOutput"], pad_tok
 def create_sampling_params_for_vllm(gen_kwargs, collect_unfinished=False):
     # TODO vLLM support partial rollout in v1 from 0.10.1, and do not need to set RequestOutputKind to CUMULATIVE
     output_kind = RequestOutputKind.CUMULATIVE if collect_unfinished else RequestOutputKind.FINAL_ONLY
+    # Enable engine logprobs when:
+    # 1. logprobs explicitly set in gen_kwargs, OR
+    # 2. use_engine_logprobs=True (replay buffer needs true pi_mu)
+    want_engine_logprobs = (
+        gen_kwargs.get("logprobs", 0) > 0
+        or gen_kwargs.get("use_engine_logprobs", False)
+    )
+    logprobs_flag = 1 if want_engine_logprobs else 0
     return dict(
         max_tokens=gen_kwargs["max_new_tokens"],
         temperature=gen_kwargs["temperature"],
@@ -413,7 +421,7 @@ def create_sampling_params_for_vllm(gen_kwargs, collect_unfinished=False):
         repetition_penalty=gen_kwargs["repetition_penalty"],
         n=gen_kwargs["num_return_sequences"],
         stop=gen_kwargs["stop_strings"],
-        logprobs=gen_kwargs.get("logprobs", 0),
+        logprobs=logprobs_flag,
         output_kind=output_kind,
         include_stop_str_in_output=gen_kwargs.get("include_stop_str_in_output", True),
     )
