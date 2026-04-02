@@ -11,6 +11,9 @@ import pickle
 import numpy as np
 from typing import Dict, List, Any, Optional
 import logging
+import json
+import os
+from pathlib import Path
 
 from .neural_linear_ucb import NeuralLinearUCB
 from .neural_linear_ts import NeuralLinearTS
@@ -96,11 +99,65 @@ class BanditActor:
         self.update_counter = 0
         self.update_freq = bandit_kwargs.get("update_freq", 10)
 
+        # JSONL episode logging
+        self.log_dir = None
+        self._jsonl_file = None
+
         logger.info(
             f"[BanditActor] Initialized with {n_prompts} prompts, "
             f"algorithm={bandit_algorithm}, context_dim={context_dim}, "
             f"exploration_param={exploration_param}"
         )
+
+    def set_log_dir(self, log_dir: str) -> None:
+        """Set output directory for JSONL episode logs and final summary."""
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = self.log_dir / "bandit_episodes.jsonl"
+        self._jsonl_file = open(jsonl_path, "a")
+        logger.info(f"[BanditActor] JSONL logging to {jsonl_path}")
+
+    def _log_episode_jsonl(self, arm_idx: int, reward: float,
+                           ucb_value: float, predicted_reward: float,
+                           confidence: float, problem_text: str = "") -> None:
+        """Write one episode record to JSONL file."""
+        if self._jsonl_file is None:
+            return
+        record = {
+            "step": self.update_counter,
+            "arm_idx": arm_idx,
+            "prompt_name": self.prompt_names[arm_idx] if arm_idx < len(self.prompt_names) else str(arm_idx),
+            "reward": reward,
+            "ucb_value": ucb_value,
+            "predicted_reward": predicted_reward,
+            "confidence": confidence,
+            "problem_text": problem_text[:200] if problem_text else "",
+        }
+        self._jsonl_file.write(json.dumps(record, ensure_ascii=False) + chr(10))
+        if self.update_counter % 50 == 0:
+            self._jsonl_file.flush()
+
+    def save_summary(self) -> str:
+        """Save full monitoring summary and plotting data to JSON. Returns file path."""
+        if self.log_dir is None:
+            return ""
+        # Flush JSONL
+        if self._jsonl_file:
+            self._jsonl_file.flush()
+        # Save summary
+        summary_path = self.log_dir / "bandit_summary.json"
+        data = {}
+        if self.enable_monitoring:
+            data["summary"] = self.monitor.get_summary()
+            data["plotting_data"] = self.monitor.export_for_plotting()
+        data["total_selections"] = self.total_selections
+        data["update_count"] = self.update_counter
+        data["bandit_algorithm"] = self.bandit_algorithm
+        data["prompt_names"] = self.prompt_names
+        with open(summary_path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        logger.info(f"[BanditActor] Summary saved to {summary_path}")
+        return str(summary_path)
 
     def select_arm(self, context_bytes: bytes) -> Dict[str, Any]:
         """
@@ -154,7 +211,8 @@ class BanditActor:
             "confidence": confidence,
         }
 
-    def update(self, arm_idx: int, context_bytes: bytes, reward: float) -> Dict[str, Any]:
+    def update(self, arm_idx: int, context_bytes: bytes, reward: float,
+               problem_text: str = "") -> Dict[str, Any]:
         """
         Update bandit with observed reward.
 
@@ -162,6 +220,7 @@ class BanditActor:
             arm_idx: Selected arm index
             context_bytes: Pickled context vector
             reward: Observed reward
+            problem_text: Problem text for JSONL logging
 
         Returns:
             Update information (training status, etc.)
@@ -199,6 +258,13 @@ class BanditActor:
                 predicted_reward=predicted_reward,
                 confidence=confidence,
                 metadata={}
+            )
+
+            # Log to JSONL
+            self._log_episode_jsonl(
+                arm_idx=arm_idx, reward=reward,
+                ucb_value=ucb_value, predicted_reward=predicted_reward,
+                confidence=confidence, problem_text=problem_text,
             )
 
         self.update_counter += 1
@@ -335,6 +401,31 @@ class BanditActor:
         # Global stats
         metrics["bandit/total_selections"] = self.total_selections
         metrics["bandit/update_count"] = self.update_counter
+
+        # Enhanced metrics: entropy, exploration, reward gap, per-prompt curves
+        global_stats = summary.get("global_stats", {})
+        metrics["bandit/selection_entropy"] = global_stats.get("selection_entropy", 0.0)
+        metrics["bandit/max_entropy"] = global_stats.get("max_entropy", 0.0)
+        metrics["bandit/exploration_ratio"] = global_stats.get("exploration_ratio", 0.0)
+
+        # Per-prompt enhanced: recent_reward_50, ucb_value, confidence, cumulative_selections
+        for prompt_name, prompt_stats in summary["prompt_stats"].items():
+            safe_name = prompt_name.replace("/", "_").replace(" ", "_")
+            metrics[f"bandit/prompts/{safe_name}/recent_reward_50"] = prompt_stats.get("recent_reward_50", 0.0)
+            metrics[f"bandit/prompts/{safe_name}/ucb_value"] = prompt_stats.get("latest_ucb", 0.0)
+            metrics[f"bandit/prompts/{safe_name}/confidence"] = prompt_stats.get("latest_confidence", 0.0)
+            metrics[f"bandit/prompts/{safe_name}/predicted_reward"] = prompt_stats.get("latest_predicted", 0.0)
+            metrics[f"bandit/prompts/{safe_name}/cumulative_selections"] = float(prompt_stats.get("total_selections", 0))
+
+        # Reward gap between best and worst prompt
+        all_mean_rewards = [
+            s["mean_reward"] for s in summary["prompt_stats"].values()
+            if s["total_selections"] >= 5
+        ]
+        if len(all_mean_rewards) >= 2:
+            metrics["bandit/reward_gap"] = max(all_mean_rewards) - min(all_mean_rewards)
+        else:
+            metrics["bandit/reward_gap"] = 0.0
 
         return metrics
 

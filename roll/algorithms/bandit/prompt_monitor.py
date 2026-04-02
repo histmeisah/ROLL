@@ -96,6 +96,10 @@ class PromptStats:
             "success_rate": float(self.success_rate),
             "successes": self.successes,
             "ucb_trend": np.mean(self.ucb_values[-10:]) if self.ucb_values else 0.0,
+            "recent_reward_50": float(np.mean(list(self.recent_rewards)[-50:])) if self.recent_rewards else 0.0,
+            "latest_ucb": float(self.ucb_values[-1]) if self.ucb_values else 0.0,
+            "latest_confidence": float(self.confidence_bounds[-1]) if self.confidence_bounds else 0.0,
+            "latest_predicted": float(self.predicted_rewards[-1]) if self.predicted_rewards else 0.0,
         }
 
 
@@ -261,6 +265,26 @@ class PromptMonitor:
             for i in range(self.n_prompts)
         }
 
+    def get_selection_entropy(self, recent: bool = True) -> float:
+        """Compute entropy of prompt selection distribution. High=exploring, low=converged."""
+        dist = self.get_selection_distribution(recent=recent)
+        freqs = np.array(list(dist.values()))
+        freqs = freqs[freqs > 0]
+        if len(freqs) == 0:
+            return 0.0
+        return float(-np.sum(freqs * np.log2(freqs)))
+
+    def get_exploration_ratio(self) -> float:
+        """Fraction of selections where confidence bound > predicted reward (exploring)."""
+        total_explore = 0
+        total_with_data = 0
+        for stats in self.prompt_stats.values():
+            for conf, pred in zip(stats.confidence_bounds, stats.predicted_rewards):
+                total_with_data += 1
+                if conf > abs(pred):
+                    total_explore += 1
+        return total_explore / max(total_with_data, 1)
+
     def get_summary(self) -> Dict:
         """Get comprehensive monitoring summary."""
         rankings = self.get_prompt_rankings()
@@ -291,6 +315,9 @@ class PromptMonitor:
             "global_stats": {
                 "mean_reward": float(np.mean(self.reward_history)) if self.reward_history else 0.0,
                 "recent_mean_reward": float(np.mean(self.reward_history[-100:])) if len(self.reward_history) >= 100 else 0.0,
+                "selection_entropy": self.get_selection_entropy(recent=True),
+                "max_entropy": float(np.log2(self.n_prompts)) if self.n_prompts > 0 else 0.0,
+                "exploration_ratio": self.get_exploration_ratio(),
             }
         }
 

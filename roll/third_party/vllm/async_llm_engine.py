@@ -24,4 +24,4 @@ class CustomAsyncLLMEngine(AsyncLLMEngine):
         self.engine.model_executor.collective_rpc(method="custom_add_lora", args=args, kwargs=kwargs)
 
     async def process_weights_after_loading(self):
-        await self.engine.model_executor.collective_rpc(method="process_weights_after_loading")
+        self.engine.model_executor.collective_rpc(method="process_weights_after_loading")

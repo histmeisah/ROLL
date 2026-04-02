@@ -438,7 +438,10 @@ def reduce_metrics(metrics: dict, reduce_func=np.mean) -> dict:
             if len(val) == 0:
                 continue
             agg_func = _parse_aggregation_func(key)
-            metrics[key] = float(agg_func(val))
+            try:
+                metrics[key] = float(agg_func(val))
+            except (ValueError, TypeError):
+                continue
         else:
             # Fallback for other types (e.g., single-element containers)
             metrics[key] = float(reduce_func(val))

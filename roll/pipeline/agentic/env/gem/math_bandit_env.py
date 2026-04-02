@@ -122,6 +122,7 @@ class MathBanditEnv(MathEnv):
         encoder_input = _obs_to_encoder_input(obs)
         context_bytes = ray.get(self.encoder_actor.encode.remote(encoder_input))
         self._current_context_bytes = context_bytes
+        self._current_problem_text = obs if isinstance(obs, str) else str(obs)[:300]
 
         # Select prompt via bandit
         selection = ray.get(self.bandit_actor.select_arm.remote(context_bytes))
@@ -162,6 +163,7 @@ class MathBanditEnv(MathEnv):
                         self._current_arm_idx,
                         self._current_context_bytes,
                         float(reward),
+                        problem_text=getattr(self, "_current_problem_text", ""),
                     )
                 )
                 # Add bandit metrics to info

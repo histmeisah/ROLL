@@ -130,6 +130,14 @@ class BanditAgenticPipeline(AgenticPipeline):
             f"hidden_dims={hidden_dims}"
         )
 
+        # Set bandit log directory (will be overridden by Hydra override if set)
+        bandit_log_dir = getattr(pipeline_config, "output_dir", None)
+        if bandit_log_dir:
+            import os
+            bandit_log_path = os.path.join(str(bandit_log_dir), "bandit_logs")
+            ray.get(self.bandit_actor.set_log_dir.remote(bandit_log_path))
+            logger.info(f"[BanditPipeline] Bandit JSONL logging to {bandit_log_path}")
+
         # Now safe to call super().__init__() which creates env workers
         super().__init__(pipeline_config)
 
@@ -171,9 +179,17 @@ class BanditAgenticPipeline(AgenticPipeline):
             self._print_bandit_summary()
 
     def _print_bandit_summary(self) -> None:
-        """Print bandit performance summary."""
+        """Print bandit performance summary and save to disk."""
         try:
             summary = ray.get(self.bandit_actor.print_summary.remote())
             logger.info(summary)
         except Exception as e:
             logger.warning(f"[BanditPipeline] Failed to print bandit summary: {e}")
+
+        # Save full summary + plotting data to JSON
+        try:
+            save_path = ray.get(self.bandit_actor.save_summary.remote())
+            if save_path:
+                logger.info(f"[BanditPipeline] Bandit summary saved to {save_path}")
+        except Exception as e:
+            logger.warning(f"[BanditPipeline] Failed to save bandit summary: {e}")
