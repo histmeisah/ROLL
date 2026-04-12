@@ -82,6 +82,17 @@ def create_local_dataset(
 
     logger.info(f"load dataset: {dataset_name}")
     if os.path.isdir(dataset_name):
+        # Detect HuggingFace `save_to_disk` format and use load_from_disk
+        # (the directory contains mixed .arrow + .json files which would
+        # otherwise fail the file-type uniformity check below).
+        if (
+            os.path.exists(os.path.join(dataset_name, "dataset_info.json"))
+            and os.path.exists(os.path.join(dataset_name, "state.json"))
+        ):
+            from datasets import load_from_disk
+            ds = load_from_disk(dataset_name)
+            logger.info(f"loaded HF save_to_disk dataset, len={len(ds)}")
+            return ds
         for file_name in os.listdir(dataset_name):
             data_files.append(os.path.join(dataset_name, file_name))
             if data_path is None:

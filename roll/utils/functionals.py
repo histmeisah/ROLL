@@ -438,7 +438,10 @@ def reduce_metrics(metrics: dict, reduce_func=np.mean) -> dict:
             if len(val) == 0:
                 continue
             agg_func = _parse_aggregation_func(key)
-            metrics[key] = float(agg_func(val))
+            try:
+                metrics[key] = float(agg_func(val))
+            except (ValueError, TypeError):
+                continue
         else:
             # Fallback for other types (e.g., single-element containers)
             metrics[key] = float(reduce_func(val))
@@ -531,6 +534,100 @@ def compute_gae_advantage_return(
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
 
         returns = advantages + values
+
+    return advantages, returns
+
+
+def compute_vtrace_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    current_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float = 0.99,
+    rho_bar: float = 1.0,
+    c_bar: float = 1.0,
+):
+    """Compute V-trace advantages and returns for off-policy correction.
+
+    V-trace is an off-policy actor-critic algorithm that uses truncated importance
+    sampling to correct for the difference between the behavior policy (that generated
+    the data) and the target policy (being learned).
+
+    Reference: "IMPALA: Scalable Distributed Deep-RL with Importance Weighted
+               Actor-Learner Architectures" (Espeholt et al., 2018)
+
+    Args:
+        token_level_rewards: shape (batch_size, seq_len) - Rewards at each token position
+        values: shape (batch_size, seq_len) - Value function estimates V(x_t)
+        old_log_probs: shape (batch_size, seq_len-1) - Log probs from behavior policy
+        current_log_probs: shape (batch_size, seq_len-1) - Log probs from target policy
+        response_mask: shape (batch_size, seq_len-1) - Mask for valid response tokens
+        gamma: Discount factor for future rewards
+        rho_bar: Truncation threshold for importance sampling ratio
+        c_bar: Truncation threshold for trace coefficient
+
+    Returns:
+        advantages: shape (batch_size, seq_len) - V-trace advantage estimates
+        returns: shape (batch_size, seq_len) - V-trace return estimates (target values)
+    """
+    batch_size, seq_len = token_level_rewards.shape
+
+    # Handle shape alignment for log_probs (they are usually seq_len-1)
+    if old_log_probs.shape[1] == seq_len - 1:
+        old_log_probs = torch.nn.functional.pad(old_log_probs, (0, 1), value=0.0)
+        current_log_probs = torch.nn.functional.pad(current_log_probs, (0, 1), value=0.0)
+        if response_mask.shape[1] == seq_len - 1:
+            response_mask = torch.nn.functional.pad(response_mask, (0, 1), value=0.0)
+
+    # Compute importance sampling ratios
+    log_rhos = current_log_probs - old_log_probs
+    rhos = torch.exp(log_rhos)
+
+    rho_bar_tensor = torch.tensor(rho_bar, device=rhos.device, dtype=rhos.dtype)
+    c_bar_tensor = torch.tensor(c_bar, device=rhos.device, dtype=rhos.dtype)
+
+    clipped_rhos = torch.minimum(rho_bar_tensor, rhos)
+    clipped_cs = torch.minimum(c_bar_tensor, rhos)
+
+    clipped_rhos = clipped_rhos * response_mask
+    clipped_cs = clipped_cs * response_mask
+    token_level_rewards = token_level_rewards * response_mask
+    values = values * response_mask
+
+    # Initialize V-trace targets
+    vs = torch.zeros_like(values)
+
+    for t in reversed(range(seq_len)):
+        if t == seq_len - 1:
+            next_values = torch.zeros_like(values[:, t])
+        else:
+            next_values = values[:, t + 1]
+
+        delta_t = clipped_rhos[:, t] * (
+            token_level_rewards[:, t] + gamma * next_values - values[:, t]
+        )
+
+        if t == seq_len - 1:
+            vs[:, t] = values[:, t] + delta_t
+        else:
+            vs[:, t] = values[:, t] + delta_t + gamma * clipped_cs[:, t] * (vs[:, t + 1] - values[:, t + 1])
+
+    # Compute advantages
+    advantages = torch.zeros_like(token_level_rewards)
+
+    for t in range(seq_len):
+        if t == seq_len - 1:
+            next_values = torch.zeros_like(values[:, t])
+        else:
+            next_values = vs[:, t + 1]
+
+        advantages[:, t] = clipped_rhos[:, t] * (
+            token_level_rewards[:, t] + gamma * next_values - values[:, t]
+        )
+
+    advantages = advantages * response_mask
+    returns = vs * response_mask
 
     return advantages, returns
 
@@ -825,8 +922,33 @@ def compute_advantage(
             advantages, returns = compute_reinforce_return(
                 token_level_rewards=token_level_rewards, gamma=gamma, lambd=lambd
             )
+        elif adv_estimator == "vtrace":
+            # V-trace requires both old and current log_probs
+            if "old_log_probs" not in data.batch:
+                raise ValueError("V-trace requires old_log_probs (behavior policy log probs) in data.batch")
+            if "log_probs" not in data.batch:
+                raise ValueError("V-trace requires log_probs (current policy log probs) in data.batch")
+
+            values = data.batch["values"].float()
+            data.batch["values"] = values * response_mask
+
+            vtrace_rho_bar = data.meta_info.get("vtrace_rho_bar", 1.0) if hasattr(data, "meta_info") and data.meta_info else 1.0
+            vtrace_c_bar = data.meta_info.get("vtrace_c_bar", 1.0) if hasattr(data, "meta_info") and data.meta_info else 1.0
+
+            logger.debug(f"V-trace parameters: rho_bar={vtrace_rho_bar}, c_bar={vtrace_c_bar}, gamma={gamma}")
+
+            advantages, returns = compute_vtrace_advantage_return(
+                token_level_rewards=token_level_rewards,
+                values=values,
+                old_log_probs=data.batch["old_log_probs"],
+                current_log_probs=data.batch["log_probs"],
+                response_mask=response_mask,
+                gamma=gamma,
+                rho_bar=vtrace_rho_bar,
+                c_bar=vtrace_c_bar,
+            )
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unknown advantage estimator: {adv_estimator}")
 
         data.batch["raw_advantages"] = advantages
 

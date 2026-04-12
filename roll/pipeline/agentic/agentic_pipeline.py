@@ -1,8 +1,10 @@
 import json
+import os
 import os.path
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import ray
@@ -32,6 +34,9 @@ from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     RunningMoments,
     agg_loss,
+    apply_kl_penalty,
+    compute_advantage,
+    compute_clip_fraction,
     compute_token_reward,
     masked_mean,
     reduce_metrics,
@@ -41,6 +46,29 @@ from roll.utils.train_infer_corrections import apply_train_infer_correction_to_b
 from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
 from roll.utils.offload_states import OffloadStateType
+
+# Optional imports for replay buffer features
+try:
+    from roll.pipeline.agentic.replay_buffer import (
+        create_replay_buffer,
+        detect_manager_type_from_config,
+        BaseReplayBuffer
+    )
+except ImportError:
+    create_replay_buffer = None
+    detect_manager_type_from_config = None
+    BaseReplayBuffer = None
+
+try:
+    from roll.pipeline.agentic.offpolicy_monitor import (
+        compute_offpolicy_metrics,
+        validate_replay_batch_fields,
+        log_offpolicy_diagnostics
+    )
+except ImportError:
+    compute_offpolicy_metrics = None
+    validate_replay_batch_fields = None
+    log_offpolicy_diagnostics = None
 
 
 logger = get_logger()
@@ -197,6 +225,40 @@ class AgenticPipeline(BasePipeline):
             self.set_checkpoint_clusters(self.actor_train)
 
         self.running = RunningMoments()
+
+        # Initialize replay buffer if enabled and available
+        self.replay_buffer: Optional[object] = None
+        self._priority_function = 'uniform'
+        if (create_replay_buffer is not None
+                and hasattr(self.pipeline_config, 'replay')
+                and getattr(self.pipeline_config.replay, 'enabled', False)):
+            rb_cfg = self.pipeline_config.replay
+            manager_type = detect_manager_type_from_config(self.pipeline_config)
+            batch_size = self.pipeline_config.rollout_batch_size if rb_cfg.use_rollout_batch_size else rb_cfg.minibatch_size
+            priority_function = getattr(rb_cfg, 'priority_function', 'uniform')
+            priority_exponent = getattr(rb_cfg, 'priority_exponent', 0.6)
+            self._priority_function = priority_function
+
+            logger.info(
+                f"Creating replay buffer: manager_type={manager_type}, capacity={rb_cfg.capacity}, "
+                f"priority_fn={priority_function}, priority_exponent={priority_exponent}"
+            )
+
+            self.replay_buffer = create_replay_buffer(
+                manager_type=manager_type,
+                capacity=rb_cfg.capacity,
+                batch_size=batch_size,
+                seed=self.pipeline_config.seed,
+                priority_function=priority_function,
+                priority_exponent=priority_exponent,
+                enable_nstep=getattr(rb_cfg, 'enable_nstep', False),
+                n_step=getattr(rb_cfg, 'n_step', 5),
+                gamma=getattr(rb_cfg, 'nstep_gamma', 0.99),
+                enable_age_decay=getattr(rb_cfg, 'enable_age_decay', False),
+                age_decay=getattr(rb_cfg, 'age_decay', 1000.0),
+                eviction_strategy=getattr(rb_cfg, 'eviction_strategy', 'fifo'),
+            )
+            logger.info(f"Successfully initialized replay buffer: {type(self.replay_buffer).__name__}")
 
         # Validate partial GPU mode configuration and set self.partial_gpu_mode
         if self.pipeline_config.partial_gpu_mode:
