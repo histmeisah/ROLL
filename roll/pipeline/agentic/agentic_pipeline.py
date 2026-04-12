@@ -239,9 +239,11 @@ class AgenticPipeline(BasePipeline):
             priority_exponent = getattr(rb_cfg, 'priority_exponent', 0.6)
             self._priority_function = priority_function
 
+            group_level = getattr(rb_cfg, 'group_level', True)
             logger.info(
                 f"Creating replay buffer: manager_type={manager_type}, capacity={rb_cfg.capacity}, "
-                f"priority_fn={priority_function}, priority_exponent={priority_exponent}"
+                f"priority_fn={priority_function}, priority_exponent={priority_exponent}, "
+                f"group_level={group_level}"
             )
 
             self.replay_buffer = create_replay_buffer(
@@ -257,6 +259,7 @@ class AgenticPipeline(BasePipeline):
                 enable_age_decay=getattr(rb_cfg, 'enable_age_decay', False),
                 age_decay=getattr(rb_cfg, 'age_decay', 1000.0),
                 eviction_strategy=getattr(rb_cfg, 'eviction_strategy', 'fifo'),
+                group_level=group_level,
             )
             logger.info(f"Successfully initialized replay buffer: {type(self.replay_buffer).__name__}")
 
@@ -399,6 +402,15 @@ class AgenticPipeline(BasePipeline):
                             logger.info(f"Shrink sampler: {shrink_metrics}")
                             metrics.update({"shrink/" + k: v for k, v in shrink_metrics.items()})
                         metrics["time/step_shrink"] = shrink_timer.last
+
+                    # PHASE 10: Push to replay buffer (before reward norm, store raw rollout data)
+                    if self.replay_buffer is not None:
+                        with Timer(name="replay_push", logger=None) as replay_push_timer:
+                            self.replay_buffer.push_from_dataproto(batch, global_step)
+                            rb_stats = self.replay_buffer.get_stats()
+                            metrics["replay/buffer_utilization"] = rb_stats.get("utilization", 0.0)
+                            metrics["replay/num_groups"] = rb_stats.get("num_groups", rb_stats.get("current_size", 0))
+                        metrics["time/step_replay_push"] = replay_push_timer.last
 
                     batch = compute_discounted_returns(batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma)
 
@@ -564,6 +576,137 @@ class AgenticPipeline(BasePipeline):
                             metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
                         tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
                     metrics["time/step_train"] = train_timer.last
+
+                    # PHASE 15: Replay buffer training (extra off-policy training steps)
+                    if self.replay_buffer is not None and self.pipeline_config.critic_warmup <= global_step:
+                        rb_cfg = self.pipeline_config.replay
+                        train_steps = getattr(rb_cfg, 'train_steps_per_env_step', 1)
+                        # Determine number of groups to sample
+                        # For GroupReplayBuffer: batch_size = number of groups
+                        # Actual trajectories = num_groups × group_size
+                        group_size = self.pipeline_config.train_env_manager.group_size
+                        num_groups_to_sample = self.pipeline_config.rollout_batch_size // max(group_size, 1)
+
+                        with Timer(name="replay_train", logger=None) as replay_train_timer:
+                            for replay_step in range(train_steps):
+                                if not self.replay_buffer.can_sample(num_groups_to_sample):
+                                    logger.info(
+                                        f"Replay buffer insufficient for sampling "
+                                        f"(need {num_groups_to_sample} groups), skipping replay step {replay_step}"
+                                    )
+                                    break
+
+                                # Sample from replay buffer
+                                replay_result = self.replay_buffer.sample_for_training(
+                                    batch_size=num_groups_to_sample,
+                                    device='cpu',
+                                    sequence_length=batch.batch["input_ids"].shape[1],
+                                    sample_method=getattr(rb_cfg, 'sample_method', 'uniform'),
+                                    candidates_per_group=getattr(rb_cfg, 'candidates_per_group', 1),
+                                    group_sampling=getattr(rb_cfg, 'group_sampling', 'uniform'),
+                                    compute_importance_weights=(
+                                        getattr(rb_cfg, 'importance_sampling_correction', False)
+                                    ),
+                                    importance_weight_beta=getattr(rb_cfg, 'importance_beta', 0.4),
+                                )
+                                if replay_result is None or replay_result[0] is None:
+                                    logger.debug(f"Replay sampling returned None at step {replay_step}")
+                                    break
+
+                                replay_batch, sampled_indices = replay_result
+                                replay_batch.meta_info["global_step"] = global_step
+                                replay_batch.meta_info["_broadcast_non_tensor_batch"] = True
+                                replay_batch.meta_info["loss_mask_keys"] = ["response_mask"]
+                                replay_batch.meta_info["is_offload_states"] = False
+
+                                # Replay batch goes through the same pipeline: reward norm → advantage → train
+                                replay_batch = compute_discounted_returns(
+                                    replay_batch, self.pipeline_config.adv_estimator,
+                                    self.pipeline_config.step_reward_gamma
+                                )
+                                replay_batch = self.adjust_batch(
+                                    replay_batch, mode=self.pipeline_config.batch_adjust_mode
+                                )
+
+                                # Recompute old_log_probs for replay data (off-policy)
+                                if self.pipeline_config.enable_old_logprobs_recompute:
+                                    batch_balance(replay_batch, dp_size=self.actor_train.dp_size,
+                                                  minibatch_size=len(replay_batch))
+                                    old_lp: DataProto = self.actor_train.compute_log_probs(
+                                        replay_batch, blocking=True
+                                    )
+                                    replay_batch.batch["old_log_probs"] = old_lp.batch["log_probs"]
+                                else:
+                                    replay_batch.batch["old_log_probs"] = torch.zeros_like(
+                                        replay_batch.batch["attention_mask"][:, 1:]
+                                    )
+
+                                # Reference log probs for KL
+                                if not self.pipeline_config.enable_reference:
+                                    replay_batch.batch["ref_log_probs"] = replay_batch.batch["old_log_probs"].clone()
+                                elif self.use_ref_model:
+                                    batch_balance(replay_batch, dp_size=self.reference.dp_size,
+                                                  minibatch_size=len(replay_batch))
+                                    ref_lp_refs = self.reference.compute_log_probs(replay_batch, blocking=False)
+                                    ref_lp = DataProto.materialize_concat(data_refs=ref_lp_refs)
+                                    replay_batch.batch["ref_log_probs"] = ref_lp.batch["log_probs"]
+                                else:
+                                    replay_batch.meta_info["disable_adapter"] = True
+                                    batch_balance(replay_batch, dp_size=self.actor_train.dp_size,
+                                                  minibatch_size=len(replay_batch))
+                                    ref_lp_refs = self.actor_train.compute_log_probs(replay_batch, blocking=False)
+                                    ref_lp = DataProto.materialize_concat(data_refs=ref_lp_refs)
+                                    replay_batch.batch["ref_log_probs"] = ref_lp.batch["log_probs"]
+                                    replay_batch.meta_info["disable_adapter"] = False
+
+                                # Reward normalization (group structure preserved by GroupReplayBuffer)
+                                replay_batch, _ = compute_response_level_rewards(
+                                    batch=replay_batch, pipeline_config=self.pipeline_config
+                                )
+                                replay_batch, _ = compute_token_reward(
+                                    replay_batch, self.pipeline_config, self.kl_ctrl
+                                )
+
+                                # Advantage computation
+                                replay_batch = agentic_compute_advantage(
+                                    data=replay_batch,
+                                    gamma=self.pipeline_config.gamma,
+                                    lambd=self.pipeline_config.lambd,
+                                    adv_estimator=self.pipeline_config.adv_estimator,
+                                    advantage_clip=self.pipeline_config.advantage_clip,
+                                    whiten_advantages=self.pipeline_config.whiten_advantages,
+                                    whiten_rewards=self.pipeline_config.whiten_rewards,
+                                    pipeline_config=self.pipeline_config,
+                                )
+
+                                if self.pipeline_config.enable_old_logprobs_recompute:
+                                    replay_batch, _ = apply_train_infer_correction_to_batch(
+                                        self.pipeline_config, replay_batch,
+                                        update_mask_keys=replay_batch.meta_info['loss_mask_keys']
+                                    )
+
+                                # Actor training on replay data
+                                batch_balance(replay_batch, dp_size=self.actor_train.dp_size,
+                                    minibatch_size=self.actor_train.dp_size *
+                                    self.pipeline_config.actor_train.training_args.per_device_train_batch_size *
+                                    self.pipeline_config.actor_train.training_args.gradient_accumulation_steps,
+                                    logging_prefix="global_seqlen/replay_train")
+                                replay_train_refs = self.actor_train.train_step(replay_batch, blocking=False)
+                                replay_train_result = DataProto.materialize_concat(data_refs=replay_train_refs)
+                                replay_metrics = reduce_metrics(
+                                    replay_train_result.meta_info.pop("metrics", {})
+                                )
+                                metrics.update({
+                                    f"replay/{k}": v for k, v in replay_metrics.items()
+                                })
+
+                                logger.info(
+                                    f"Replay train step {replay_step}/{train_steps}: "
+                                    f"{replay_batch.batch['input_ids'].shape[0]} trajectories"
+                                )
+
+                        metrics["time/step_replay_train"] = replay_train_timer.last
+                        metrics["replay/train_steps"] = train_steps
 
                 with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
                     data_metrics = compute_train_data_metrics(batch=batch)

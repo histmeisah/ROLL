@@ -1,6 +1,7 @@
 from .base_buffer import BaseReplayBuffer
 from .trajectory_buffer import TrajectoryReplayBuffer, TrajectoryEntry
 from .step_buffer import StepReplayBuffer, StepEntry
+from .group_buffer import GroupReplayBuffer, TrajectoryGroup
 from .buffer_factory import create_replay_buffer, detect_manager_type_from_config
 from .segment_tree import SegmentTree, SumSegmentTree, MinSegmentTree, next_power_of_2
 from .priority_functions import (
@@ -21,6 +22,8 @@ __all__ = [
     "BaseReplayBuffer",
     "TrajectoryReplayBuffer",
     "TrajectoryEntry",
+    "GroupReplayBuffer",
+    "TrajectoryGroup",
     "StepReplayBuffer",
     "StepEntry",
     "create_replay_buffer",

@@ -167,7 +167,15 @@ class OffPolicyMonitorConfig:
 @dataclass
 class ReplayConfig:
     enabled: bool = field(default=False, metadata={"help": "Enable replay buffer for agentic training."})
-    capacity: int = field(default=1000000, metadata={"help": "Max number of step transitions stored in replay buffer."})
+    group_level: bool = field(
+        default=True,
+        metadata={
+            "help": "Use GroupReplayBuffer (store/sample by traj_group_id). "
+                    "Required for GRPO (group_size>1) to preserve group structure. "
+                    "When group_size=1, degrades to per-trajectory replay."
+        }
+    )
+    capacity: int = field(default=1000000, metadata={"help": "Max number of groups (group_level=True) or trajectories stored."})
     min_size: int = field(default=2000, metadata={"help": "Minimum step transitions before sampling is allowed."})
     train_steps_per_env_step: int = field(default=1, metadata={"help": "Number of training steps per rollout step when replay is enabled."})
 

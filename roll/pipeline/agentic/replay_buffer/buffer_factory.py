@@ -11,6 +11,7 @@ from functools import partial
 from .base_buffer import BaseReplayBuffer
 from .trajectory_buffer import TrajectoryReplayBuffer
 from .step_buffer import StepReplayBuffer
+from .group_buffer import GroupReplayBuffer
 from .priority_functions import PRIORITY_FUNCTIONS, get_priority_function
 from roll.utils.logging import get_logger
 
@@ -30,6 +31,7 @@ def create_replay_buffer(
     enable_age_decay: bool = False,
     age_decay: float = 1000.0,
     eviction_strategy: str = "fifo",
+    group_level: bool = False,
     **kwargs
 ) -> BaseReplayBuffer:
     """
@@ -45,6 +47,7 @@ def create_replay_buffer(
         enable_age_decay: Whether to enable age-based freshness weighting (default False for standard PER)
         age_decay: Age decay constant for freshness weighting (only used if enable_age_decay=True)
         eviction_strategy: "fifo" (default) or "smart"
+        group_level: If True, use GroupReplayBuffer (stores/samples by traj_group_id, GRPO-compatible)
 
     Returns:
         Appropriate replay buffer instance
@@ -57,6 +60,23 @@ def create_replay_buffer(
     except ValueError as e:
         logger.warning(f"{e}. Falling back to uniform priority.")
         priority_fn = get_priority_function("uniform")
+
+    if group_level and manager_type == "trajectory":
+        logger.info(
+            f"Creating GroupReplayBuffer: capacity={capacity} groups, "
+            f"priority_fn={priority_function}, priority_exponent={priority_exponent}, "
+            f"enable_age_decay={enable_age_decay}, age_decay={age_decay}, eviction={eviction_strategy}"
+        )
+        return GroupReplayBuffer(
+            capacity=capacity,
+            batch_size=batch_size,
+            seed=seed,
+            priority_fn=priority_fn,
+            priority_exponent=priority_exponent,
+            enable_age_decay=enable_age_decay,
+            age_decay=age_decay,
+            eviction_strategy=eviction_strategy,
+        )
 
     if manager_type == "trajectory":
         logger.info(
