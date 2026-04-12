@@ -270,11 +270,18 @@ class EncoderActor:
             return self._encode_qwen3_vl_transformers(input_dict)
 
     def _encode_qwen3_vl_transformers(self, input_dict: Dict[str, Any]) -> np.ndarray:
-        """Encode using transformers AutoModel fallback."""
+        """Encode using transformers AutoModel fallback.
+
+        For Qwen3-VL models, image inputs must be formatted through the chat
+        template so that proper vision placeholder tokens (e.g.
+        ``<|vision_start|>...<|vision_end|>``) are inserted into the text.
+        Passing raw text + images directly to the processor causes a mismatch
+        between image features and image tokens.
+        """
         import torch
         from PIL import Image
 
-        text = input_dict.get("text", "")
+        text = input_dict.get("text", "") or ""
         images = None
 
         # Handle image input
@@ -289,12 +296,31 @@ class EncoderActor:
             else:
                 images = [img]
 
-        inputs = self._processor(
-            text=[text] if text else None,
-            images=images,
-            return_tensors="pt",
-            padding=True,
-        ).to(self.device)
+        if images is not None:
+            # Build a chat-formatted message so the processor inserts the
+            # correct vision placeholder tokens into the tokenized text.
+            content = [{"type": "image", "image": img} for img in images]
+            if text:
+                content.append({"type": "text", "text": text})
+            messages = [{"role": "user", "content": content}]
+            chat_text = self._processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            inputs = self._processor(
+                text=[chat_text],
+                images=images,
+                return_tensors="pt",
+                padding=True,
+            ).to(self.device)
+        else:
+            # Text-only: no vision tokens needed
+            if not text:
+                text = " "
+            inputs = self._processor(
+                text=[text],
+                return_tensors="pt",
+                padding=True,
+            ).to(self.device)
 
         with torch.no_grad():
             outputs = self._model(**inputs)

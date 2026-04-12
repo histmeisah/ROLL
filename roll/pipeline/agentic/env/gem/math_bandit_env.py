@@ -122,13 +122,24 @@ class MathBanditEnv(MathEnv):
         encoder_input = _obs_to_encoder_input(obs)
         context_bytes = ray.get(self.encoder_actor.encode.remote(encoder_input))
         self._current_context_bytes = context_bytes
-        self._current_problem_text = obs if isinstance(obs, str) else str(obs)[:300]
+        # Extract a short text snippet for logging — handle dict (multimodal)
+        # observations by pulling out the text field.
+        if isinstance(obs, str):
+            self._current_problem_text = obs
+        elif isinstance(obs, dict):
+            text_field = obs.get("prompt") or obs.get("text") or ""
+            self._current_problem_text = str(text_field)[:300]
+        else:
+            self._current_problem_text = str(obs)[:300]
 
         # Select prompt via bandit
         selection = ray.get(self.bandit_actor.select_arm.remote(context_bytes))
         self._current_arm_idx = selection["arm_idx"]
 
-        # Get prompt templates from bandit config
+        # Get prompt templates from bandit config.
+        # Templates are used as system prompts (replacing the default system prompt).
+        # The pipeline adds the original system prompt as the last candidate, so the
+        # bandit can also choose to use the default.
         prompt_templates = self._bandit_config.get("prompt_templates", [])
         if self._current_arm_idx < len(prompt_templates):
             prompt_text = prompt_templates[self._current_arm_idx]
@@ -139,8 +150,12 @@ class MathBanditEnv(MathEnv):
                 f"(n_templates={len(prompt_templates)}), using empty prompt"
             )
 
-        # Inject prompt via env_instruction
-        info["env_instruction"] = prompt_text
+        # Override the system prompt with the bandit-selected prompt.
+        # TrajEnvManager checks this key and uses it instead of agent_system_template.
+        info["system_prompt_override"] = prompt_text
+        # Remove the empty env_instruction from base MathEnv to avoid prepending
+        # a stray newline to the user message.
+        info.pop("env_instruction", None)
 
         logger.debug(
             f"[MathBanditEnv] Selected prompt {self._current_arm_idx} "

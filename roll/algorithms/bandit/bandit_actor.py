@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .neural_linear_ucb import NeuralLinearUCB
 from .neural_linear_ts import NeuralLinearTS
+from .cosine_similarity_bandit import CosineSimilarityBandit
 from .prompt_monitor import PromptMonitor
 
 logger = logging.getLogger(__name__)
@@ -46,8 +47,10 @@ class BanditActor:
         bandit_kwargs: Dict[str, Any],
         prompt_names: List[str],
         enable_monitoring: bool = True,
-        device: str = "cpu",  # Use CPU since BanditActor runs without GPU allocation
-        bandit_algorithm: str = "ts",  # "ucb" or "ts" (Thompson Sampling)
+        device: str = "cpu",
+        bandit_algorithm: str = "ts",  # "ts", "ucb", or "cosine"
+        warmup_episodes: int = 500,
+        prompt_embeddings: Optional[np.ndarray] = None,
     ):
         """
         Initialize centralized bandit.
@@ -63,9 +66,17 @@ class BanditActor:
             prompt_names: Names of prompts (for monitoring)
             enable_monitoring: Enable performance monitoring
             device: Device for computation
-            bandit_algorithm: Algorithm variant - "ts" (Thompson Sampling,
-                recommended, Riquelme et al. ICLR 2018) or "ucb"
-                (Upper Confidence Bound, Xu et al. ICLR 2022)
+            bandit_algorithm: Algorithm variant:
+                - "ts": Thompson Sampling (recommended, Riquelme et al. ICLR 2018)
+                - "ucb": Upper Confidence Bound (Xu et al. ICLR 2022)
+                - "cosine": Cosine similarity baseline (no learning, ablation)
+            warmup_episodes: Number of initial episodes using uniform random
+                arm selection. Ensures each arm gets sufficient data before
+                the bandit algorithm takes over. Set to 0 to disable.
+                Ignored for cosine algorithm (no learning needed).
+            prompt_embeddings: Pre-computed prompt embeddings for cosine
+                algorithm, shape (n_prompts, context_dim). Required when
+                bandit_algorithm="cosine".
         """
         self.n_prompts = n_prompts
         self.context_dim = context_dim
@@ -74,15 +85,25 @@ class BanditActor:
         self.bandit_algorithm = bandit_algorithm
 
         # Select bandit algorithm
-        bandit_cls = NeuralLinearTS if bandit_algorithm == "ts" else NeuralLinearUCB
-        self.bandit = bandit_cls(
-            n_arms=n_prompts,
-            context_dim=context_dim,
-            hidden_dims=hidden_dims,
-            exploration_param=exploration_param,
-            device=device,
-            **bandit_kwargs
-        )
+        if bandit_algorithm == "cosine":
+            if prompt_embeddings is None:
+                raise ValueError("prompt_embeddings required for cosine algorithm")
+            self.bandit = CosineSimilarityBandit(
+                n_arms=n_prompts,
+                context_dim=context_dim,
+                prompt_embeddings=prompt_embeddings,
+                device=device,
+            )
+        else:
+            bandit_cls = NeuralLinearTS if bandit_algorithm == "ts" else NeuralLinearUCB
+            self.bandit = bandit_cls(
+                n_arms=n_prompts,
+                context_dim=context_dim,
+                hidden_dims=hidden_dims,
+                exploration_param=exploration_param,
+                device=device,
+                **bandit_kwargs
+            )
 
         # Initialize monitoring
         self.enable_monitoring = enable_monitoring
@@ -97,7 +118,7 @@ class BanditActor:
         # Statistics
         self.total_selections = 0
         self.update_counter = 0
-        self.update_freq = bandit_kwargs.get("update_freq", 10)
+        self.warmup_episodes = warmup_episodes
 
         # JSONL episode logging
         self.log_dir = None
@@ -106,7 +127,8 @@ class BanditActor:
         logger.info(
             f"[BanditActor] Initialized with {n_prompts} prompts, "
             f"algorithm={bandit_algorithm}, context_dim={context_dim}, "
-            f"exploration_param={exploration_param}"
+            f"exploration_param={exploration_param}, "
+            f"warmup_episodes={warmup_episodes}"
         )
 
     def set_log_dir(self, log_dir: str) -> None:
@@ -182,25 +204,35 @@ class BanditActor:
                 f"Expected context shape ({self.context_dim},), got {context.shape}"
             )
 
-        # Select arm using NeuralLinearUCB
-        arm_idx = self.bandit.select_arm(context)
+        # During warmup: uniform random selection to gather initial data for all arms.
+        # After warmup: use the bandit algorithm (TS or UCB).
+        if self.total_selections < self.warmup_episodes:
+            arm_idx = int(self.total_selections % self.n_prompts)
+        else:
+            arm_idx = self.bandit.select_arm(context)
 
-        # Compute UCB components for monitoring
-        with torch.no_grad():
-            context_tensor = torch.from_numpy(context).float().to(self.device).unsqueeze(0)
-            network = self.bandit.networks[arm_idx]
-            predicted_reward = network(context_tensor).item()
-            features = network.get_features(context_tensor).squeeze()
-            confidence = self.bandit.exploration_param * torch.sqrt(
-                torch.matmul(
+        # Compute monitoring metrics (algorithm-dependent)
+        if self.bandit_algorithm == "cosine":
+            similarities = self.bandit.get_similarities(context)
+            predicted_reward = float(similarities[arm_idx])
+            confidence = 0.0
+            ucb_value = predicted_reward
+        else:
+            with torch.no_grad():
+                context_tensor = torch.from_numpy(context).float().to(self.device).unsqueeze(0)
+                network = self.bandit.networks[arm_idx]
+                predicted_reward = network(context_tensor).item()
+                features = network.get_features(context_tensor).squeeze()
+                confidence = self.bandit.exploration_param * torch.sqrt(
                     torch.matmul(
-                        features.unsqueeze(0),
-                        self.bandit.A_inv[arm_idx]
-                    ),
-                    features.unsqueeze(1)
-                )
-            ).item()
-            ucb_value = predicted_reward + confidence
+                        torch.matmul(
+                            features.unsqueeze(0),
+                            self.bandit.A_inv[arm_idx]
+                        ),
+                        features.unsqueeze(1)
+                    )
+                ).item()
+                ucb_value = predicted_reward + confidence
 
         self.total_selections += 1
 
@@ -233,22 +265,27 @@ class BanditActor:
 
         # Update monitoring
         if self.enable_monitoring:
-            # Recompute UCB info for logging
-            with torch.no_grad():
-                context_tensor = torch.from_numpy(context).float().to(self.device).unsqueeze(0)
-                network = self.bandit.networks[arm_idx]
-                predicted_reward = network(context_tensor).item()
-                features = network.get_features(context_tensor).squeeze()
-                confidence = self.bandit.exploration_param * torch.sqrt(
-                    torch.matmul(
+            if self.bandit_algorithm == "cosine":
+                similarities = self.bandit.get_similarities(context)
+                predicted_reward = float(similarities[arm_idx])
+                confidence = 0.0
+                ucb_value = predicted_reward
+            else:
+                with torch.no_grad():
+                    context_tensor = torch.from_numpy(context).float().to(self.device).unsqueeze(0)
+                    network = self.bandit.networks[arm_idx]
+                    predicted_reward = network(context_tensor).item()
+                    features = network.get_features(context_tensor).squeeze()
+                    confidence = self.bandit.exploration_param * torch.sqrt(
                         torch.matmul(
-                            features.unsqueeze(0),
-                            self.bandit.A_inv[arm_idx]
-                        ),
-                        features.unsqueeze(1)
-                    )
-                ).item()
-                ucb_value = predicted_reward + confidence
+                            torch.matmul(
+                                features.unsqueeze(0),
+                                self.bandit.A_inv[arm_idx]
+                            ),
+                            features.unsqueeze(1)
+                        )
+                    ).item()
+                    ucb_value = predicted_reward + confidence
 
             self.monitor.log_episode(
                 episode=self.update_counter,
@@ -269,73 +306,13 @@ class BanditActor:
 
         self.update_counter += 1
 
-        # Periodically train networks
-        train_info = {}
-        if self.update_counter % self.update_freq == 0:
-            train_info = self._train_networks()
+        # Network training is handled internally by NeuralLinearUCB.update()
+        # (called via self.bandit.update above) every update_freq steps.
+        # No additional training needed here.
 
         return {
             "update_count": self.update_counter,
-            "train_triggered": bool(train_info),
-            **train_info
         }
-
-    def _train_networks(self) -> Dict[str, Any]:
-        """
-        Train neural networks using experience replay buffers.
-
-        Returns:
-            Training statistics
-        """
-        losses = []
-
-        for arm_idx in range(self.bandit.n_arms):
-            buffer = self.bandit.buffers[arm_idx]
-
-            # Skip if not enough data
-            if len(buffer) < self.bandit.batch_size:
-                continue
-
-            # Sample from buffer
-            samples = list(buffer)
-            batch_size = min(self.bandit.batch_size, len(samples))
-            indices = torch.randperm(len(samples))[:batch_size]
-            batch = [samples[i] for i in indices]
-
-            # Prepare batch - convert numpy arrays to tensors if needed
-            contexts = torch.stack([
-                torch.from_numpy(s[0]).float() if isinstance(s[0], np.ndarray) else s[0]
-                for s in batch
-            ]).to(self.device)
-            rewards = torch.tensor([s[1] for s in batch], dtype=torch.float32).to(self.device)
-
-            # Train network
-            network = self.bandit.networks[arm_idx]
-            optimizer = self.bandit.optimizers[arm_idx]
-
-            optimizer.zero_grad()
-            predictions = network(contexts).squeeze()
-            loss = torch.nn.functional.mse_loss(predictions, rewards)
-
-            # Add L2 regularization
-            l2_loss = sum(p.pow(2.0).sum() for p in network.parameters())
-            total_loss = loss + self.bandit.reg_param * l2_loss
-
-            total_loss.backward()
-            optimizer.step()
-
-            losses.append(loss.item())
-
-        if losses:
-            return {
-                "mean_loss": sum(losses) / len(losses),
-                "num_arms_trained": len(losses),
-            }
-        else:
-            return {
-                "mean_loss": 0.0,
-                "num_arms_trained": 0,
-            }
 
     def get_statistics(self) -> Dict[str, Any]:
         """

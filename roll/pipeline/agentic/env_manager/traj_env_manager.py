@@ -260,9 +260,13 @@ class TrajEnvManager(BaseEnvManager):
         messages = []
         user_content = ""
         if content["actions_left"] == self.env_config.max_steps:
-            messages.append({"role": "system", "content": self.agent_system_template})
+            # Allow env to override the system prompt (e.g., bandit prompt selection)
+            system_prompt = history.history[0].get(
+                "system_prompt_override", self.agent_system_template
+            )
+            messages.append({"role": "system", "content": system_prompt})
             if "env_instruction" in history.history[0]:
-                user_content =  f"{history.history[0]['env_instruction']}\n"
+                user_content = f"{history.history[0]['env_instruction']}\n"
         if len(self.rollout_cache.history) > 1 and self.rollout_cache.history[-2].get("use_tool", False):
             messages.append({"role": "tool", "content": content["observation"]})
         else:

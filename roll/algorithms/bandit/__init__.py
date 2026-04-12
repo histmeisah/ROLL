@@ -10,6 +10,7 @@ Based on: "Neural Contextual Bandits with Deep Representation and Shallow Explor
 
 from .neural_linear_ucb import NeuralLinearUCB
 from .neural_linear_ts import NeuralLinearTS
+from .cosine_similarity_bandit import CosineSimilarityBandit
 from .base_bandit import BaseContextualBandit
 from .bandit_reinforce_plus import (
     BanditReinforcePlusPlus,
@@ -29,6 +30,7 @@ __all__ = [
     "BaseContextualBandit",
     "NeuralLinearUCB",
     "NeuralLinearTS",
+    "CosineSimilarityBandit",
     "BanditReinforcePlusPlus",
     "create_bandit_reinforce_from_preset",
     "create_bandit_reinforce_from_names",

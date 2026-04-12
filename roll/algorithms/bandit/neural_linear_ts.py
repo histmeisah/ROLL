@@ -166,6 +166,17 @@ class NeuralLinearTS(NeuralLinearUCB):
 
         This gives posterior mean μ_a = A_a⁻¹ · b_a at any point.
 
+        Known limitation (consistent with Riquelme et al. ICLR 2018):
+          When the neural network is retrained (every ``update_freq`` steps),
+          the feature mapping φ(x) changes, but A_inv and b retain statistics
+          computed under the *old* features. This creates a transient mismatch
+          in the posterior μ = A⁻¹·b. The mismatch is bounded because:
+          (1) network updates are small (10 SGD steps on a mini-batch), and
+          (2) A_inv is continuously updated with new features after retraining.
+          A full fix would require recomputing A_inv and b from the replay buffer
+          after each network retrain, at O(n·d²) cost per arm. This is a
+          potential optimization for future work.
+
         Args:
             arm: The arm that was pulled
             context: The context when the arm was pulled

@@ -1,0 +1,323 @@
+# VLM Mathematical Reasoning Prompt Templates
+# Based on: LLaVA-CoT, VL-Rethinker, CCoT, R1-Onevision, DVLR
+#
+# Key difference from LLM prompts: these are SYSTEM prompts (not appended to problem).
+# The problem text + image are provided separately as user message.
+# Template uses {problem} placeholder for system-level instruction.
+
+prompts:
+  # ============================================================================
+  # R1-Style Standard Prompts (VLM-R1, Vision-R1 community standard)
+  # ============================================================================
+  - name: r1_standard
+    template: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, i.e., <think> reasoning process here </think><answer> answer here </answer>."
+    description: "Standard R1-style VLM reasoning prompt used by VLM-R1 and Vision-R1"
+    category: r1_style
+    paper_reference: "VLM-R1 (2025), Vision-R1 (2025)"
+    expected_performance: "community_baseline"
+
+  - name: r1_concise
+    template: "You are a helpful assistant. You first think about the reasoning process in the mind and then provide the user with the answer. Show your work in <think> </think> tags and return the answer in <answer> </answer> tags."
+    description: "Concise R1-style prompt from Groundlight r1_vlm"
+    category: r1_style
+    paper_reference: "r1_vlm (Groundlight, 2025)"
+    expected_performance: "competitive"
+
+  - name: r1_math_expert
+    template: "You are a math expert. When given a math problem with an image, carefully analyze the visual information and solve it step by step. Enclose your reasoning in <think> </think> and your final answer in <answer> </answer> tags."
+    description: "R1-style with math expert role"
+    category: r1_style
+    expected_performance: "competitive"
+
+  # ============================================================================
+  # Describe-then-Solve Prompts (LLaVA-CoT style)
+  # ============================================================================
+  - name: describe_then_solve
+    template: "You are a visual math reasoning assistant. When solving problems, follow these stages:\n<SUMMARY> Summarize your approach and the steps you will take. </SUMMARY>\n<CAPTION> Describe the image in detail, focusing on aspects relevant to the question. </CAPTION>\n<REASONING> Provide step-by-step logical reasoning to solve the problem. </REASONING>\n<CONCLUSION> State the final answer clearly. </CONCLUSION>"
+    description: "LLaVA-CoT 4-stage structured reasoning: summarize, describe image, reason, conclude"
+    category: describe_then_solve
+    paper_reference: "LLaVA-CoT (ICCV 2025)"
+    expected_performance: "best_for_visual_heavy"
+
+  - name: caption_first
+    template: "You are a visual math solver. First, carefully describe what you see in the image, identifying all relevant mathematical elements (numbers, shapes, labels, relationships). Then, use your description to solve the problem step by step. Put your final answer in <answer> </answer> tags."
+    description: "Describe image first then solve, simpler than full LLaVA-CoT"
+    category: describe_then_solve
+    expected_performance: "good_for_geometry"
+
+  - name: visual_extraction
+    template: "You are a precise visual math solver. Before solving, extract all mathematical information from the image:\n- Numbers and labels\n- Geometric shapes and their properties\n- Relationships between elements\nThen solve using the extracted information. Show reasoning in <think> </think> and answer in <answer> </answer>."
+    description: "Explicit visual information extraction before solving"
+    category: describe_then_solve
+    expected_performance: "reduces_visual_errors"
+
+  # ============================================================================
+  # Geometry-Specific Prompts
+  # ============================================================================
+  - name: geometry_expert
+    template: "You are an expert geometry solver. When analyzing geometric figures:\n1. Identify all labeled angles, sides, and their measurements\n2. Identify geometric relationships (parallel, perpendicular, congruent, supplementary, etc.)\n3. Determine which theorems apply (angle sum, Pythagorean, similarity, etc.)\n4. Solve step by step\nPut your reasoning in <think> </think> and final answer in <answer> </answer>."
+    description: "Geometry-specific prompt with structured analysis steps"
+    category: geometry
+    paper_reference: "Inspired by DVLR (ICCV 2025)"
+    expected_performance: "best_for_geometry"
+
+  - name: geometry_theorem
+    template: "You are a geometry reasoning assistant. For each problem:\n- State the Given information from the figure\n- State what you need to Find\n- Identify the relevant Theorem or property\n- Apply it step by step to reach the Solution\n- Provide the final Answer\nUse <think> </think> for your work and <answer> </answer> for the final answer."
+    description: "Given-Find-Theorem-Solution structured geometry approach"
+    category: geometry
+    expected_performance: "structured_geometry"
+
+  - name: geometry_predicates
+    template: "You are an AI mathematician specializing in geometry. Analyze the geometric figure in the image and identify all geometric predicates: points, lines, angles, circles, and their relationships. Then use these predicates to formally reason about the problem and derive the answer. Show reasoning in <think> </think> and answer in <answer> </answer>."
+    description: "Formal geometric predicate extraction and reasoning"
+    category: geometry
+    paper_reference: "GeoCoder / Formal Geometry (2025)"
+    expected_performance: "good_for_formal"
+
+  # ============================================================================
+  # Chain-of-Thought Prompts (VLM-adapted)
+  # ============================================================================
+  - name: vlm_cot_classic
+    template: "You are a helpful math assistant. Look at the image carefully and solve the problem step by step. Show your complete reasoning process and provide the final answer. Put your thinking in <think> </think> and answer in <answer> </answer>."
+    description: "Classic CoT adapted for VLM with image awareness"
+    category: chain_of_thought
+    expected_performance: "solid_baseline"
+
+  - name: vlm_cot_careful
+    template: "You are a careful math problem solver. Examine the image closely, paying attention to every detail. Think through the problem carefully step by step, making sure not to miss any information from the figure. Put your reasoning in <think> </think> and final answer in <answer> </answer>."
+    description: "Emphasis on careful visual examination"
+    category: chain_of_thought
+    expected_performance: "reduces_careless_errors"
+
+  - name: vlm_cot_ape
+    template: "You are a visual math reasoning expert. Let's work this out in a step by step way to be sure we have the right answer. First examine the image, then solve the problem systematically. Put your reasoning in <think> </think> and answer in <answer> </answer>."
+    description: "APE-style optimal CoT trigger adapted for VLM"
+    category: chain_of_thought
+    paper_reference: "Adapted from Zhou et al., 2022 (APE)"
+    expected_performance: "best_zero_shot"
+
+  # ============================================================================
+  # Plan-and-Solve Prompts (VLM-adapted)
+  # ============================================================================
+  - name: vlm_plan_and_solve
+    template: "You are a systematic math problem solver. For each problem:\n1. Examine the image and understand what is shown\n2. Identify the key information and what needs to be found\n3. Devise a plan to solve it\n4. Execute the plan step by step\n5. State your final answer\nPut your work in <think> </think> and answer in <answer> </answer>."
+    description: "Plan-and-Solve adapted for visual math problems"
+    category: plan_and_solve
+    paper_reference: "Adapted from Wang et al., 2023 (PS+)"
+    expected_performance: "good_for_complex"
+
+  - name: vlm_plan_extract_solve
+    template: "You are a visual math solver. First, extract all relevant variables and numbers from both the image and the question text. Then, devise a complete plan to solve the problem. Finally, carry out the plan step by step, showing all calculations. Put reasoning in <think> </think> and answer in <answer> </answer>."
+    description: "Extract variables from image + text, then plan and solve"
+    category: plan_and_solve
+    expected_performance: "good_for_numerical"
+
+  # ============================================================================
+  # Verification and Self-Checking Prompts
+  # ============================================================================
+  - name: vlm_solve_and_verify
+    template: "You are a meticulous math solver. Solve the problem step by step based on the image. After reaching your answer, verify it by checking your reasoning against the visual information in the image. If you find an error, correct it. Put your work in <think> </think> and final answer in <answer> </answer>."
+    description: "Solve then verify against visual information"
+    category: verification
+    paper_reference: "Inspired by VL-Rethinker (NeurIPS 2025)"
+    expected_performance: "reduces_errors"
+
+  - name: vlm_double_check
+    template: "You are a precise math assistant. Carefully examine the image and solve the problem. Double-check that you have correctly read all numbers, labels, and relationships from the figure before giving your answer. Put reasoning in <think> </think> and answer in <answer> </answer>."
+    description: "Emphasis on double-checking visual information reading"
+    category: verification
+    expected_performance: "good_for_reading_errors"
+
+  - name: vlm_reflect
+    template: "You are a thoughtful math solver. Analyze the image and solve the problem step by step. After reaching an answer, reflect: Does the answer make sense given what the image shows? Is the magnitude reasonable? Put your reasoning in <think> </think> and final answer in <answer> </answer>."
+    description: "Metacognitive reflection on answer reasonableness"
+    category: verification
+    expected_performance: "catches_magnitude_errors"
+
+  # ============================================================================
+  # Cross-Modal Formalization Prompts
+  # ============================================================================
+  - name: formalize_then_solve
+    template: "You are a visual math expert. First, translate the visual content into a formal mathematical description: identify all given quantities, constraints, and relationships. Then solve the formalized problem using standard mathematical methods. Show reasoning in <think> </think> and answer in <answer> </answer>."
+    description: "Formalize visual content into math notation then solve"
+    category: cross_modal
+    paper_reference: "Inspired by R1-Onevision (ICCV 2025)"
+    expected_performance: "good_for_formalization"
+
+  - name: scene_graph_reasoning
+    template: "You are a structured visual reasoning assistant. For the given math problem:\n1. Identify the key objects in the image\n2. Note their attributes (size, angle, length, value)\n3. Determine relationships between objects\n4. Use these relationships to solve the problem\nPut reasoning in <think> </think> and answer in <answer> </answer>."
+    description: "Scene-graph style structured visual reasoning"
+    category: cross_modal
+    paper_reference: "Inspired by CCoT (CVPR 2024)"
+    expected_performance: "good_for_complex_diagrams"
+
+  # ============================================================================
+  # Structured Format Prompts
+  # ============================================================================
+  - name: structured_solution
+    template: "You are a math tutor. Solve the visual math problem in this structured format:\n- Observation: What does the image show?\n- Given: What information is provided?\n- Find: What needs to be calculated?\n- Solution: Step-by-step solution\n- Answer: Final numerical answer\nPut everything in <think> </think> except the final answer which goes in <answer> </answer>."
+    description: "Highly structured observation-given-find-solution format"
+    category: structured
+    expected_performance: "consistent_format"
+
+  # ============================================================================
+  # Direct/Baseline Prompts
+  # ============================================================================
+  - name: direct_solve
+    template: "You are a math assistant. Look at the image and answer the question. Provide your answer in <answer> </answer> tags."
+    description: "Minimal prompt without reasoning scaffolding"
+    category: direct
+    expected_performance: "baseline"
+
+  - name: direct_with_think
+    template: "Solve the math problem shown in the image. Put your reasoning in <think> </think> and answer in <answer> </answer>."
+    description: "Minimal prompt with think/answer tags"
+    category: direct
+    expected_performance: "weak_baseline"
+
+
+# ============================================================================
+# Preset Configurations for Experiments
+# ============================================================================
+presets:
+  vlm_diverse_6:
+    description: "6 diverse VLM prompts covering different strategies"
+    prompts:
+      - r1_standard
+      - describe_then_solve
+      - geometry_expert
+      - vlm_cot_ape
+      - vlm_solve_and_verify
+      - vlm_plan_and_solve
+
+  vlm_research_backed_8:
+    description: "8 VLM prompts with strong research backing"
+    prompts:
+      - r1_standard
+      - describe_then_solve
+      - geometry_expert
+      - vlm_cot_ape
+      - vlm_plan_and_solve
+      - vlm_solve_and_verify
+      - formalize_then_solve
+      - structured_solution
+
+  vlm_geometry_focused_6:
+    description: "6 prompts optimized for geometry tasks"
+    prompts:
+      - geometry_expert
+      - geometry_theorem
+      - geometry_predicates
+      - caption_first
+      - visual_extraction
+      - vlm_solve_and_verify
+
+  vlm_high_performance_10:
+    description: "Top 10 VLM prompts for maximum diversity"
+    prompts:
+      - r1_standard
+      - r1_math_expert
+      - describe_then_solve
+      - caption_first
+      - geometry_expert
+      - vlm_cot_ape
+      - vlm_plan_and_solve
+      - vlm_solve_and_verify
+      - formalize_then_solve
+      - structured_solution
+
+  vlm_ablation_study:
+    description: "For comparing different VLM prompt strategies"
+    prompts:
+      - direct_solve
+      - r1_standard
+      - vlm_cot_classic
+      - describe_then_solve
+      - geometry_expert
+      - vlm_solve_and_verify
+
+  vlm_all_prompts_22:
+    description: "All 22 VLM prompts for comprehensive testing"
+    prompts:
+      - r1_standard
+      - r1_concise
+      - r1_math_expert
+      - describe_then_solve
+      - caption_first
+      - visual_extraction
+      - geometry_expert
+      - geometry_theorem
+      - geometry_predicates
+      - vlm_cot_classic
+      - vlm_cot_careful
+      - vlm_cot_ape
+      - vlm_plan_and_solve
+      - vlm_plan_extract_solve
+      - vlm_solve_and_verify
+      - vlm_double_check
+      - vlm_reflect
+      - formalize_then_solve
+      - scene_graph_reasoning
+      - structured_solution
+      - direct_solve
+      - direct_with_think
+
+
+# ============================================================================
+# Category Descriptions
+# ============================================================================
+categories:
+  r1_style:
+    name: "R1-Style Standard"
+    description: "Standard VLM reasoning prompts from VLM-R1/Vision-R1 community"
+    key_papers:
+      - "VLM-R1 (om-ai-lab, 2025)"
+      - "Vision-R1 (Osilly, 2025)"
+
+  describe_then_solve:
+    name: "Describe-then-Solve"
+    description: "First describe visual content, then solve. Reduces visual hallucination."
+    key_papers:
+      - "LLaVA-CoT (PKU, ICCV 2025)"
+      - "DVLR (ICCV 2025)"
+
+  geometry:
+    name: "Geometry-Specific"
+    description: "Specialized prompts for geometric reasoning with structured extraction"
+    key_papers:
+      - "DVLR - Decoupled Visual-Linguistic Reasoning (ICCV 2025)"
+      - "GeoCoder (2025)"
+
+  chain_of_thought:
+    name: "Chain-of-Thought (VLM-adapted)"
+    description: "Classic CoT prompts adapted for multimodal context"
+    key_papers:
+      - "Kojima et al., 2022 (adapted for VLM)"
+      - "Zhou et al., 2022 APE (adapted for VLM)"
+
+  plan_and_solve:
+    name: "Plan-and-Solve (VLM-adapted)"
+    description: "Two-stage prompts adapted for visual problem solving"
+    key_papers:
+      - "Wang et al., 2023 PS+ (adapted for VLM)"
+
+  verification:
+    name: "Verification and Self-Checking"
+    description: "Prompts that encourage verifying answers against visual information"
+    key_papers:
+      - "VL-Rethinker (TIGER-AI-Lab, NeurIPS 2025)"
+
+  cross_modal:
+    name: "Cross-Modal Formalization"
+    description: "Translate visual content to formal representations before reasoning"
+    key_papers:
+      - "R1-Onevision (ICCV 2025)"
+      - "CCoT - Compositional Chain-of-Thought (CVPR 2024)"
+
+  structured:
+    name: "Structured Format"
+    description: "Prompts with explicit output structure for consistent formatting"
+
+  direct:
+    name: "Direct/Baseline"
+    description: "Minimal prompts without reasoning scaffolding for ablation baseline"

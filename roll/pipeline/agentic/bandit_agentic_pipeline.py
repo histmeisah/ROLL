@@ -7,6 +7,7 @@ when they are created during pipeline initialization.
 """
 
 import ray
+import numpy as np
 from typing import Any, Dict, List, Optional
 
 from roll.algorithms.bandit.bandit_actor import BanditActor
@@ -44,8 +45,29 @@ class BanditAgenticPipeline(AgenticPipeline):
         self.prompt_templates = loader.get_preset_prompts(preset)
         self.prompt_names = [p.name for p in self.prompt_templates]
         self.prompt_texts = [p.template for p in self.prompt_templates]
-        n_prompts = len(self.prompt_templates)
-        logger.info(f"[BanditPipeline] Loaded {n_prompts} prompts from preset '{preset}': {self.prompt_names}")
+
+        # Strip "{problem}" from templates — they are used as system prompts,
+        # not user messages. The problem text is already in the user message
+        # via agent_template's {observation}.
+        self.prompt_texts = [t.replace("{problem}", "").strip() for t in self.prompt_texts]
+
+        # Add the original system prompt as an additional candidate ("default_system").
+        # This lets the bandit choose between custom prompts and the baseline prompt,
+        # making the comparison fair — the bandit can always fall back to the default.
+        default_system_prompt = None
+        for tag, env_cfg in pipeline_config.custom_envs.items():
+            if env_cfg.get("env_type") == "roll_math_bandit":
+                default_system_prompt = env_cfg.get("agent_system_template", "")
+                break
+        if default_system_prompt:
+            self.prompt_names.append("default_system")
+            self.prompt_texts.append(default_system_prompt)
+            logger.info(f"[BanditPipeline] Added default system prompt as candidate: "
+                        f"'{default_system_prompt[:80]}...'")
+
+        n_prompts = len(self.prompt_texts)
+        logger.info(f"[BanditPipeline] {n_prompts} total prompt candidates "
+                    f"(preset '{preset}' + default): {self.prompt_names}")
 
         # Inject prompt_templates into env_config for all custom_envs that use roll_math_bandit
         for tag, env_cfg in pipeline_config.custom_envs.items():
@@ -71,26 +93,56 @@ class BanditAgenticPipeline(AgenticPipeline):
 
         # Create EncoderActor
         encoder_model = bandit_cfg.get("encoder_model", "Qwen/Qwen3-VL-Embedding-2B")
-        encoder_device = bandit_cfg.get("encoder_device", "cpu")
+        encoder_device = bandit_cfg.get("encoder_device", "auto")
         encoder_type = bandit_cfg.get("encoder_type", "qwen3_vl")
         embedding_dim = bandit_cfg.get("embedding_dim", None)
         encoder_actor_name = bandit_cfg.get("encoder_actor_name", DEFAULT_ENCODER_ACTOR_NAME)
 
+        # Auto-select encoder device: place on the last inference GPU to minimize
+        # contention with training. The encoder model (~1.2GB for 0.6B) is small
+        # enough to share a GPU with vLLM (which typically reserves 90% = ~72GB
+        # on an 80GB H100, leaving ~8GB free).
+        if encoder_device == "auto":
+            infer_cfg = getattr(pipeline_config, "actor_infer", None)
+            if infer_cfg and hasattr(infer_cfg, "device_mapping") and infer_cfg.device_mapping:
+                last_infer_gpu = infer_cfg.device_mapping[-1]
+                encoder_device = f"cuda:{last_infer_gpu}"
+            else:
+                encoder_device = "cpu"
+            logger.info(f"[BanditPipeline] Auto-selected encoder device: {encoder_device}")
+
+        # When using GPU, we keep num_gpus=0 to avoid consuming Ray's GPU quota
+        # (the training pipeline needs all GPUs). Instead, we use runtime_env to
+        # inject CUDA_VISIBLE_DEVICES so the actor process can see the GPU.
+        # This matches the vLLM worker pattern in ROLL (see third_party/vllm/).
+        encoder_actor_options = {
+            "name": encoder_actor_name,
+            "namespace": RAY_NAMESPACE,
+            "lifetime": "detached",
+        }
+        if encoder_device.startswith("cuda"):
+            gpu_idx = encoder_device.split(":")[-1] if ":" in encoder_device else "0"
+            encoder_actor_options["runtime_env"] = {
+                "env_vars": {
+                    "CUDA_VISIBLE_DEVICES": gpu_idx,
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                }
+            }
+            encoder_device_for_actor = "cuda:0"  # Remapped inside the process
+        else:
+            encoder_device_for_actor = encoder_device
+
         self._kill_existing_actor(encoder_actor_name)
-        self.encoder_actor = EncoderActor.options(
-            name=encoder_actor_name,
-            namespace=RAY_NAMESPACE,
-            lifetime="detached",
-        ).remote(
+        self.encoder_actor = EncoderActor.options(**encoder_actor_options).remote(
             model_name_or_path=encoder_model,
-            device=encoder_device,
+            device=encoder_device_for_actor,
             encoder_type=encoder_type,
             embedding_dim=embedding_dim,
         )
         context_dim = ray.get(self.encoder_actor.get_context_dim.remote())
         logger.info(
             f"[BanditPipeline] EncoderActor created: type={encoder_type}, "
-            f"model={encoder_model}, context_dim={context_dim}"
+            f"model={encoder_model}, device={encoder_device}, context_dim={context_dim}"
         )
 
         # Create BanditActor
@@ -107,6 +159,19 @@ class BanditAgenticPipeline(AgenticPipeline):
         }
 
         bandit_algorithm = bandit_cfg.get("bandit_algorithm", "ts")
+        warmup_episodes = bandit_cfg.get("warmup_episodes", 500)
+
+        # For cosine algorithm: pre-compute prompt embeddings using the encoder
+        prompt_embeddings = None
+        if bandit_algorithm == "cosine":
+            import pickle as _pickle
+            logger.info("[BanditPipeline] Pre-computing prompt embeddings for cosine selection...")
+            prompt_embeddings = []
+            for text in self.prompt_texts:
+                emb_bytes = ray.get(self.encoder_actor.encode.remote({"text": text}))
+                prompt_embeddings.append(_pickle.loads(emb_bytes))
+            prompt_embeddings = np.stack(prompt_embeddings)  # (n_prompts, context_dim)
+            logger.info(f"[BanditPipeline] Prompt embeddings shape: {prompt_embeddings.shape}")
 
         self._kill_existing_actor(bandit_actor_name)
         self.bandit_actor = BanditActor.options(
@@ -123,6 +188,8 @@ class BanditAgenticPipeline(AgenticPipeline):
             enable_monitoring=True,
             device="cpu",
             bandit_algorithm=bandit_algorithm,
+            warmup_episodes=warmup_episodes,
+            prompt_embeddings=prompt_embeddings,
         )
         logger.info(
             f"[BanditPipeline] BanditActor created: algorithm={bandit_algorithm}, "

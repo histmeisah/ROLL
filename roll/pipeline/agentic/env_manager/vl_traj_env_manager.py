@@ -137,8 +137,10 @@ class VLTrajEnvManager(TrajEnvManager):
                 }
             ]
         """
-        self.pre_step_template = cfg_template["pre_step_template"]
-        self.next_step_template = cfg_template["next_step_template"]
+        # pre/next step templates are optional — single-turn envs (e.g. math)
+        # don't need them.
+        self.pre_step_template = cfg_template.get("pre_step_template", "") or ""
+        self.next_step_template = cfg_template.get("next_step_template", "") or ""
         if self.env_config["env_id"] == 0:
             self.logger.info(f"agent_system_template: {self.agent_system_template}")
             self.logger.info(f"pre_step_template: {self.pre_step_template}")
@@ -286,7 +288,11 @@ class VLTrajEnvManager(TrajEnvManager):
         return lm_output
 
     def format_messages(self, history: RolloutCache) -> Tuple[DataProto, List[Dict]]:
-        messages = [{"role": "system", "content": self.agent_system_template}]
+        # Allow env to override the system prompt (e.g., bandit prompt selection)
+        system_prompt = history.history[0].get(
+            "system_prompt_override", self.agent_system_template
+        )
+        messages = [{"role": "system", "content": system_prompt}]
         mm_data = None
 
         for idx, content in enumerate(history.history):
@@ -312,7 +318,7 @@ class VLTrajEnvManager(TrajEnvManager):
                 mm_dict = {"image": [PIL.Image.fromarray(obs, mode="RGB")]}
             else :
                 assert isinstance(obs, dict), f"observation type {type(obs)} is not supported"
-                obs_content = obs.get("prompt", "")
+                obs_content = obs.get("prompt", obs.get("text", ""))
                 # str or list of dict, and the dict is item of chat format or user content
                 if isinstance(obs_content, list):
                     if "role" in obs_content[0]:
@@ -321,7 +327,16 @@ class VLTrajEnvManager(TrajEnvManager):
                             obs_content = obs_content[1]["content"]
                         else:
                             obs_content = obs_content[0]["content"]
-                mm_dict = dict((k, v) for k, v in obs.items() if k not in ["prompt"])
+                mm_dict = dict((k, v) for k, v in obs.items() if k not in ["prompt", "text"])
+
+            # If we have an image but obs_content is a plain string (no image
+            # placeholder), promote it to the list-of-dict form so the image
+            # gets a proper position in the chat template.
+            if isinstance(obs_content, str) and "image" in mm_dict and not getattr(self.env, "image_placeholder", None):
+                obs_content = [
+                    {"type": "image"},
+                    {"type": "text", "text": obs_content},
+                ]
 
             # replace image placeholder included in env returned prompt
             def replace_placeholder(text):
