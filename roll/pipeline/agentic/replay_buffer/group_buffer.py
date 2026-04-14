@@ -190,14 +190,32 @@ class GroupReplayBuffer(BaseReplayBuffer):
         response_mask = batch.batch["response_mask"][idx].cpu().numpy()
         prompt_mask = batch.batch["prompt_mask"][idx].cpu().numpy()
         scores = batch.batch["scores"][idx].cpu().numpy()
-        penalty = float(batch.batch["penalty"][idx].cpu().item())
 
-        behavior_log_probs = None
+        # penalty was removed from rollout batch in upstream; default to 0.0
+        if "penalty" in batch.batch:
+            penalty = float(batch.batch["penalty"][idx].cpu().item())
+        else:
+            penalty = 0.0
+
+        # upstream renamed behavior_log_probs → infer_logprobs
+        target_len = max(int(input_ids.shape[0]) - 1, 0)
         if "behavior_log_probs" in batch.batch:
             behavior_log_probs = batch.batch["behavior_log_probs"][idx].cpu().numpy()
+        elif "infer_logprobs" in batch.batch:
+            behavior_log_probs = batch.batch["infer_logprobs"][idx].cpu().numpy()
         else:
-            target_len = max(int(input_ids.shape[0]) - 1, 0)
             behavior_log_probs = np.zeros((target_len,), dtype=np.float32)
+
+        # Upstream removed `messages_list` and `frames` from text TrajEnvManager.
+        # VLM env manager still emits `messages_list`. Make them optional here.
+        # TODO(VLM): to properly support VLM replay we also need to preserve
+        # multi-modal tensors injected via env.add_extra_data (e.g. pixel_values,
+        # image_grid_thw). Revisit when building VLM experiments.
+        def _nt(key, default):
+            arr = batch.non_tensor_batch.get(key, None)
+            if arr is None:
+                return default
+            return arr[idx]
 
         return TrajectoryEntry(
             input_ids=input_ids,
@@ -208,15 +226,15 @@ class GroupReplayBuffer(BaseReplayBuffer):
             scores=scores,
             penalty=penalty,
             behavior_log_probs=behavior_log_probs,
-            env_id=batch.non_tensor_batch["env_ids"][idx],
-            group_id=batch.non_tensor_batch["group_ids"][idx],
-            messages_list=batch.non_tensor_batch["messages_list"][idx],
-            tag=batch.non_tensor_batch["tags"][idx],
-            frames=batch.non_tensor_batch["frames"][idx],
-            step_scores=batch.non_tensor_batch["step_scores"][idx],
-            episode_scores=batch.non_tensor_batch["episode_scores"][idx],
-            traj_group_id=batch.non_tensor_batch["traj_group_id"][idx],
-            traj_id=batch.non_tensor_batch["traj_id"][idx],
+            env_id=_nt("env_ids", ""),
+            group_id=_nt("group_ids", ""),
+            messages_list=_nt("messages_list", []),
+            tag=_nt("tags", ""),
+            frames=_nt("frames", []),
+            step_scores=_nt("step_scores", []),
+            episode_scores=_nt("episode_scores", 0.0),
+            traj_group_id=_nt("traj_group_id", ""),
+            traj_id=_nt("traj_id", ""),
             stored_at_step=global_step,
             episode_length=int(attention_mask.sum()),
             global_step=global_step,
@@ -255,12 +273,12 @@ class GroupReplayBuffer(BaseReplayBuffer):
                 oldest_idx = i
         if oldest_idx == -1:
             oldest_idx = 0
-        # Clear the slot
+        # Clear the slot; num_valid stays constant because _store_group
+        # will immediately refill this slot (atomic evict-then-store).
         self.valid_mask[oldest_idx] = False
         self.groups[oldest_idx] = None
         self._it_sum[oldest_idx] = 0.0
         self._it_min[oldest_idx] = float('inf')
-        self.num_valid -= 1
         return oldest_idx
 
     # ─── Sample ──────────────────────────────────────────────────────────

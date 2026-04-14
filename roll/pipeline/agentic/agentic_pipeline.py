@@ -632,6 +632,16 @@ class AgenticPipeline(BasePipeline):
                                 if self.pipeline_config.enable_old_logprobs_recompute:
                                     batch_balance(replay_batch, dp_size=self.actor_train.dp_size,
                                                   minibatch_size=len(replay_batch))
+                                    if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
+                                        replay_batch, _ = dynamic_batching_shard(
+                                            replay_batch,
+                                            self.actor_train.dp_size,
+                                            self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
+                                            self.pipeline_config.actor_train.sequence_length_round_in_infer,
+                                            self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                                            self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                                            "replay_actor_train/compute_log_probs",
+                                        )
                                     old_lp: DataProto = self.actor_train.compute_log_probs(
                                         replay_batch, blocking=True
                                     )
@@ -647,6 +657,16 @@ class AgenticPipeline(BasePipeline):
                                 elif self.use_ref_model:
                                     batch_balance(replay_batch, dp_size=self.reference.dp_size,
                                                   minibatch_size=len(replay_batch))
+                                    if self.pipeline_config.reference.use_dynamic_batching_in_infer:
+                                        replay_batch, _ = dynamic_batching_shard(
+                                            replay_batch,
+                                            self.reference.dp_size,
+                                            self.pipeline_config.reference.max_tokens_per_microbatch_in_infer,
+                                            self.pipeline_config.reference.sequence_length_round_in_infer,
+                                            self.pipeline_config.reference.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                                            self.pipeline_config.reference.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                                            "replay_reference/compute_log_probs",
+                                        )
                                     ref_lp_refs = self.reference.compute_log_probs(replay_batch, blocking=False)
                                     ref_lp = DataProto.materialize_concat(data_refs=ref_lp_refs)
                                     replay_batch.batch["ref_log_probs"] = ref_lp.batch["log_probs"]
@@ -654,6 +674,16 @@ class AgenticPipeline(BasePipeline):
                                     replay_batch.meta_info["disable_adapter"] = True
                                     batch_balance(replay_batch, dp_size=self.actor_train.dp_size,
                                                   minibatch_size=len(replay_batch))
+                                    if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
+                                        replay_batch, _ = dynamic_batching_shard(
+                                            replay_batch,
+                                            self.actor_train.dp_size,
+                                            self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
+                                            self.pipeline_config.actor_train.sequence_length_round_in_infer,
+                                            self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                                            self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                                            "replay_ref_via_actor/compute_log_probs",
+                                        )
                                     ref_lp_refs = self.actor_train.compute_log_probs(replay_batch, blocking=False)
                                     ref_lp = DataProto.materialize_concat(data_refs=ref_lp_refs)
                                     replay_batch.batch["ref_log_probs"] = ref_lp.batch["log_probs"]
@@ -691,6 +721,17 @@ class AgenticPipeline(BasePipeline):
                                     self.pipeline_config.actor_train.training_args.per_device_train_batch_size *
                                     self.pipeline_config.actor_train.training_args.gradient_accumulation_steps,
                                     logging_prefix="global_seqlen/replay_train")
+                                # train_step requires global_micro_batch_indices when dynamic batching is on
+                                if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
+                                    replay_batch, _ = dynamic_batching_shard(
+                                        replay_batch,
+                                        self.actor_train.dp_size,
+                                        self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
+                                        self.pipeline_config.actor_train.sequence_length_round_in_train,
+                                        self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                                        self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                                        "replay_actor_train/train_step",
+                                    )
                                 replay_train_refs = self.actor_train.train_step(replay_batch, blocking=False)
                                 replay_train_result = DataProto.materialize_concat(data_refs=replay_train_refs)
                                 replay_metrics = reduce_metrics(
